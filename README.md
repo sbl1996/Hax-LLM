@@ -1,4 +1,4 @@
-![Hax-LLM Logo](https://github.com/sbl1996/Hax-LLM/blob/master/docs/_static/hax-llm-1.jpg)
+![Hax-LLM Logo](/docs/_static/hax-llm-1.jpg)
 
 --------------------------------------------------------------------------------
 
