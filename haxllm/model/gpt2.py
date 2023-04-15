@@ -1,7 +1,6 @@
 import math
 from typing import Any, Callable, Optional, Tuple
 
-import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
@@ -243,6 +242,4 @@ def remap_state_dict(state_dict, config: TransformerConfig):
 
     # Final LayerNorm
     root['ln_f'] = {'scale': state_dict.pop('ln_f.weight'), 'bias': state_dict.pop('ln_f.bias')}
-
-    root = jax.tree_map(lambda x: x.numpy(), root)
     return root

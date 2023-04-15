@@ -16,7 +16,7 @@ def convert_config(config, **kwargs):
         n_inner=config.intermediate_size,
         n_head=config.num_attention_heads,
         n_layer=config.num_hidden_layers,
-        layer_norm_epsilon=config.layer_norm_eps,
+        # layer_norm_epsilon=config.layer_norm_eps,
         n_positions=config.max_position_embeddings,
         embd_pdrop=config.hidden_dropout_prob,
         attn_pdrop=config.attention_probs_dropout_prob,
@@ -60,7 +60,7 @@ class MlpBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
         n_inner = config.n_inner
-
+        self.sow
         actual_out_dim = inputs.shape[-1]
         x = nn.Dense(
             n_inner,
@@ -251,5 +251,4 @@ def remap_state_dict(state_dict, config: TransformerConfig):
                            'bias': state_dict.pop(f'encoder.layer.{d}.output.LayerNorm.beta')}
         root[f'h_{d}'] = block_d
 
-    root = jax.tree_map(lambda x: x.numpy(), root)
     return root

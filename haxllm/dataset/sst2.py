@@ -7,10 +7,10 @@ from haxllm.dataset.utils import create_ds
 def load_data(split, tokenize_function):
     dataset = load_dataset('glue', 'sst2', split=split)
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
-    tokenized_dataset.set_format(type='numpy', columns=['input_ids', 'attention_mask', 'label'])
-    input_ids = tokenized_dataset['input_ids']
-    attention_mask = tokenized_dataset['attention_mask']
-    labels = tokenized_dataset['label']
+    tokenized_dataset.set_format(type='numpy', columns=['input_ids', 'attention_mask', 'label']) # type: ignore
+    input_ids = tokenized_dataset['input_ids'] # type: ignore
+    attention_mask = tokenized_dataset['attention_mask'] # type: ignore
+    labels = tokenized_dataset['label'] # type: ignore
     return input_ids, attention_mask, labels
 
 
@@ -25,7 +25,7 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_batch_size=None,
-                seed=42, with_test=False):
+                   seed=42, with_test=False):
     assert eval_size is None, 'eval_size is not supported for SST-2'
     if eval_batch_size is None:
         eval_batch_size = batch_size
