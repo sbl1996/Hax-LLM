@@ -178,7 +178,7 @@ class TransformerSequenceClassifier(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train):
+    def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
         x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
 
