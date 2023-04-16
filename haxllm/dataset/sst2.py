@@ -25,7 +25,7 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_batch_size=None,
-                   seed=42, with_test=False):
+                   seed=42, with_test=False, sub_ratio=None):
     assert eval_size is None, 'eval_size is not supported for SST-2'
     if eval_batch_size is None:
         eval_batch_size = batch_size
@@ -37,6 +37,11 @@ def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_
     else:
         train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn)
         test_input_ids, test_attention_mask, test_labels = load_data('validation', tokenize_fn)
+
+    if sub_ratio is not None:
+        train_input_ids = train_input_ids[:int(len(train_input_ids) * sub_ratio)]
+        train_attention_mask = train_attention_mask[:int(len(train_attention_mask) * sub_ratio)]
+        train_labels = train_labels[:int(len(train_labels) * sub_ratio)]
 
     train_data = {'inputs': train_input_ids, 'attn_mask': train_attention_mask, 'labels': train_labels}
     test_data = {'inputs': test_input_ids, 'attn_mask': test_attention_mask, 'labels': test_labels}
