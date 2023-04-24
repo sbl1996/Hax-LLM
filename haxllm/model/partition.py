@@ -5,12 +5,6 @@ from jax.sharding import PartitionSpec as P
 import jax
 from jax.sharding import NamedSharding
 
-# Sentinels
-_unmatched = object()
-
-# For specifying empty leaf dict `{}`
-empty_dict = object()
-
 
 def _match(qs, ks):
     """Return True if regexes in qs match any window of strings in tuple ks."""
@@ -25,59 +19,63 @@ def _match(qs, ks):
 
 def _replacement_rules(rules):
     def replace(key, val):
+        n = len(val.shape)
         for rule, replacement in rules:
             if _match(rule, key):
+                assert len(replacement) <= n, "Mismatched partition spec {}: {} vs {}" \
+                    .format(key, replacement, val.shape)
+                if len(replacement) < n:
+                    # pad left with None for scan
+                    replacement = [None] * (n - len(replacement)) + list(replacement)
+                    replacement = P(*replacement)
                 return replacement
-        return val
+        # undefined keys in rules are not partitioned
+        return P(*[None for _ in range(n)])
 
     return replace
 
+
 def get_partition_spec(in_dict, rules):
     replace = _replacement_rules(rules)
-    initd = {k: _unmatched for k in flatten_dict(in_dict)}
-    result = {k: replace(k, v) for k, v in initd.items()}
-    for k, v in result.items():
-        if v == _unmatched:
-            print("Unmatched key: {}".format(k))
-    assert _unmatched not in result.values(), "Incomplete partition spec."
+    result = {k: replace(k, v) for k, v in flatten_dict(in_dict).items()}
     return freeze(unflatten_dict(result))
 
 
 def _get_partition_rules_gpt2():
     spec = [
-        (("transformer", "wte", "embedding"), P(None, None)),
-        (("transformer", "wpe", "embedding"), P(None, None)),
-
         (("hs", "attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
-        (("hs", "attn", "(query|key|value)", "bias"), P(None, None)), 
         (("hs", "attn", "out", "kernel"), P("Y", None, "X")), 
-        (("hs", "attn", "out", "bias"), P(None)), 
         (("hs", "mlp", "fc_1", "kernel"), P("X", "Y")),
-        (("hs", "mlp", "fc_1", "bias"), P(None)),
         (("hs", "mlp", "fc_2", "kernel"), P("Y", "X")),
-        (("hs", "mlp", "fc_2", "bias"), P(None)), 
-        (("hs", "ln_1", "(scale|bias)"), P(None)),
-        (("hs", "ln_2", "(scale|bias)"), P(None)),
-
-        (("transformer", "ln_f", "(scale|bias)"), P(None)), 
-        (("score", "kernel"), P(None, None)), 
-        (("score", "bias"), P(None)), 
     ]
-    spec_ = []
-    for k, v in spec:
-        if k[0] == 'hs':
-            v = P(*[None, None, *v])
-        spec_.append((k, v))
-    return spec_
+    return spec
 
 
-def get_gpt2_param_partition_spec(params):
-    return get_partition_spec(params, _get_partition_rules_gpt2())
+def _get_partition_rules_llama():
+    spec = [
+        (("hs", "attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
+        (("hs", "attn", "out", "kernel"), P("Y", None, "X")), 
+        (("hs", "mlp", "gate", "kernel"), P("X", "Y")),
+        (("hs", "mlp", "up", "kernel"), P("X", "Y")),
+        (("hs", "mlp", "down", "kernel"), P("Y", "X")),
+    ]
+    return spec
+
+
+def get_param_partition_spec(params, model_name):
+    if "gpt2" in model_name:
+        return get_partition_spec(params, _get_partition_rules_gpt2())
+    elif 'llama' in model_name:
+        return get_partition_spec(params, _get_partition_rules_llama())
+    else:
+        raise NotImplementedError
+
 
 def global_mesh_defined():
     """Checks if global xmap/pjit mesh resource environment is defined."""
     maps_env = jax.experimental.maps.thread_resources.env
     return maps_env.physical_mesh.devices.shape != ()  # pylint: disable=g-explicit-bool-comparison
+
 
 def with_sharding_constraint(x, axis_resources):
     """Wrapper for pjit with_sharding_constraint, no-op on cpu or outside pjit."""
@@ -85,6 +83,7 @@ def with_sharding_constraint(x, axis_resources):
         return x
     else:
         return jax.lax.with_sharding_constraint(x, axis_resources)
+
 
 def with_named_sharding_constraint(x, mesh, partition_spec):
     if mesh is not None:

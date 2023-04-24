@@ -1,12 +1,11 @@
 import math
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Sequence
 
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.modules import SelfAttention 
+from haxllm.model.lora.modules import SelfAttention 
 
 
 def convert_config(config, **kwargs):
@@ -42,15 +41,15 @@ class TransformerConfig:
     remat: bool = False
     scan_layers: Optional[int] = None
     remat_scan_lengths: Optional[Tuple[int, int]] = None
+    attn_lora_r: Optional[Sequence[int]] = (0, 0, 0, 0)
+    lora_alpha: int = 1
 
 
 class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block.
-    """
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, inputs):
+    def __call__(self, inputs, deterministic=True):
         config = self.config
         n_inner = config.n_embd * 4
 
@@ -70,6 +69,7 @@ class MlpBlock(nn.Module):
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             name="fc_2")(x)
+        x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=deterministic)
         return x
 
 
@@ -82,13 +82,13 @@ class TransformerBlock(nn.Module):
     def __call__(self, x):
         inputs, attn_mask = x
         config = self.config
-        # inputs = nn_partitioning.with_sharding_constraint(inputs, P("X", None, None))
 
         assert inputs.ndim == 3
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
             num_heads=config.n_head,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             qkv_features=config.n_embd,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
@@ -96,18 +96,18 @@ class TransformerBlock(nn.Module):
             broadcast_dropout=False,
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
+            attn_lora_r=config.attn_lora_r,
+            lora_alpha=config.lora_alpha,
             name='attn')(x, attn_mask)
-        x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
         y = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_2')(x)
-        y = MlpBlock(config=config, name='mlp')(y)
-        y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
+        y = MlpBlock(config=config, name='mlp')(y, deterministic=self.deterministic)
         if self.scan:
             return (x + y, attn_mask), None
         else:    
             return x + y, attn_mask
-    
+
 
 class TransformerModel(nn.Module):
     config: TransformerConfig
@@ -154,9 +154,9 @@ class TransformerModel(nn.Module):
                 raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layer={config.n_layer}")
             for i in range(d):
                 x = block_fn(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
-            if scan_layers > 0:
-                TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
-                x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
+            
+            TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
+            x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
         return x
 

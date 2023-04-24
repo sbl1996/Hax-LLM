@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from flax import traverse_util
 from flax.training import common_utils
 from flax.core.frozen_dict import freeze
-from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import unflatten_dict, flatten_dict
 
 import optax
 
@@ -58,17 +58,18 @@ def get_metrics(all_metrics, pmap=True):
 
 
 def freeze_params_optimizer(optimizer, params, trainable_pattern):
-    partition_optimizers = {'trainable': optimizer,
-                            'frozen': optax.set_to_zero()}
+    optimizers = {'trainable': optimizer, 'frozen': optax.set_to_zero()}
 
-    def match_partition(path, v):
+    def match_label(path, v):
         path_str = ".".join(path)
         match = re.findall(trainable_pattern, path_str) != []
+        if match:
+            print(f"Trainable: {path_str}")
         return 'trainable' if match else 'frozen'
 
-    param_partitions = freeze(
-        traverse_util.path_aware_map(match_partition, params))
-    tx = optax.multi_transform(partition_optimizers, param_partitions)
+    param_labels = freeze(
+        traverse_util.path_aware_map(match_label, params))
+    tx = optax.multi_transform(optimizers, param_labels)
     return tx
 
 
@@ -92,6 +93,31 @@ def convert_remat_scan_params(params, src_keys, tgt_key, lengths):
     return params
 
 
+
+def convert_scan_params(params, src_keys, tgt_key, lengths):
+    if isinstance(lengths, int):
+        lengths = [lengths]
+    scan_layers = math.prod(lengths)
+    if scan_layers > len(src_keys):
+        raise ValueError(
+            f'Number of remat scan layers ({scan_layers}) must be less than or equal to the number of source keys ({len(src_keys)})')
+    src_keys = src_keys[-scan_layers:]
+    level_trees = []
+    if len(lengths) == 1:
+        for i in range(lengths[0]):
+            level_trees.append(params.pop(src_keys[i]))
+    else:
+        for i in range(lengths[0]):
+            loop_trees = []
+            for j in range(lengths[1]):
+                loop_trees.append(params.pop(src_keys[i * lengths[1] + j]))
+            level_trees.append(jax.tree_map(
+                lambda *xs: np.stack(xs, axis=0), *loop_trees))
+    params[tgt_key] = jax.tree_map(
+        lambda *xs: np.stack(xs, axis=0), *level_trees)
+    return params
+
+
 def pad(x, batch_size):
     b, *shape = x.shape
     rest = b % batch_size
@@ -101,36 +127,63 @@ def pad(x, batch_size):
     return x
 
 
-def pad_partition_unpad(wrapped, partition_spec, static_argnums=(0,), static_argnames=()):
-    def pad_shard_unpad_wrapper(*args, batch_size=None, **kw):
-        batch_sizes = set()
-        for i, a in enumerate(args):
-            if i not in static_argnums:
-                batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(a)}
-        for k, v in kw.items():
-            if k not in static_argnames:
-                batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(v)}
-        assert len(batch_sizes) == 1, f"Inconsistent batch-sizes: {batch_sizes}"
-        b = batch_sizes.pop()
+# def pad_partition_unpad(wrapped, partition_spec, static_argnums=(0,), static_argnames=()):
+#     def pad_shard_unpad_wrapper(*args, batch_size=None, **kw):
+#         batch_sizes = set()
+#         for i, a in enumerate(args):
+#             if i not in static_argnums:
+#                 batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(a)}
+#         for k, v in kw.items():
+#             if k not in static_argnames:
+#                 batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(v)}
+#         assert len(batch_sizes) == 1, f"Inconsistent batch-sizes: {batch_sizes}"
+#         b = batch_sizes.pop()
 
-        def pad(x):
-            _, *shape = x.shape
-            rest = batch_size - b
-            if rest:
-                x = np.concatenate(
-                    [x, np.zeros((rest, *shape), x.dtype)], axis=0)
-            return nn_partitioning.with_sharding_constraint(x, partition_spec)
+#         def pad(x):
+#             _, *shape = x.shape
+#             rest = batch_size - b
+#             if rest:
+#                 x = np.concatenate(
+#                     [x, np.zeros((rest, *shape), x.dtype)], axis=0)
+#             return nn_partitioning.with_sharding_constraint(x, partition_spec)
 
-        def maybe_pad(tree, actually_pad=True):
-            if not actually_pad: return tree  # For call-site convenience below.
-            return jax.tree_util.tree_map(pad, tree)
+#         def maybe_pad(tree, actually_pad=True):
+#             if not actually_pad: return tree  # For call-site convenience below.
+#             return jax.tree_util.tree_map(pad, tree)
 
-        args = [maybe_pad(a, i not in static_argnums) for i, a in enumerate(args)]
-        kw = {k: maybe_pad(v, k not in static_argnames) for k, v in kw.items()}
-        out = wrapped(*args, **kw)
-        print(out)
+#         args = [maybe_pad(a, i not in static_argnums) for i, a in enumerate(args)]
+#         kw = {k: maybe_pad(v, k not in static_argnames) for k, v in kw.items()}
+#         out = wrapped(*args, **kw)
+#         print(out)
 
-        def unpad(x):
-            return jax.device_get(x)[:b]
-        return jax.tree_util.tree_map(unpad, out)
-    return pad_shard_unpad_wrapper
+#         def unpad(x):
+#             return jax.device_get(x)[:b]
+#         return jax.tree_util.tree_map(unpad, out)
+#     return pad_shard_unpad_wrapper
+
+
+def merge_pretrained_transformer_params(params, transformer_params, n_layer, scan_lengths):
+    transformer_params = unflatten_dict(transformer_params, sep='.')
+    if scan_lengths:
+        transformer_params = convert_scan_params(
+            transformer_params, src_keys=[f'h_{i}' for i in range(n_layer)],
+            tgt_key='hs', lengths=scan_lengths)
+
+    params = params.unfreeze()
+    old_transformer_params = flatten_dict(params['transformer'], sep=".")
+    new_transformer_params = flatten_dict(transformer_params, sep=".")
+    all_keys = list(old_transformer_params.keys())
+    for key in all_keys:
+        if key in new_transformer_params:
+            x = new_transformer_params[key]
+            p = old_transformer_params[key]
+            dtype = p.dtype
+            sharding = p.sharding
+            del old_transformer_params[key], p
+            p = jax.device_put(jnp.asarray(x, dtype=dtype), sharding)
+            old_transformer_params[key] = p
+
+    transformer_params = unflatten_dict(old_transformer_params, sep=".")
+    params['transformer'] = transformer_params
+    params = freeze(params)
+    return params

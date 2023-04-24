@@ -1,3 +1,4 @@
+from typing import Sequence
 import numpy as np
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
@@ -40,8 +41,18 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
             train_input_ids, train_attention_mask, train_labels, test_size=eval_size, random_state=seed)
 
     if sub_ratio is not None:
-        train_input_ids, _, train_attention_mask, _, train_labels, _ = train_test_split(
-            train_input_ids, train_attention_mask, train_labels, test_size=1-sub_ratio, random_state=seed)
+        if isinstance(sub_ratio, Sequence):
+            train_sub_ratio = sub_ratio[0]
+            test_sub_ratio = sub_ratio[1]
+        else:
+            train_sub_ratio = sub_ratio
+            test_sub_ratio = 1.0
+        if train_sub_ratio < 1.0:
+            train_input_ids, _, train_attention_mask, _, train_labels, _ = train_test_split(
+                train_input_ids, train_attention_mask, train_labels, test_size=1-train_sub_ratio, random_state=seed)
+        if test_sub_ratio < 1.0:
+            test_input_ids, _, test_attention_mask, _, test_labels, _ = train_test_split(
+                test_input_ids, test_attention_mask, test_labels, test_size=1-test_sub_ratio, random_state=seed)
 
     train_data = {'inputs': train_input_ids, 'attn_mask': train_attention_mask, 'labels': train_labels}
     test_data = {'inputs': test_input_ids, 'attn_mask': test_attention_mask, 'labels': test_labels}
