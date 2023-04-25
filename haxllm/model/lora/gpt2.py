@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.lora.modules import SelfAttention 
+from haxllm.model.lora.modules import SelfAttention, DenseGeneral
 
 
 def convert_config(config, **kwargs):
@@ -42,6 +42,7 @@ class TransformerConfig:
     scan_layers: Optional[int] = None
     remat_scan_lengths: Optional[Tuple[int, int]] = None
     attn_lora_r: Optional[Sequence[int]] = (0, 0, 0, 0)
+    ffn_lora_r: Optional[Sequence[int]] = (0, 0)
     lora_alpha: int = 1
 
 
@@ -54,20 +55,20 @@ class MlpBlock(nn.Module):
         n_inner = config.n_embd * 4
 
         actual_out_dim = inputs.shape[-1]
-        x = nn.Dense(
+        x = DenseGeneral(
             n_inner,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
+            r=config.ffn_lora_r[0],
+            lora_alpha=config.lora_alpha,
             name="fc_1")(inputs)
         x = nn.gelu(x)
-        x = nn.Dense(
+        x = DenseGeneral(
             actual_out_dim,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
+            r=config.ffn_lora_r[1],
+            lora_alpha=config.lora_alpha,
             name="fc_2")(x)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=deterministic)
         return x

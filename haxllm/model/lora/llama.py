@@ -52,6 +52,7 @@ class TransformerConfig:
     scan_layers: int = 0
     remat_scan_lengths: Optional[Tuple[int, int]] = None
     attn_lora_r: Optional[Sequence[int]] = (0, 0, 0, 0)
+    ffn_lora_r: Optional[Sequence[int]] = (0, 0, 0)
     lora_alpha: int = 1
 
 
@@ -61,19 +62,21 @@ class MlpBlock(nn.Module):
     @nn.compact
     def __call__(self, inputs):
         config = self.config
+        lora_r = config.ffn_lora_r
 
         dense = functools.partial(
-            nn.Dense,
-            use_bias=False,
+            DenseGeneral,
+            axis=-1,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
+            use_bias=False,
+            lora_alpha=config.lora_alpha,
         )
-
         actual_out_dim = inputs.shape[-1]
-        g = nn.silu(dense(config.n_inner, name="gate")(inputs))
-        x = g * dense(config.n_inner, name="up")(inputs)
-        x = dense(actual_out_dim, name="down")(x)
+        g = nn.silu(
+            dense(features=config.n_inner, r=lora_r[0], name="gate")(inputs))
+        x = g * dense(features=config.n_inner, r=lora_r[1], name="up")(inputs)
+        x = dense(features=actual_out_dim, r=lora_r[2], name="down")(x)
         return x
 
 
