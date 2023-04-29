@@ -10,13 +10,21 @@ from haxllm.model.modules import SelfAttention
 
 
 def convert_config(config, **kwargs):
-    d = {}
-    for k in TransformerConfig.__annotations__.keys():
-        if hasattr(config, k):
-            v = getattr(config, k)
-            if v is not None:
-                d[k] = v
-    for k, v in kwargs.items():
+    d = dict(
+        vocab_size=config.vocab_size,
+        hidden_size=config.n_embd,
+        n_heads=config.n_head,
+        n_layers=config.n_layer,
+        n_positions=config.n_positions,
+        layer_norm_epsilon =config.layer_norm_epsilon,
+        embd_pdrop=config.embd_pdrop,
+        attn_pdrop=config.attn_pdrop,
+        resid_pdrop=config.resid_pdrop,
+    )
+    kwargs_ = {**kwargs}
+    if 'scan_layers' in kwargs_ and kwargs_['scan_layers'] is None:
+        kwargs_['scan_layers'] = 0
+    for k, v in kwargs_.items():
         d[k] = v
     return TransformerConfig(**d)
 
@@ -27,9 +35,9 @@ class TransformerConfig:
     num_labels: int = 2
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
-    n_embd: int = 768
-    n_head: int = 12
-    n_layer: int = 12
+    hidden_size: int = 768
+    n_heads: int = 12
+    n_layers: int = 12
     layer_norm_epsilon: float = 1e-5
     n_positions: int = 1024
     embd_pdrop: float = 0.1
@@ -52,11 +60,11 @@ class MlpBlock(nn.Module):
     @nn.compact
     def __call__(self, inputs):
         config = self.config
-        n_inner = config.n_embd * 4
+        intermediate_size = config.hidden_size * 4
 
         actual_out_dim = inputs.shape[-1]
         x = nn.Dense(
-            n_inner,
+            intermediate_size,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
@@ -87,9 +95,9 @@ class TransformerBlock(nn.Module):
         assert inputs.ndim == 3
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
-            num_heads=config.n_head,
+            num_heads=config.n_heads,
             dtype=config.dtype,
-            qkv_features=config.n_embd,
+            qkv_features=config.hidden_size,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             use_bias=True,
@@ -119,9 +127,9 @@ class TransformerModel(nn.Module):
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
 
         inputs_embeds = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.n_embd, dtype=config.dtype, name='wte')(inputs)
+            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, name='wte')(inputs)
         position_embeds = nn.Embed(
-            num_embeddings=config.n_positions, features=config.n_embd, dtype=config.dtype, name='wpe')(position_ids)
+            num_embeddings=config.n_positions, features=config.hidden_size, dtype=config.dtype, name='wpe')(position_ids)
 
         x = inputs_embeds + position_embeds
 
@@ -137,9 +145,9 @@ class TransformerModel(nn.Module):
 
         if config.remat_scan_lengths is not None:
             remat_scan_layers = math.prod(config.remat_scan_lengths)
-            d = config.n_layer - remat_scan_layers
+            d = config.n_layers - remat_scan_layers
             if d < 0:
-                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layer={config.n_layer}")
+                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layers={config.n_layers}")
             for i in range(d):
                 x = TransformerBlock(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
             TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=config.remat_scan_lengths)
@@ -149,9 +157,9 @@ class TransformerModel(nn.Module):
             if config.remat:
                 block_fn = nn.remat(block_fn)
             scan_layers = config.scan_layers
-            d = config.n_layer - scan_layers
+            d = config.n_layers - scan_layers
             if d < 0:
-                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layer={config.n_layer}")
+                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layers={config.n_layers}")
             for i in range(d):
                 x = block_fn(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
             if scan_layers > 0:
@@ -187,11 +195,11 @@ def remap_state_dict(state_dict, config: TransformerConfig):
     root = {}
     root['wte'] = {'embedding': state_dict.pop('wte.weight')}
     root['wpe'] = {'embedding': state_dict.pop('wpe.weight')}
-    hidden_size = config.n_embd
-    n_heads = config.n_head
+    hidden_size = config.hidden_size
+    n_heads = config.n_heads
 
     # TransformerBlock
-    for d in range(config.n_layer):
+    for d in range(config.n_layers):
         block_d = {}
         block_d['ln_1'] = {'scale': state_dict.pop(f'h.{d}.ln_1.weight'), 'bias': state_dict.pop(f'h.{d}.ln_1.bias')}
         c_attn_weight = state_dict[f'h.{d}.attn.c_attn.weight']

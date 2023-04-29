@@ -1,62 +1,16 @@
 import functools
 import math
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import numpy as np
-
-import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from flax import struct
-
-from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, RMSNorm
+from flax.linen import partitioning as nn_partitioning
 
 
-# remat = functools.partial(nn.remat, policy=jax.checkpoint_policies.nothing_saveable)
-remat = nn.remat
-
-
-def convert_config(config, **kwargs):
-    d = dict(
-        vocab_size=config.vocab_size,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        n_heads=config.num_attention_heads,
-        n_layers=config.num_hidden_layers,
-        n_positions=config.max_position_embeddings,
-        rms_norm_eps =config.rms_norm_eps,
-        pad_token_id=config.pad_token_id,
-        bos_token_id=config.bos_token_id,
-        eos_token_id=config.eos_token_id,
-    )
-    kwargs_ = {**kwargs}
-    if 'scan_layers' in kwargs_ and kwargs_['scan_layers'] is None:
-        kwargs_['scan_layers'] = 0
-    for k, v in kwargs_.items():
-        d[k] = v
-    return TransformerConfig(**d)
-
-
-@struct.dataclass
-class TransformerConfig:
-    vocab_size: int = 32000
-    num_labels: int = 2
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    n_heads: int = 32
-    n_layers: int = 32
-    rms_norm_eps: float = 1e-6
-    n_positions: int = 2048
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    kernel_init: Callable = nn.initializers.xavier_uniform()
-    bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    remat: bool = False
-    scan_layers: int = 0
-    remat_scan_lengths: Optional[Tuple[int, int]] = None
+from haxllm.model.llama import TransformerConfig, convert_config, remap_state_dict
+from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, dot_product_attention, RMSNorm
+from haxllm.model.parallel.modules import DenseGeneral, Dense, Embed, remat_scan
 
 
 class MlpBlock(nn.Module):
@@ -67,7 +21,7 @@ class MlpBlock(nn.Module):
         config = self.config
 
         dense = functools.partial(
-            nn.Dense,
+            Dense,
             use_bias=False,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
@@ -75,9 +29,22 @@ class MlpBlock(nn.Module):
         )
 
         actual_out_dim = inputs.shape[-1]
-        g = nn.silu(dense(config.intermediate_size, name="gate")(inputs))
-        x = g * dense(config.intermediate_size, name="up")(inputs)
-        x = dense(actual_out_dim, name="down")(x)
+        g = nn.silu(dense(
+            features=config.intermediate_size,
+            shard_axes={"kernel": ("X", "Y")},
+            name="gate")(inputs))
+        g = nn_partitioning.with_sharding_constraint(
+            g, ("X", None, "Y"))
+        x = g * dense(
+            features=config.intermediate_size,
+            shard_axes={"kernel": ("X", "Y")},
+            name="up")(inputs)
+        x = nn_partitioning.with_sharding_constraint(
+            x, ("X", None, "Y"))
+        x = dense(
+            features=actual_out_dim,
+            shard_axes={"kernel": ("Y", "X")},
+            name="down")(x)
         return x
 
 
@@ -131,11 +98,19 @@ class SelfAttention(nn.Module):
             features=(self.num_heads, head_dim),
             kernel_init=self.kernel_init,
             use_bias=False,
+            shard_axes={"kernel": ("X", "Y", None)},
         )
 
-        query, key, value = (dense(name='query')(x),
-                             dense(name='key')(x),
-                             dense(name='value')(x))
+        qkv_constraint = functools.partial(
+            nn_partitioning.with_sharding_constraint,
+            logical_axis_resources=("X", None, "Y", None),
+        )
+
+        query, key, value = (
+            qkv_constraint(dense(name='query')(x)),
+            qkv_constraint(dense(name='key')(x)),
+            qkv_constraint(dense(name='value')(x)),
+        )
 
         cos, sin = precompute_freqs_cis(dim=head_dim, end=seq_len, dtype=self.dtype)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
@@ -149,8 +124,11 @@ class SelfAttention(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            name='out',  # type: ignore[call-arg]
+            shard_axes={"kernel": ("Y", None, "X")},
+            name='out',
         )(x)
+        out = nn_partitioning.with_sharding_constraint(
+            out, ("X", None, "Y"))
         return out
 
 
@@ -188,8 +166,17 @@ class TransformerModel(nn.Module):
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
 
-        x = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, param_dtype=config.param_dtype, name='wte')(inputs)
+        embed_layer = Embed
+        if config.remat_scan_lengths is not None or config.remat:
+            embed_layer = nn.remat(Embed)
+        x = embed_layer(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            shard_axes={"embedding": (None, "Y")},
+            name='wte'
+        )(inputs)
 
         if attn_mask is not None:
             casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
@@ -202,12 +189,15 @@ class TransformerModel(nn.Module):
                 raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layers={config.n_layers}")
             for i in range(d):
                 x = TransformerBlock(config, name=f'h_{i}')((x, attn_mask))[0]
-            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=config.remat_scan_lengths)
+            TransformerBlockStack = remat_scan(
+                TransformerBlock, lengths=config.remat_scan_lengths,
+                variable_axes={"params": 0}, split_rngs={True: True},
+                metadata_params1={nn.PARTITION_NAME: None}, metadata_params2={nn.PARTITION_NAME: None})
             x = TransformerBlockStack(config, name='hs')((x, attn_mask))[0]
         else:
             block_fn = TransformerBlock
             if config.remat:
-                block_fn = remat(block_fn)
+                block_fn = nn.remat(block_fn)
             scan_layers = config.scan_layers
             d = config.n_layers - scan_layers
             if d < 0:
@@ -215,13 +205,14 @@ class TransformerModel(nn.Module):
             for i in range(d):
                 x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
             if scan_layers > 0:
-                TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
+                TransformerBlockStack = nn.scan(
+                    block_fn, length=scan_layers, variable_axes={True: 0},
+                    metadata_params={nn.PARTITION_NAME: None}, split_rngs={True: True})
                 x = TransformerBlockStack(config, scan=True, name='hs')((x, attn_mask))[0][0]
+        norm_layer = RMSNorm
         if config.remat_scan_lengths is not None or config.remat:
-            norm = remat(RMSNorm)
-        else:
-            norm = RMSNorm
-        x = norm(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
+            norm_layer = nn.remat(RMSNorm)
+        x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
         return x
 
 
@@ -237,45 +228,10 @@ class TransformerSequenceClassifier(nn.Module):
         seq_len = (jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1)
         x = x[jnp.arange(batch_size), seq_len]
 
-        x = nn.Dense(
+        x = Dense(
             config.num_labels,
             dtype=config.dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             name='score')(x)
         return x
-
-
-def remap_state_dict(state_dict, config: TransformerConfig):
-    root = {}
-    root['wte'] = {'embedding': state_dict.pop('model.embed_tokens.weight')}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
-
-    for d in range(config.n_layers):
-        block_d = {}
-        block_d['ln_1'] = {'scale': state_dict.pop(f'model.layers.{d}.input_layernorm.weight')}
-        block_d['attn'] = {
-            'query': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.q_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'key': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.k_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'value': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.v_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'out': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.o_proj.weight').T.reshape(n_heads, -1, hidden_size),
-            },
-        }
-        block_d['ln_2'] = {'scale': state_dict.pop(f'model.layers.{d}.post_attention_layernorm.weight')}
-        block_d['mlp'] = {
-            'gate': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.gate_proj.weight').T},
-            'up': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.up_proj.weight').T},
-            'down': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.down_proj.weight').T},
-        }
-        root[f'h_{d}'] = block_d
-
-    root['ln_f'] = {'scale': state_dict.pop('model.norm.weight')}
-    return root

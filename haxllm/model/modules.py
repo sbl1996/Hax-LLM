@@ -155,7 +155,7 @@ class MultiHeadDotProductAttention(Module):
             use_bias=self.use_bias,
         )
         # project inputs_q to multi-headed q/k/v
-        # dimensions are then [batch..., length, n_heads, n_features_per_head]
+        # dimensions are then [batch..., length, num_attention_headss, n_features_per_head]
         query, key, value = (dense(name='query')(inputs_q),
                              dense(name='key')(inputs_kv),
                              dense(name='value')(inputs_kv))

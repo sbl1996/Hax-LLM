@@ -43,21 +43,23 @@ def get_partition_spec(in_dict, rules):
 
 def _get_partition_rules_gpt2():
     spec = [
-        (("hs", "attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
-        (("hs", "attn", "out", "kernel"), P("Y", None, "X")), 
-        (("hs", "mlp", "fc_1", "kernel"), P("X", "Y")),
-        (("hs", "mlp", "fc_2", "kernel"), P("Y", "X")),
+        (("wte", "embedding"), P(None, "Y")),
+        (("attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
+        (("attn", "out", "kernel"), P("Y", None, "X")), 
+        (("mlp", "fc_1", "kernel"), P("X", "Y")),
+        (("mlp", "fc_2", "kernel"), P("Y", "X")),
     ]
     return spec
 
 
 def _get_partition_rules_llama():
     spec = [
-        (("hs", "attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
-        (("hs", "attn", "out", "kernel"), P("Y", None, "X")), 
-        (("hs", "mlp", "gate", "kernel"), P("X", "Y")),
-        (("hs", "mlp", "up", "kernel"), P("X", "Y")),
-        (("hs", "mlp", "down", "kernel"), P("Y", "X")),
+        (("wte", "embedding"), P(None, "Y")),
+        (("attn", "(query|key|value)", "kernel"), P("X", "Y", None)), 
+        (("attn", "out", "kernel"), P("Y", None, "X")), 
+        (("mlp", "gate", "kernel"), P("X", "Y")),
+        (("mlp", "up", "kernel"), P("X", "Y")),
+        (("mlp", "down", "kernel"), P("Y", "X")),
     ]
     return spec
 

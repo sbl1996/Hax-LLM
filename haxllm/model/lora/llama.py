@@ -8,15 +8,16 @@ import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, RMSNorm
+from haxllm.model.llama import remap_state_dict
 from haxllm.model.lora.modules import DenseGeneral
 
 def convert_config(config, **kwargs):
     d = dict(
         vocab_size=config.vocab_size,
-        n_embd=config.hidden_size,
-        n_inner=config.intermediate_size,
-        n_head=config.num_attention_heads,
-        n_layer=config.num_hidden_layers,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        n_heads=config.num_attention_heads,
+        n_layers=config.num_hidden_layers,
         n_positions=config.max_position_embeddings,
         rms_norm_eps =config.rms_norm_eps,
         pad_token_id=config.pad_token_id,
@@ -37,10 +38,10 @@ class TransformerConfig:
     num_labels: int = 2
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
-    n_embd: int = 4096
-    n_inner: int = 11008
-    n_head: int = 32
-    n_layer: int = 32
+    hidden_size: int = 4096
+    intermediate_size: int = 11008
+    n_heads: int = 32
+    n_layers: int = 32
     rms_norm_eps: float = 1e-6
     n_positions: int = 2048
     pad_token_id: int = 0
@@ -74,8 +75,8 @@ class MlpBlock(nn.Module):
         )
         actual_out_dim = inputs.shape[-1]
         g = nn.silu(
-            dense(features=config.n_inner, r=lora_r[0], name="gate")(inputs))
-        x = g * dense(features=config.n_inner, r=lora_r[1], name="up")(inputs)
+            dense(features=config.intermediate_size, r=lora_r[0], name="gate")(inputs))
+        x = g * dense(features=config.intermediate_size, r=lora_r[1], name="up")(inputs)
         x = dense(features=actual_out_dim, r=lora_r[2], name="down")(x)
         return x
 
@@ -172,7 +173,7 @@ class TransformerBlock(nn.Module):
         x = SelfAttention(
             lora_r=config.attn_lora_r,
             lora_alpha=config.lora_alpha,
-            num_heads=config.n_head,
+            num_heads=config.n_heads,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
@@ -195,7 +196,7 @@ class TransformerModel(nn.Module):
         config = self.config
 
         x = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.n_embd, dtype=config.dtype, param_dtype=config.param_dtype, name='wte')(inputs)
+            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, param_dtype=config.param_dtype, name='wte')(inputs)
 
         if attn_mask is not None:
             casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
@@ -203,9 +204,9 @@ class TransformerModel(nn.Module):
             attn_mask = nn.combine_masks(casual_mask, attn_mask)
         if config.remat_scan_lengths is not None:
             remat_scan_layers = math.prod(config.remat_scan_lengths)
-            d = config.n_layer - remat_scan_layers
+            d = config.n_layers - remat_scan_layers
             if d < 0:
-                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layer={config.n_layer}")
+                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layers={config.n_layers}")
             for i in range(d):
                 x = TransformerBlock(config, name=f'h_{i}')((x, attn_mask))[0]
             TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=config.remat_scan_lengths)
@@ -215,9 +216,9 @@ class TransformerModel(nn.Module):
             if config.remat:
                 block_fn = nn.remat(block_fn)
             scan_layers = config.scan_layers
-            d = config.n_layer - scan_layers
+            d = config.n_layers - scan_layers
             if d < 0:
-                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layer={config.n_layer}")
+                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layers={config.n_layers}")
             for i in range(d):
                 x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
             if scan_layers > 0:
@@ -246,38 +247,3 @@ class TransformerSequenceClassifier(nn.Module):
             bias_init=config.bias_init,
             name='score')(x)
         return x
-
-
-def remap_state_dict(state_dict, config: TransformerConfig):
-    root = {}
-    root['wte'] = {'embedding': state_dict.pop('model.embed_tokens.weight')}
-    hidden_size = config.n_embd
-    n_heads = config.n_head
-
-    for d in range(config.n_layer):
-        block_d = {}
-        block_d['ln_1'] = {'scale': state_dict.pop(f'model.layers.{d}.input_layernorm.weight')}
-        block_d['attn'] = {
-            'query': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.q_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'key': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.k_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'value': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.v_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'out': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.o_proj.weight').T.reshape(n_heads, -1, hidden_size),
-            },
-        }
-        block_d['ln_2'] = {'scale': state_dict.pop(f'model.layers.{d}.post_attention_layernorm.weight')}
-        block_d['mlp'] = {
-            'gate': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.gate_proj.weight').T},
-            'up': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.up_proj.weight').T},
-            'down': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.down_proj.weight').T},
-        }
-        root[f'h_{d}'] = block_d
-
-    root['ln_f'] = {'scale': state_dict.pop('model.norm.weight')}
-    return root

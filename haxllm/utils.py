@@ -48,9 +48,9 @@ def get_metrics(all_metrics, pmap=True):
         all_metrics = common_utils.get_metrics(all_metrics)
         all_metrics = jax.tree_util.tree_map(jnp.sum, all_metrics)
     else:
-        metrics_np = jax.device_get(all_metrics)
+        # metrics_np = jax.device_get(all_metrics)
         all_metrics = jax.tree_util.tree_map(
-            lambda *xs: np.stack(xs).sum(), *metrics_np)
+            lambda *xs: np.stack(xs).sum(), *all_metrics)
     denominator = all_metrics.pop('total')
     summary = jax.tree_util.tree_map(
         lambda x: x / denominator, all_metrics)
@@ -58,6 +58,8 @@ def get_metrics(all_metrics, pmap=True):
 
 
 def freeze_params_optimizer(optimizer, params, trainable_pattern):
+    if not trainable_pattern:
+        return optimizer
     optimizers = {'trainable': optimizer, 'frozen': optax.set_to_zero()}
 
     def match_label(path, v):
@@ -162,11 +164,11 @@ def pad(x, batch_size):
 #     return pad_shard_unpad_wrapper
 
 
-def merge_pretrained_transformer_params(params, transformer_params, n_layer, scan_lengths):
+def merge_pretrained_transformer_params(params, transformer_params, n_layers, scan_lengths, cpu=False):
     transformer_params = unflatten_dict(transformer_params, sep='.')
     if scan_lengths:
         transformer_params = convert_scan_params(
-            transformer_params, src_keys=[f'h_{i}' for i in range(n_layer)],
+            transformer_params, src_keys=[f'h_{i}' for i in range(n_layers)],
             tgt_key='hs', lengths=scan_lengths)
 
     params = params.unfreeze()
@@ -178,10 +180,18 @@ def merge_pretrained_transformer_params(params, transformer_params, n_layer, sca
             x = new_transformer_params[key]
             p = old_transformer_params[key]
             dtype = p.dtype
-            sharding = p.sharding
-            del old_transformer_params[key], p
-            p = jax.device_put(jnp.asarray(x, dtype=dtype), sharding)
-            old_transformer_params[key] = p
+            if cpu:
+                del old_transformer_params[key]
+                with jax.default_device(jax.devices('cpu')[0]):
+                    p = jnp.where(True, x, p)
+                    p.block_until_ready()
+                old_transformer_params[key] = p
+            else:
+                sharding = p.sharding
+                del old_transformer_params[key], p
+                p = jax.device_put(jnp.asarray(x, dtype=dtype), sharding)
+                p.block_until_ready()
+                old_transformer_params[key] = p
 
     transformer_params = unflatten_dict(old_transformer_params, sep=".")
     params['transformer'] = transformer_params
