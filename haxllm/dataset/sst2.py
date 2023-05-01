@@ -1,3 +1,4 @@
+from typing import Sequence
 import numpy as np
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
