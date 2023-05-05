@@ -172,28 +172,26 @@ def merge_pretrained_transformer_params(params, transformer_params, n_layers, sc
             tgt_key='hs', lengths=scan_lengths)
 
     params = params.unfreeze()
-    old_transformer_params = flatten_dict(params['transformer'], sep=".")
-    new_transformer_params = flatten_dict(transformer_params, sep=".")
-    all_keys = list(old_transformer_params.keys())
+    t_params = flatten_dict(params['transformer'], sep=".")
+    pt_params = flatten_dict(transformer_params, sep=".")
+    all_keys = list(t_params.keys())
+    cpu_device = jax.devices('cpu')[0]
     for key in all_keys:
-        if key in new_transformer_params:
-            x = new_transformer_params[key]
-            p = old_transformer_params[key]
+        if key in pt_params:
+            x = pt_params[key]
+            p = t_params[key]
             dtype = p.dtype
             if cpu:
-                del old_transformer_params[key]
-                with jax.default_device(jax.devices('cpu')[0]):
-                    p = jnp.where(True, x, p)
-                    p.block_until_ready()
-                old_transformer_params[key] = p
+                device = cpu_device
             else:
-                sharding = p.sharding
-                del old_transformer_params[key], p
-                p = jax.device_put(jnp.asarray(x, dtype=dtype), sharding)
-                p.block_until_ready()
-                old_transformer_params[key] = p
+                device = p.sharding
+            del t_params[key], p
+            x = x.astype(dtype)
+            p = jax.device_put(x, device)
+            p.block_until_ready()
+            t_params[key] = p
 
-    transformer_params = unflatten_dict(old_transformer_params, sep=".")
+    transformer_params = unflatten_dict(t_params, sep=".")
     params['transformer'] = transformer_params
     params = freeze(params)
     return params
