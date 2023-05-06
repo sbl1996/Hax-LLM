@@ -69,7 +69,11 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
         ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
     elif loader == 'paddle':
         from haxllm.dataset.paddle.utils import create_paddle_loader
-        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True, num_workers=num_workers)
-        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False, num_workers=num_workers)
+        if isinstance(num_workers, Sequence):
+            num_workers_train, num_workers_eval  = num_workers
+        else:
+            num_workers_train = num_workers_eval = num_workers
+        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True, num_workers=num_workers_train)
+        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False, num_workers=num_workers_eval)
 
     return ds_train, steps_per_epoch, ds_eval, eval_steps
