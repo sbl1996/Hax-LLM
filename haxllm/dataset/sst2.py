@@ -4,8 +4,8 @@ from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
 
-def load_data(split, tokenize_function):
-    dataset = load_dataset('glue', 'sst2', split=split)
+def load_data(split, tokenize_function, cache_dir=None):
+    dataset = load_dataset('glue', 'sst2', split=split, cache_dir=cache_dir)
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
     tokenized_dataset.set_format(type='numpy', columns=['input_ids', 'attention_mask', 'label']) # type: ignore
     input_ids = tokenized_dataset['input_ids'] # type: ignore
@@ -25,18 +25,18 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_batch_size=None,
-                   seed=42, with_test=False, sub_ratio=None, loader='tf'):
+                   seed=42, with_test=False, sub_ratio=None, loader='tf', cache_dir=None):
     assert eval_size is None, 'eval_size is not supported for SST-2'
     if eval_batch_size is None:
         eval_batch_size = batch_size
 
     tokenize_fn = lambda x: tokenize_function(tokenizer, x, max_len)
     if with_test:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn)
-        test_input_ids, test_attention_mask, test_labels = load_data('test', tokenize_fn)
+        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
+        test_input_ids, test_attention_mask, test_labels = load_data('test', tokenize_fn, cache_dir=cache_dir)
     else:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn)
-        test_input_ids, test_attention_mask, test_labels = load_data('validation', tokenize_fn)
+        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
+        test_input_ids, test_attention_mask, test_labels = load_data('validation', tokenize_fn, cache_dir=cache_dir)
 
     if sub_ratio is not None:
         if isinstance(sub_ratio, Sequence):

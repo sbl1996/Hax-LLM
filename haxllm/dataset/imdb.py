@@ -3,11 +3,9 @@ import numpy as np
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
-from haxllm.dataset.utils import create_tfds
 
-
-def load_data(split, tokenize_function):
-    dataset = load_dataset('imdb', split=split)
+def load_data(split, tokenize_function, cache_dir):
+    dataset = load_dataset('imdb', split=split, cache_dir=cache_dir)
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
     tokenized_dataset.set_format(type='numpy', columns=['input_ids', 'attention_mask', 'label'])
     input_ids = tokenized_dataset['input_ids']
@@ -27,15 +25,15 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_batch_size=None,
-                seed=42, with_test=False, sub_ratio=None):
+                seed=42, with_test=False, sub_ratio=None, loader='tf', cache_dir=None):
     if eval_batch_size is None:
         eval_batch_size = batch_size
     tokenize_fn = lambda x: tokenize_function(tokenizer, x, max_len)
     if with_test:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn)
-        test_input_ids, test_attention_mask, test_labels = load_data('test', tokenize_fn)
+        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
+        test_input_ids, test_attention_mask, test_labels = load_data('test', tokenize_fn, cache_dir=cache_dir)
     else:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn)
+        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
 
         train_input_ids, test_input_ids, train_attention_mask, test_attention_mask, train_labels, test_labels = train_test_split(
             train_input_ids, train_attention_mask, train_labels, test_size=eval_size, random_state=seed)
@@ -65,7 +63,13 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
     train_data = cast_dtype(train_data)
     test_data = cast_dtype(test_data)
 
-    ds_train, steps_per_epoch = create_tfds(train_data, batch_size, train=True, seed=seed)
-    ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
+    if loader == 'tf':
+        from haxllm.dataset.utils import create_tfds
+        ds_train, steps_per_epoch = create_tfds(train_data, batch_size, train=True, seed=seed)
+        ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
+    elif loader == 'paddle':
+        from haxllm.dataset.paddle.utils import create_paddle_loader
+        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True)
+        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False)
 
     return ds_train, steps_per_epoch, ds_eval, eval_steps
