@@ -25,7 +25,7 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_batch_size=None,
-                seed=42, with_test=False, sub_ratio=None, loader='tf', cache_dir=None):
+                seed=42, with_test=False, sub_ratio=None, loader='tf', cache_dir=None, num_workers=0):
     if eval_batch_size is None:
         eval_batch_size = batch_size
     tokenize_fn = lambda x: tokenize_function(tokenizer, x, max_len)
@@ -69,7 +69,7 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
         ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
     elif loader == 'paddle':
         from haxllm.dataset.paddle.utils import create_paddle_loader
-        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True)
-        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False)
+        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True, num_workers=num_workers)
+        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False, num_workers=num_workers)
 
     return ds_train, steps_per_epoch, ds_eval, eval_steps

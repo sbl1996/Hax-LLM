@@ -14,6 +14,7 @@ def create_dataset(
     sub_ratio=None,
     loader="tf",
     cache_dir=None,
+    num_workers=0,
 ):
     if name == "imdb":
         return create_imdb_dataset(
@@ -27,6 +28,7 @@ def create_dataset(
             sub_ratio,
             loader=loader,
             cache_dir=cache_dir,
+            num_workers=num_workers,
         )
     elif name == "sst2":
         return create_sst2_dataset(
@@ -40,6 +42,7 @@ def create_dataset(
             sub_ratio,
             loader=loader,
             cache_dir=cache_dir,
+            num_worker=num_workers,
         )
     else:
         raise ValueError(f"Unknown dataset: {name}")

@@ -43,7 +43,7 @@ def default_collate_fn(batch):
                     "dict, list, number, but got {}".format(type(sample)))
 
 
-def create_paddle_loader(data, batch_size, train):
+def create_paddle_loader(data, batch_size, train, num_workers):
     drop_last = train
     n = next(iter(data.values())).shape[0]
     data = {**data, 'mask': np.ones(n, dtype=np.bool_)}
@@ -52,5 +52,5 @@ def create_paddle_loader(data, batch_size, train):
     else:
         steps_per_epoch = math.ceil(n // batch_size)
     dataset = TensorDictDataset(data)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=2, drop_last=drop_last, collate_fn=default_collate_fn)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers, drop_last=drop_last, collate_fn=default_collate_fn)
     return data_loader, steps_per_epoch
