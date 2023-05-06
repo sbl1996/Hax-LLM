@@ -3,7 +3,7 @@ import numpy as np
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
-from haxllm.dataset.utils import create_ds
+from haxllm.dataset.utils import create_tfds
 
 
 def load_data(split, tokenize_function):
@@ -65,7 +65,7 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
     train_data = cast_dtype(train_data)
     test_data = cast_dtype(test_data)
 
-    ds_train, steps_per_epoch = create_ds(train_data, batch_size, train=True, seed=seed)
-    ds_eval, eval_steps = create_ds(test_data, eval_batch_size, train=False, seed=seed)
+    ds_train, steps_per_epoch = create_tfds(train_data, batch_size, train=True, seed=seed)
+    ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
 
     return ds_train, steps_per_epoch, ds_eval, eval_steps

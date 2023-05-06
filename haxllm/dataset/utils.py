@@ -1,9 +1,9 @@
 import math
 import numpy as np
-import tensorflow as tf
 
 
-def create_ds(data, batch_size, train=True, seed=None):
+def create_tfds(data, batch_size, train=True, seed=None):
+    import tensorflow as tf
     drop_remainder = train
     n = next(iter(data.values())).shape[0]
     data = {**data, 'mask': np.ones(n, dtype=np.bool_)}

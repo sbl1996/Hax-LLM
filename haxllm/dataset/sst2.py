@@ -3,8 +3,6 @@ import numpy as np
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
-from haxllm.dataset.utils import create_ds
-
 
 def load_data(split, tokenize_function):
     dataset = load_dataset('glue', 'sst2', split=split)
@@ -27,7 +25,7 @@ def tokenize_function(tokenizer, example, max_len):
     
 
 def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_batch_size=None,
-                   seed=42, with_test=False, sub_ratio=None):
+                   seed=42, with_test=False, sub_ratio=None, loader='tf'):
     assert eval_size is None, 'eval_size is not supported for SST-2'
     if eval_batch_size is None:
         eval_batch_size = batch_size
@@ -65,7 +63,13 @@ def create_dataset(tokenizer, max_len=128, eval_size=None, batch_size=128, eval_
     train_data = cast_dtype(train_data)
     test_data = cast_dtype(test_data)
 
-    ds_train, steps_per_epoch = create_ds(train_data, batch_size, train=True, seed=seed)
-    ds_eval, eval_steps = create_ds(test_data, eval_batch_size, train=False, seed=seed)
+    if loader == 'tf':
+        from haxllm.dataset.utils import create_tfds
+        ds_train, steps_per_epoch = create_tfds(train_data, batch_size, train=True, seed=seed)
+        ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
+    elif loader == 'paddle':
+        from haxllm.dataset.paddle.utils import create_paddle_loader
+        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True)
+        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False)
 
     return ds_train, steps_per_epoch, ds_eval, eval_steps

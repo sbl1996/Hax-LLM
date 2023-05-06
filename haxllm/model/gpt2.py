@@ -2,7 +2,6 @@ import math
 from typing import Any, Callable, Optional, Tuple
 
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
 import flax.linen as nn
 from flax import struct
 
@@ -90,9 +89,14 @@ class TransformerBlock(nn.Module):
     def __call__(self, x):
         inputs, attn_mask = x
         config = self.config
-        # inputs = nn_partitioning.with_sharding_constraint(inputs, P("X", None, None))
 
-        assert inputs.ndim == 3
+        if config.is_casual:
+            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
+            attn_mask_ = attn_mask[:, None, None, :]
+            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        else:
+            attn_mask_ = attn_mask[:, None, None, :]
+
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
@@ -104,7 +108,7 @@ class TransformerBlock(nn.Module):
             broadcast_dropout=False,
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
-            name='attn')(x, attn_mask)
+            name='attn')(x, attn_mask_)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
@@ -123,6 +127,7 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
+        remat = config.remat_scan_lengths is not None or config.remat
 
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
 
@@ -133,15 +138,8 @@ class TransformerModel(nn.Module):
 
         x = inputs_embeds + position_embeds
 
-        x = nn.Dropout(rate=config.embd_pdrop)(x, deterministic=not train)
-
-        if attn_mask is not None:
-            if config.is_casual:
-                casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-                attn_mask = attn_mask[:, None, None, :]
-                attn_mask = nn.combine_masks(casual_mask, attn_mask)
-            else:
-                attn_mask = attn_mask[:, None, None, :]
+        dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
+        x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
         if config.remat_scan_lengths is not None:
             remat_scan_layers = math.prod(config.remat_scan_lengths)
@@ -163,9 +161,11 @@ class TransformerModel(nn.Module):
             for i in range(d):
                 x = block_fn(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
             if scan_layers > 0:
+                block_fn = nn.remat(TransformerBlock, prevent_cse=False)
                 TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
                 x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
-        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
+        norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
+        x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
         return x
 
 

@@ -16,13 +16,24 @@ import optax
 
 
 def spec_from_dataset(dataset, input_keys):
-    element_spec = dataset.element_spec
-    return {
-        key: {
-            'shape': element_spec[key].shape.as_list(),
-            'dtype': element_spec[key].dtype.name,
-        } for key in input_keys
-    }
+    if 'paddle' in str(type(dataset)):
+        loader = dataset
+        tensors = loader.dataset.tensor_dict
+        batch_size = loader.batch_size
+        return {
+            key: {
+                'shape': (batch_size,) + tensors[key].shape[1:],
+                'dtype': tensors[key].dtype.name,
+            } for key in input_keys
+        }
+    else:
+        element_spec = dataset.element_spec
+        return {
+            key: {
+                'shape': element_spec[key].shape.as_list(),
+                'dtype': element_spec[key].dtype.name,
+            } for key in input_keys
+        }
 
 
 def init_model(input_spec, model, init_rng):
