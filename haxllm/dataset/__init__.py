@@ -42,7 +42,7 @@ def create_dataset(
             sub_ratio,
             loader=loader,
             cache_dir=cache_dir,
-            num_worker=num_workers,
+            num_workers=num_workers,
         )
     else:
         raise ValueError(f"Unknown dataset: {name}")
