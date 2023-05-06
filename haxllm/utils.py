@@ -1,6 +1,8 @@
 import math
 import re
 from datetime import datetime, timedelta
+import collections
+import itertools
 
 import numpy as np
 
@@ -206,3 +208,25 @@ def merge_pretrained_transformer_params(params, transformer_params, n_layers, sc
     params['transformer'] = transformer_params
     params = freeze(params)
     return params
+
+
+def prefetch_to_device(iterator, size, device):
+    queue = collections.deque()
+
+    def _prefetch(x):
+        return jax.device_put(x, device)
+
+    def enqueue(n):  # Enqueues *up to* `n` elements from the iterator.
+        for data in itertools.islice(iterator, n):
+            queue.append(jax.tree_util.tree_map(_prefetch, data))
+
+    enqueue(size)  # Fill up the buffer.
+    while queue:
+        yield queue.popleft()
+        enqueue(1)
+
+
+def create_input_iter(ds, device, prepare_fn):
+    it = map(prepare_fn, ds)
+    it = prefetch_to_device(it, 2, device)
+    return it

@@ -59,7 +59,7 @@ class MlpBlock(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, inputs, deterministic=True):
+    def __call__(self, inputs):
         config = self.config
         intermediate_size = config.hidden_size * 4
 
@@ -79,7 +79,6 @@ class MlpBlock(nn.Module):
             r=config.ffn_lora_r[1],
             lora_alpha=config.lora_alpha,
             name="fc_2")(x)
-        x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=deterministic)
         return x
 
 
@@ -93,7 +92,12 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        assert inputs.ndim == 3
+        if config.is_casual:
+            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
+            attn_mask_ = attn_mask[:, None, None, :]
+            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        else:
+            attn_mask_ = attn_mask[:, None, None, :]
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
@@ -108,11 +112,13 @@ class TransformerBlock(nn.Module):
             deterministic=self.deterministic,
             attn_lora_r=config.attn_lora_r,
             lora_alpha=config.lora_alpha,
-            name='attn')(x, attn_mask)
+            name='attn')(x, attn_mask_)
+        x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
         y = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_2')(x)
-        y = MlpBlock(config=config, name='mlp')(y, deterministic=self.deterministic)
+        y = MlpBlock(config=config, name='mlp')(y)
+        y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
         if self.scan:
             return (x + y, attn_mask), None
         else:    
@@ -125,25 +131,19 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
+        remat = config.remat_scan_lengths is not None or config.remat
 
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
 
         inputs_embeds = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, name='wte')(inputs)
+            num_embeddings=config.vocab_size, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wte')(inputs)
         position_embeds = nn.Embed(
-            num_embeddings=config.n_positions, features=config.hidden_size, dtype=config.dtype, name='wpe')(position_ids)
+            num_embeddings=config.n_positions, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wpe')(position_ids)
 
         x = inputs_embeds + position_embeds
 
-        x = nn.Dropout(rate=config.embd_pdrop)(x, deterministic=not train)
-
-        if attn_mask is not None:
-            if config.is_casual:
-                casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-                attn_mask = attn_mask[:, None, None, :]
-                attn_mask = nn.combine_masks(casual_mask, attn_mask)
-            else:
-                attn_mask = attn_mask[:, None, None, :]
+        dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
+        x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
         if config.remat_scan_lengths is not None:
             remat_scan_layers = math.prod(config.remat_scan_lengths)
@@ -165,9 +165,12 @@ class TransformerModel(nn.Module):
             for i in range(d):
                 x = block_fn(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
             
-            TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
-            x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
-        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
+            if scan_layers > 0:
+                block_fn = nn.remat(TransformerBlock, prevent_cse=False)
+                TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
+                x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
+        norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
+        x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
         return x
 
 

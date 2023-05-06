@@ -101,6 +101,7 @@ class TransformerBlock(nn.Module):
         x = SelfAttention(
             num_heads=config.n_heads,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             qkv_features=config.hidden_size,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
@@ -132,9 +133,9 @@ class TransformerModel(nn.Module):
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
 
         inputs_embeds = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, name='wte')(inputs)
+            num_embeddings=config.vocab_size, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wte')(inputs)
         position_embeds = nn.Embed(
-            num_embeddings=config.n_positions, features=config.hidden_size, dtype=config.dtype, name='wpe')(position_ids)
+            num_embeddings=config.n_positions, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wpe')(position_ids)
 
         x = inputs_embeds + position_embeds
 
@@ -184,6 +185,7 @@ class TransformerSequenceClassifier(nn.Module):
         x = nn.Dense(
             config.num_labels,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
             name='score')(x)

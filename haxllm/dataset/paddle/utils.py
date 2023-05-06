@@ -52,5 +52,7 @@ def create_paddle_loader(data, batch_size, train, num_workers):
     else:
         steps_per_epoch = math.ceil(n // batch_size)
     dataset = TensorDictDataset(data)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers, drop_last=drop_last, collate_fn=default_collate_fn)
+    data_loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers, drop_last=drop_last, collate_fn=default_collate_fn,
+        persistent_workers=True)
     return data_loader, steps_per_epoch
