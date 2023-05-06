@@ -50,7 +50,7 @@ def init_model(input_spec, model, init_rng):
 
 
 def time_now():
-    now = datetime.now() + timedelta(hours=8)
+    now = datetime.utcnow() + timedelta(hours=8)
     return now.strftime("%H:%M:%S")
 
 
