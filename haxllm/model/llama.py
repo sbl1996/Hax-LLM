@@ -1,6 +1,5 @@
 import functools
-import math
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -15,24 +14,47 @@ from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_in
 # remat = functools.partial(nn.remat, policy=jax.checkpoint_policies.nothing_saveable)
 remat = nn.remat
 
+config_hub = {
+    "llama-7b": dict(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+    ),
+    "llama-13b": dict(
+        hidden_size=5120,
+        intermediate_size=13824,
+        n_heads=40,
+        n_layers=40,
+    ),
+    "llama-30b": dict(
+        hidden_size=6656,
+        intermediate_size=17920,
+        n_heads=52,
+        n_layers=60,
+    ),
+    "llama-65b": dict(
+        hidden_size=8192,
+        intermediate_size=22016,
+        n_heads=64,
+        n_layers=80,
+    ),
+}
 
-def convert_config(config, **kwargs):
-    d = dict(
-        vocab_size=config.vocab_size,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        n_heads=config.num_attention_heads,
-        n_layers=config.num_hidden_layers,
-        n_positions=config.max_position_embeddings,
-        rms_norm_eps =config.rms_norm_eps,
-        pad_token_id=config.pad_token_id,
-        bos_token_id=config.bos_token_id,
-        eos_token_id=config.eos_token_id,
-    )
-    kwargs_ = {**kwargs}
-    if 'scan_layers' in kwargs_ and kwargs_['scan_layers'] is None:
-        kwargs_['scan_layers'] = 0
-    for k, v in kwargs_.items():
+def load_config(name, **kwargs):
+    d = {**config_hub[name]}
+    kwargs = {**kwargs}
+    if 'scan_layers' in kwargs:
+        if kwargs['scan_layers'] is None:
+            kwargs['scan_layers'] = 0
+        elif kwargs['scan_layers'] == -1:
+            kwargs['scan_layers'] = d['n_layers']
+    if 'remat_scan_lengths' in kwargs:
+        remat_scan_lengths = kwargs['remat_scan_lengths']
+        if remat_scan_lengths is not None:
+            if len(remat_scan_lengths) == 1:
+                remat_scan_lengths = (remat_scan_lengths[0], remat_scan_lengths[0])
+    for k, v in kwargs.items():
         d[k] = v
     return TransformerConfig(**d)
 
@@ -55,8 +77,22 @@ class TransformerConfig:
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     remat: bool = False
-    scan_layers: int = 0
-    remat_scan_lengths: Optional[Tuple[int, int]] = None
+    scan: bool = False
+    remat_scan: bool = False
+
+    def scan_layers(self):
+        return self.n_layers if self.scan else 0
+
+    def remat_scan_lengths(self):
+        return (self.n_layers, 1) if self.remat_scan else None
+
+    def scan_lengths(self):
+        if self.remat_scan:
+            return self.remat_scan_lengths()
+        elif self.scan:
+            return self.scan_layers()
+        else:
+            return None
 
 
 class MlpBlock(nn.Module):
@@ -195,32 +231,21 @@ class TransformerModel(nn.Module):
             casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
             attn_mask = attn_mask[:, None, None, :]
             attn_mask = nn.combine_masks(casual_mask, attn_mask)
-        if config.remat_scan_lengths is not None:
-            remat_scan_layers = math.prod(config.remat_scan_lengths)
-            d = config.n_layers - remat_scan_layers
-            if d < 0:
-                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layers={config.n_layers}")
-            for i in range(d):
-                x = TransformerBlock(config, name=f'h_{i}')((x, attn_mask))[0]
-            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=config.remat_scan_lengths)
+        if config.remat_scan:
+            remat_scan_lengths = config.remat_scan_lengths()
+            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
             x = TransformerBlockStack(config, name='hs')((x, attn_mask))[0]
         else:
             block_fn = TransformerBlock
             if config.remat:
                 block_fn = remat(block_fn)
-            scan_layers = config.scan_layers
-            d = config.n_layers - scan_layers
-            if d < 0:
-                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layers={config.n_layers}")
-            for i in range(d):
-                x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
-            if scan_layers > 0:
-                TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
+            if config.scan:
+                for i in range(config.n_layers):
+                    x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
+            else:
+                TransformerBlockStack = nn.scan(block_fn, length=config.n_layers, variable_axes={True: 0}, split_rngs={True: True})
                 x = TransformerBlockStack(config, scan=True, name='hs')((x, attn_mask))[0][0]
-        if config.remat_scan_lengths is not None or config.remat:
-            norm = remat(RMSNorm)
-        else:
-            norm = RMSNorm
+        norm = remat(RMSNorm) if config.remat else RMSNorm
         x = norm(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
         return x
 
