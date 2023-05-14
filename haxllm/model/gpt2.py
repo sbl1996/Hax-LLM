@@ -1,31 +1,45 @@
-import math
-from typing import Any, Callable, Optional, Tuple
+import functools
+from typing import Any, Callable
 
 import jax.numpy as jnp
-import flax.linen as nn
+
 from flax import struct
+from flax import linen as nn
 
-from haxllm.model.modules import SelfAttention 
+from haxllm.model.modules import SelfAttention, MlpBlock
+from haxllm.model.utils import load_config as _load_config
 
 
-def convert_config(config, **kwargs):
-    d = dict(
-        vocab_size=config.vocab_size,
-        hidden_size=config.n_embd,
-        n_heads=config.n_head,
-        n_layers=config.n_layer,
-        n_positions=config.n_positions,
-        layer_norm_epsilon =config.layer_norm_epsilon,
-        embd_pdrop=config.embd_pdrop,
-        attn_pdrop=config.attn_pdrop,
-        resid_pdrop=config.resid_pdrop,
-    )
-    kwargs_ = {**kwargs}
-    if 'scan_layers' in kwargs_ and kwargs_['scan_layers'] is None:
-        kwargs_['scan_layers'] = 0
-    for k, v in kwargs_.items():
-        d[k] = v
-    return TransformerConfig(**d)
+config_hub = {
+    "gpt2": dict(
+        hidden_size=768,
+        n_heads=12,
+        n_layers=12,
+    ),
+    "gpt2-medium": dict(
+        hidden_size=1024,
+        n_heads=16,
+        n_layers=24,
+    ),
+    "gpt2-large": dict(
+        hidden_size=1280,
+        n_heads=20,
+        n_layers=36,
+    ),
+    "gpt2-xl": dict(
+        hidden_size=1600,
+        n_heads=25,
+        n_layers=48,
+    ),
+}
+
+def load_config(name, **kwargs):
+    if name in config_hub:
+        config = config_hub[name]
+    else:
+        raise ValueError(f"Unknown llama model {name}")
+    return _load_config(TransformerConfig, config, **kwargs)
+
 
 
 @struct.dataclass
@@ -45,39 +59,23 @@ class TransformerConfig:
     pad_token_id: int = 50256
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    is_casual: bool = True
     remat: bool = False
-    scan_layers: Optional[int] = None
-    remat_scan_lengths: Optional[Tuple[int, int]] = None
+    scan: bool = False
+    remat_scan: bool = False
 
+    def scan_layers(self):
+        return self.n_layers if self.scan else 0
 
-class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block.
-    """
-    config: TransformerConfig
+    def remat_scan_lengths(self):
+        return (self.n_layers, 1) if self.remat_scan else None
 
-    @nn.compact
-    def __call__(self, inputs):
-        config = self.config
-        intermediate_size = config.hidden_size * 4
-
-        actual_out_dim = inputs.shape[-1]
-        x = nn.Dense(
-            intermediate_size,
-            dtype=config.dtype,
-            param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
-            name="fc_1")(inputs)
-        x = nn.gelu(x)
-        x = nn.Dense(
-            actual_out_dim,
-            dtype=config.dtype,
-            param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
-            name="fc_2")(x)
-        return x
+    def scan_lengths(self):
+        if self.remat_scan:
+            return self.remat_scan_lengths()
+        elif self.scan:
+            return self.scan_layers()
+        else:
+            return None
 
 
 class TransformerBlock(nn.Module):
@@ -90,22 +88,17 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        if config.is_casual:
-            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-            attn_mask_ = attn_mask[:, None, None, :]
-            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
-        else:
-            attn_mask_ = attn_mask[:, None, None, :]
+        casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
+        attn_mask_ = attn_mask[:, None, None, :]
+        attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
 
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            qkv_features=config.hidden_size,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
-            use_bias=True,
             broadcast_dropout=False,
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
@@ -114,12 +107,20 @@ class TransformerBlock(nn.Module):
         x = x + inputs
 
         y = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_2')(x)
-        y = MlpBlock(config=config, name='mlp')(y)
+        y = MlpBlock(
+            activation='gelu_new',
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            kernel_init=config.kernel_init,
+            bias_init=config.bias_init,
+            name='mlp')(y)
         y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
+        y = x + y
+        
         if self.scan:
-            return (x + y, attn_mask), None
+            return (y, attn_mask), None
         else:    
-            return x + y, attn_mask
+            return y, attn_mask
     
 
 class TransformerModel(nn.Module):
@@ -128,43 +129,38 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
-        remat = config.remat_scan_lengths is not None or config.remat
+        remat = config.remat or config.remat_scan
 
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
 
-        inputs_embeds = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wte')(inputs)
-        position_embeds = nn.Embed(
-            num_embeddings=config.n_positions, features=config.hidden_size, param_dtype=config.param_dtype, dtype=config.dtype, name='wpe')(position_ids)
+        embed_layer = nn.remat(nn.Embed) if remat else nn.Embed
+        embed_layer = functools.partial(
+            embed_layer, dtype=config.dtype, param_dtype=config.param_dtype)
+        inputs_embeds = embed_layer(
+            num_embeddings=config.vocab_size, features=config.hidden_size, name='wte')(inputs)
+        position_embeds = embed_layer(
+            num_embeddings=config.n_positions, features=config.hidden_size, name='wpe')(position_ids)
 
         x = inputs_embeds + position_embeds
 
         dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
         x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
-        if config.remat_scan_lengths is not None:
-            remat_scan_layers = math.prod(config.remat_scan_lengths)
-            d = config.n_layers - remat_scan_layers
-            if d < 0:
-                raise ValueError(f"remat_scan_lengths={config.remat_scan_lengths} is too large for n_layers={config.n_layers}")
-            for i in range(d):
-                x = TransformerBlock(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
-            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=config.remat_scan_lengths)
+        if config.remat_scan:
+            remat_scan_lengths = config.remat_scan_lengths()
+            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
             x = TransformerBlockStack(config, deterministic=not train, name='hs')((x, attn_mask))[0]
         else:
             block_fn = TransformerBlock
             if config.remat:
-                block_fn = nn.remat(block_fn)
-            scan_layers = config.scan_layers
-            d = config.n_layers - scan_layers
-            if d < 0:
-                raise ValueError(f"scan_layers={config.scan_layers} is too large for n_layers={config.n_layers}")
-            for i in range(d):
-                x = block_fn(config, deterministic=not train, name=f'h_{i}')((x, attn_mask))[0]
-            if scan_layers > 0:
-                block_fn = nn.remat(TransformerBlock, prevent_cse=False)
-                TransformerBlockStack = nn.scan(block_fn, length=scan_layers, variable_axes={True: 0}, split_rngs={True: True})
+                block_fn = nn.remat(TransformerBlock, prevent_cse=not config.scan)
+            if config.scan:
+                TransformerBlockStack = nn.scan(block_fn, length=config.scan_layers(), variable_axes={True: 0}, split_rngs={True: True})
                 x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
+            else:
+                for d in range(config.n_layers):
+                    x = block_fn(config, deterministic=not train, name=f'h_{d}')((x, attn_mask))[0]
+        
         norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
         x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
         return x

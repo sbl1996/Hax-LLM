@@ -4,6 +4,7 @@ def get_optimizer(cfg, steps_per_epoch):
     init_lr = cfg.optimizer.warmup_min_lr
     peak_lr = cfg.optimizer.learning_rate
     warmup_steps = cfg.optimizer.warmup_steps
+    print(f"init_lr: {init_lr}, peak_lr: {peak_lr}, warmup_steps: {warmup_steps}")
     if warmup_steps == 0:
         init_lr = peak_lr
     lr_schedule = optax.warmup_cosine_decay_schedule(

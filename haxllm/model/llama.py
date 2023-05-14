@@ -9,10 +9,7 @@ import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, RMSNorm
-
-
-# remat = functools.partial(nn.remat, policy=jax.checkpoint_policies.nothing_saveable)
-remat = nn.remat
+from haxllm.model.utils import load_config as _load_config
 
 config_hub = {
     "llama-7b": dict(
@@ -42,21 +39,11 @@ config_hub = {
 }
 
 def load_config(name, **kwargs):
-    d = {**config_hub[name]}
-    kwargs = {**kwargs}
-    if 'scan_layers' in kwargs:
-        if kwargs['scan_layers'] is None:
-            kwargs['scan_layers'] = 0
-        elif kwargs['scan_layers'] == -1:
-            kwargs['scan_layers'] = d['n_layers']
-    if 'remat_scan_lengths' in kwargs:
-        remat_scan_lengths = kwargs['remat_scan_lengths']
-        if remat_scan_lengths is not None:
-            if len(remat_scan_lengths) == 1:
-                remat_scan_lengths = (remat_scan_lengths[0], remat_scan_lengths[0])
-    for k, v in kwargs.items():
-        d[k] = v
-    return TransformerConfig(**d)
+    if name in config_hub:
+        config = config_hub[name]
+    else:
+        raise ValueError(f"Unknown llama model {name}")
+    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass
@@ -95,28 +82,6 @@ class TransformerConfig:
             return None
 
 
-class MlpBlock(nn.Module):
-    config: TransformerConfig
-
-    @nn.compact
-    def __call__(self, inputs):
-        config = self.config
-
-        dense = functools.partial(
-            nn.Dense,
-            use_bias=False,
-            dtype=config.dtype,
-            param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-        )
-
-        actual_out_dim = inputs.shape[-1]
-        g = nn.silu(dense(config.intermediate_size, name="gate")(inputs))
-        x = g * dense(config.intermediate_size, name="up")(inputs)
-        x = dense(actual_out_dim, name="down")(x)
-        return x
-
-
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32):
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
     t = np.arange(end, dtype=np.float32)  # type: ignore
@@ -142,6 +107,29 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     q = (q * cos) + (rotate_half(q) * sin)
     k = (k * cos) + (rotate_half(k) * sin)
     return q, k
+
+
+
+class MlpBlock(nn.Module):
+    config: TransformerConfig
+
+    @nn.compact
+    def __call__(self, inputs):
+        config = self.config
+
+        dense = functools.partial(
+            nn.Dense,
+            use_bias=False,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            kernel_init=config.kernel_init,
+        )
+
+        actual_out_dim = inputs.shape[-1]
+        g = nn.silu(dense(config.intermediate_size, name="gate")(inputs))
+        x = g * dense(config.intermediate_size, name="up")(inputs)
+        x = dense(actual_out_dim, name="down")(x)
+        return x
 
 
 class SelfAttention(nn.Module):
@@ -238,14 +226,14 @@ class TransformerModel(nn.Module):
         else:
             block_fn = TransformerBlock
             if config.remat:
-                block_fn = remat(block_fn)
+                block_fn = nn.remat(block_fn)
             if config.scan:
-                for i in range(config.n_layers):
-                    x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
-            else:
                 TransformerBlockStack = nn.scan(block_fn, length=config.n_layers, variable_axes={True: 0}, split_rngs={True: True})
                 x = TransformerBlockStack(config, scan=True, name='hs')((x, attn_mask))[0][0]
-        norm = remat(RMSNorm) if config.remat else RMSNorm
+            else:
+                for i in range(config.n_layers):
+                    x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
+        norm = nn.remat(RMSNorm) if config.remat else RMSNorm
         x = norm(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
         return x
 

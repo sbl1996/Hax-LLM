@@ -38,6 +38,13 @@ def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_b
         train_input_ids, test_input_ids, train_attention_mask, test_attention_mask, train_labels, test_labels = train_test_split(
             train_input_ids, train_attention_mask, train_labels, test_size=eval_size, random_state=seed)
 
+    # shuffle train data first
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(len(train_input_ids))
+    train_input_ids = train_input_ids[perm]
+    train_attention_mask = train_attention_mask[perm]
+    train_labels = train_labels[perm]
+
     if sub_ratio is not None:
         if isinstance(sub_ratio, Sequence):
             train_sub_ratio = sub_ratio[0]

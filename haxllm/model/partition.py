@@ -60,6 +60,7 @@ def _get_partition_rules_llama():
         (("mlp", "gate", "kernel"), P("X", "Y")),
         (("mlp", "up", "kernel"), P("X", "Y")),
         (("mlp", "down", "kernel"), P("Y", "X")),
+        (("score", "kernel"), P("Y", "X")),
     ]
     return spec
 

@@ -10,7 +10,7 @@ def create_tfds(data, batch_size, train=True, seed=None):
     ds = tf.data.Dataset.from_tensor_slices(data)
     ds = ds.cache()
     if train:
-        ds = ds.shuffle(10000, seed=seed)
+        ds = ds.shuffle(1000000, seed=seed)
         ds = ds.repeat()
     ds = ds.batch(batch_size, drop_remainder=train)
     if drop_remainder:

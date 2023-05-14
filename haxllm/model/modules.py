@@ -241,3 +241,36 @@ class SelfAttention(MultiHeadDotProductAttention):
                  deterministic: Optional[bool] = None):
         return super().__call__(inputs_q, inputs_q, mask,
                                 deterministic=deterministic)
+
+
+class MlpBlock(nn.Module):
+    intermediate_size: Optional[int] = None
+    activation: str = 'gelu'
+    dtype: Dtype = jnp.float32
+    param_dtype: Dtype = jnp.float32
+    use_bias: bool = True
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+
+    @nn.compact
+    def __call__(self, inputs):
+        assert self.activation in ['gelu', 'gelu_new']
+        intermediate_size = self.intermediate_size or 4 * inputs.shape[-1]
+
+        dense = functools.partial(
+            nn.Dense,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+        )
+
+        actual_out_dim = inputs.shape[-1]
+        x = dense(intermediate_size, name="fc_1")(inputs)
+        if self.activation == 'gelu':
+            x = nn.gelu(x, approximate=False)
+        elif self.activation == 'gelu_new':
+            x = nn.gelu(x, approximate=True)
+        x = dense(actual_out_dim, name="fc_2")(x)
+        return x
