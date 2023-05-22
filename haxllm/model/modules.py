@@ -10,7 +10,8 @@ from flax.core import meta
 import flax.linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen import Module, compact, initializers
-from flax.linen.attention import Dtype, Array, PRNGKey, Shape, combine_masks, merge_param, dot_product_attention
+from flax.linen.attention import Dtype, Array, PRNGKey, Shape, combine_masks, dot_product_attention
+from flax.linen.module import merge_param
 
 
 default_kernel_init = initializers.lecun_normal()

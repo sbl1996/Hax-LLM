@@ -14,7 +14,7 @@ from jax.sharding import PartitionSpec as P, NamedSharding
 from flax import linen as nn
 from flax import traverse_util
 from flax.training import common_utils
-from flax.core.frozen_dict import freeze
+from flax.core.frozen_dict import freeze, FrozenDict
 from flax.traverse_util import unflatten_dict, flatten_dict
 
 import optax
@@ -91,27 +91,6 @@ def freeze_params_optimizer(optimizer, params, trainable_pattern):
     return tx
 
 
-def convert_remat_scan_params(params, src_keys, tgt_key, lengths):
-    assert len(
-        lengths) == 2, 'Only 2D remat scan is supported, because 1D remat_scan is equivalent to scan, WITHOUT remat.'
-    remat_scan_layers = math.prod(lengths)
-    if remat_scan_layers > len(src_keys):
-        raise ValueError(
-            f'Number of remat scan layers ({remat_scan_layers}) must be less than or equal to the number of source keys ({len(src_keys)})')
-    src_keys = src_keys[-remat_scan_layers:]
-    level_trees = []
-    for i in range(lengths[0]):
-        loop_trees = []
-        for j in range(lengths[1]):
-            loop_trees.append(params.pop(src_keys[i * lengths[1] + j]))
-        level_trees.append(jax.tree_map(
-            lambda *xs: np.stack(xs, axis=0), *loop_trees))
-    params[tgt_key] = jax.tree_map(
-        lambda *xs: np.stack(xs, axis=0), *level_trees)
-    return params
-
-
-
 def convert_scan_params(params, src_keys, tgt_key, lengths):
     if isinstance(lengths, int):
         lengths = [lengths]
@@ -145,41 +124,6 @@ def pad(x, batch_size):
     return x
 
 
-# def pad_partition_unpad(wrapped, partition_spec, static_argnums=(0,), static_argnames=()):
-#     def pad_shard_unpad_wrapper(*args, batch_size=None, **kw):
-#         batch_sizes = set()
-#         for i, a in enumerate(args):
-#             if i not in static_argnums:
-#                 batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(a)}
-#         for k, v in kw.items():
-#             if k not in static_argnames:
-#                 batch_sizes |= {t.shape[0] for t in jax.tree_util.tree_leaves(v)}
-#         assert len(batch_sizes) == 1, f"Inconsistent batch-sizes: {batch_sizes}"
-#         b = batch_sizes.pop()
-
-#         def pad(x):
-#             _, *shape = x.shape
-#             rest = batch_size - b
-#             if rest:
-#                 x = np.concatenate(
-#                     [x, np.zeros((rest, *shape), x.dtype)], axis=0)
-#             return nn_partitioning.with_sharding_constraint(x, partition_spec)
-
-#         def maybe_pad(tree, actually_pad=True):
-#             if not actually_pad: return tree  # For call-site convenience below.
-#             return jax.tree_util.tree_map(pad, tree)
-
-#         args = [maybe_pad(a, i not in static_argnums) for i, a in enumerate(args)]
-#         kw = {k: maybe_pad(v, k not in static_argnames) for k, v in kw.items()}
-#         out = wrapped(*args, **kw)
-#         print(out)
-
-#         def unpad(x):
-#             return jax.device_get(x)[:b]
-#         return jax.tree_util.tree_map(unpad, out)
-#     return pad_shard_unpad_wrapper
-
-
 def replace_val(p, x):
     if isinstance(p, nn.Partitioned):
         return p.replace_boxed(x)
@@ -187,45 +131,83 @@ def replace_val(p, x):
         return x
  
 
-def merge_transformer_params(params, path, mesh=None):
-    print(f"Loading transformer params from {path}")
+def get_partition_spec(p: nn.Partitioned):
+    return p.get_partition_spec()
+
+
+def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
     transformer_params = load_file(path)
     transformer_params = unflatten_dict(transformer_params, sep=".")
-    if 'hs' in params['transformer']:
+
+    # p_replace_val = jax.jit(replace_val, donate_argnums=(0,))
+
+    if isinstance(params, FrozenDict):
+        params = params.unfreeze()
+        frozen = True
+    else:
+        frozen = False
+    params = flatten_dict(params, sep=".")
+
+    if any([k.startswith("transformer.hs") for k in params.keys()]):
         src_keys = [k for k in transformer_params if k.startswith('h_')]
-        scan_lengths = (len(src_keys), 1)
+        h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
+        sample_key = next(iter(h_params.keys()))
+        hs_param = params[f"transformer.hs.{sample_key}"]
+        if isinstance(hs_param, nn.Partitioned):
+            hs_param = hs_param.value
+        hs_shape = hs_param.shape
+        h_shape = h_params[sample_key].shape
+        del h_params, hs_param
+        scan_lengths = hs_shape[:(len(hs_shape) - len(h_shape))]
+        src_keys = [f"h_{i}" for i in range(scan_lengths[0])]
         transformer_params = convert_scan_params(
             transformer_params, src_keys=src_keys, tgt_key='hs', lengths=scan_lengths)
-
-    pjit_replace_val = jax.jit(replace_val, donate_argnums=(0,))
-
-    params = flatten_dict(params.unfreeze(), sep=".")
     new_transformer_params = flatten_dict(transformer_params, sep=".")
+
     prefix = "transformer."
     all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
+    if lm_head:
+        all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
     for key in all_keys:
-        if key in new_transformer_params:
-            print(f"Loading transformer param {key}")
-            p = params[prefix + key]
-            x = new_transformer_params[key]
-            if isinstance(p, nn.Partitioned):
-                spec = p.get_partition_spec()
-                dtype = p.value.dtype
-            else:
-                spec = P(*[None for _ in range(len(x.shape))])
-                dtype = p.dtype
-            x = x.astype(dtype)
-            if mesh is None:
-                x = jax.device_put(x)
-            else:
-                with mesh:
-                    x = jax.device_put(x, NamedSharding(mesh, spec))
-            params[prefix + key] = pjit_replace_val(p, x)
-            del p, x
-        else:
+        if key not in new_transformer_params:
             print(f"Key {key} not found in transformer params")
+        
+        full_key = key if key.startswith("lm_head") else prefix + key
+        p = params[full_key]
+        print(f"Loading param {key}")
+        x = new_transformer_params[key]
+        if isinstance(p, nn.Partitioned):
+            spec = p.get_partition_spec()
+            dtype = p.value.dtype
+        else:
+            spec = p.sharding.spec
+            dtype = p.dtype
+        x = x.astype(dtype)
+        # if cpu:
+        #     x = jax.device_put(x, jax.devices("cpu")[0])
+        if mesh is None:
+            x = jax.device_put(x)
+        else:
+            if isinstance(p, nn.Partitioned):
+                print("Before p", p.value.sharding)
+                print(p.names)
+            else:
+                print("Before", p.sharding)
+            with mesh:
+                x = jax.device_put(x, NamedSharding(mesh, spec))
+        if isinstance(p, nn.Partitioned):
+            params[full_key] = p.replace_boxed(x)
+        else:
+            params[full_key] = x
+        if isinstance(p, nn.Partitioned):
+            print("After p", params[full_key].value.sharding)
+            print(params[full_key].names)
+        else:
+            print("After", params[full_key].sharding)
+        del p, x
     params = unflatten_dict(params, sep=".")
-    params = freeze(params)
+    if frozen:
+        params = freeze(params)
     return params
 
 
@@ -233,37 +215,6 @@ def partition_x(x, mesh):
     n = len(x.shape)
     partition = ["X"] + [None] * (n - 1)
     return jax.device_put(x, NamedSharding(mesh, P(*partition)))
-# def merge_pretrained_transformer_params(params, transformer_params, n_layers, scan_lengths, cpu=False):
-#     transformer_params = unflatten_dict(transformer_params, sep='.')
-#     if scan_lengths:
-#         transformer_params = convert_scan_params(
-#             transformer_params, src_keys=[f'h_{i}' for i in range(n_layers)],
-#             tgt_key='hs', lengths=scan_lengths)
-
-#     params = params.unfreeze()
-#     t_params = flatten_dict(params['transformer'], sep=".")
-#     pt_params = flatten_dict(transformer_params, sep=".")
-#     all_keys = list(t_params.keys())
-#     cpu_device = jax.devices('cpu')[0]
-#     for key in all_keys:
-#         if key in pt_params:
-#             x = pt_params[key]
-#             p = t_params[key]
-#             dtype = p.dtype
-#             if cpu:
-#                 device = cpu_device
-#             else:
-#                 device = p.sharding
-#             del t_params[key], p
-#             x = x.astype(dtype)
-#             p = jax.device_put(x, device)
-#             p.block_until_ready()
-#             t_params[key] = p
-
-#     transformer_params = unflatten_dict(t_params, sep=".")
-#     params['transformer'] = transformer_params
-#     params = freeze(params)
-#     return params
 
 
 def prefetch_to_device(iterator, size, device):

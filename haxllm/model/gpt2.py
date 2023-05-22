@@ -59,6 +59,7 @@ class TransformerConfig:
     pad_token_id: int = 50256
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
+    decode: bool = False
     remat: bool = False
     scan: bool = False
     remat_scan: bool = False
@@ -88,9 +89,12 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-        attn_mask_ = attn_mask[:, None, None, :]
-        attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        if attn_mask is not None:
+            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
+            attn_mask_ = attn_mask[:, None, None, :]
+            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        else:
+            attn_mask_ = None
 
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(inputs)
         x = SelfAttention(
@@ -102,6 +106,7 @@ class TransformerBlock(nn.Module):
             broadcast_dropout=False,
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
+            decode=config.decode,
             name='attn')(x, attn_mask_)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
@@ -130,8 +135,15 @@ class TransformerModel(nn.Module):
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
         remat = config.remat or config.remat_scan
-
-        position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
+        
+        position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.uint32)[None]
+        if config.decode:
+            is_initialized = self.has_variable('cache', 'cache_index')
+            cache_index = self.variable('cache', 'cache_index', lambda: jnp.array(0, dtype=jnp.uint32))
+            if is_initialized:
+                i = cache_index.value
+                cache_index.value = i + 1
+                position_ids = jnp.tile(i, (inputs.shape[0], 1))
 
         embed_layer = nn.remat(nn.Embed) if remat else nn.Embed
         embed_layer = functools.partial(
@@ -188,6 +200,24 @@ class TransformerSequenceClassifier(nn.Module):
         return x
 
 
+class TransformerLMHeadModel(nn.Module):
+    config: TransformerConfig
+
+    @nn.compact
+    def __call__(self, *, inputs, attn_mask, train=False):
+        config = self.config
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+
+        x = nn.Dense(
+            config.vocab_size,
+            use_bias=False,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            kernel_init=config.kernel_init,
+            name='lm_head')(x)
+        return x
+
+
 def remap_state_dict(state_dict, config: TransformerConfig):
     # Embedding
     root = {}
@@ -233,6 +263,6 @@ def remap_state_dict(state_dict, config: TransformerConfig):
         }
         root[f'h_{d}'] = block_d
 
-    # Final LayerNorm
     root['ln_f'] = {'scale': state_dict.pop('ln_f.weight'), 'bias': state_dict.pop('ln_f.bias')}
+    root['lm_head'] = {'kernel': root['wte']['embedding'].T}
     return root

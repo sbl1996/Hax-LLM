@@ -5,13 +5,21 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from jax import lax
+
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, RMSNorm
+from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, combine_masks, RMSNorm
 from haxllm.model.utils import load_config as _load_config
 
 config_hub = {
+    "llama-t": dict(
+        hidden_size=1024,
+        intermediate_size=2816,
+        n_heads=8,
+        n_layers=2,
+    ),
     "llama-7b": dict(
         hidden_size=4096,
         intermediate_size=11008,
@@ -66,6 +74,7 @@ class TransformerConfig:
     remat: bool = False
     scan: bool = False
     remat_scan: bool = False
+    decode: bool = False
 
     def scan_layers(self):
         return self.n_layers if self.scan else 0
@@ -162,7 +171,45 @@ class SelfAttention(nn.Module):
                              dense(name='value')(x))
 
         cos, sin = precompute_freqs_cis(dim=head_dim, end=seq_len, dtype=self.dtype)
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        if not self.decode:
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        else:
+            is_initialized = self.has_variable('cache', 'cached_key')
+            cached_key = self.variable('cache', 'cached_key',
+                                       jnp.zeros, key.shape, key.dtype)
+            cached_value = self.variable('cache', 'cached_value',
+                                         jnp.zeros, value.shape, value.dtype)
+            cache_index = self.variable('cache', 'cache_index',
+                                        lambda: jnp.array(0, dtype=jnp.int32))
+            if not is_initialized:
+                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            else:
+                *batch_dims, max_length, num_heads, depth_per_head = (
+                    cached_key.value.shape)
+                # shape check of cached keys against query input
+                expected_shape = tuple(batch_dims) + \
+                    (1, num_heads, depth_per_head)
+                if expected_shape != query.shape:
+                    raise ValueError('Autoregressive cache shape error, '
+                                     'expected query shape %s instead got %s.' %
+                                     (expected_shape, query.shape))
+                # update key, value caches with our new 1d spatial slices
+                cur_index = cache_index.value
+                pos_index = jnp.array([cur_index], dtype=jnp.int32)
+                cos, sin = cos[pos_index], sin[pos_index]
+                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(
+                    cached_value.value, value, indices)
+                cached_key.value = key
+                cached_value.value = value
+                cache_index.value = cache_index.value + 1
+                mask = combine_masks(
+                    mask,
+                    jnp.broadcast_to(jnp.arange(max_length) <= cur_index,
+                                     tuple(batch_dims) + (1, 1, max_length)))
 
         x = dot_product_attention(query, key, value, mask=mask, dtype=self.dtype)
 
@@ -173,7 +220,7 @@ class SelfAttention(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            name='out',  # type: ignore[call-arg]
+            name='out',
         )(x)
         return out
 
@@ -187,14 +234,21 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        assert inputs.ndim == 3
+        if attn_mask is not None:
+            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
+            attn_mask_ = attn_mask[:, None, None, :]
+            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        else:
+            attn_mask_ = None
+
         x = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            name='attn')(x, attn_mask)
+            decode=config.decode,
+            name='attn')(x, attn_mask_)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
@@ -212,13 +266,17 @@ class TransformerModel(nn.Module):
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
 
-        x = nn.Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size, dtype=config.dtype, param_dtype=config.param_dtype, name='wte')(inputs)
+        embed_layer = nn.Embed
+        if config.remat or config.remat_scan:
+            embed_layer = nn.remat(nn.Embed)
+        x = embed_layer(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            name='wte'
+        )(inputs)
 
-        if attn_mask is not None:
-            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-            attn_mask = attn_mask[:, None, None, :]
-            attn_mask = nn.combine_masks(casual_mask, attn_mask)
         if config.remat_scan:
             remat_scan_lengths = config.remat_scan_lengths()
             TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
@@ -233,8 +291,9 @@ class TransformerModel(nn.Module):
             else:
                 for i in range(config.n_layers):
                     x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
-        norm = nn.remat(RMSNorm) if config.remat else RMSNorm
-        x = norm(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
+
+        norm_layer = nn.remat(RMSNorm) if config.remat or config.remat_scan else RMSNorm
+        x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
         return x
 
 
@@ -259,6 +318,24 @@ class TransformerSequenceClassifier(nn.Module):
         return x
 
 
+class TransformerLMHeadModel(nn.Module):
+    config: TransformerConfig
+
+    @nn.compact
+    def __call__(self, *, inputs, attn_mask, train=False):
+        config = self.config
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+
+        x = nn.Dense(
+            config.vocab_size,
+            use_bias=False,
+            dtype=config.dtype,
+            param_dtype=config.param_dtype,
+            kernel_init=config.kernel_init,
+            name='lm_head')(x)
+        return x
+
+        
 def remap_state_dict(state_dict, config: TransformerConfig):
     root = {}
     root['wte'] = {'embedding': state_dict.pop('model.embed_tokens.weight')}
@@ -291,4 +368,5 @@ def remap_state_dict(state_dict, config: TransformerConfig):
         root[f'h_{d}'] = block_d
 
     root['ln_f'] = {'scale': state_dict.pop('model.norm.weight')}
+    root['lm_head'] = {'kernel': state_dict.pop('lm_head.weight').T}
     return root
