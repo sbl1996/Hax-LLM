@@ -15,6 +15,9 @@ def load_config(cls, base_config, **kwargs):
             if len(remat_scan_lengths) == 1:
                 remat_scan_lengths = (remat_scan_lengths[0], remat_scan_lengths[0])
     for k, v in kwargs.items():
+        if k not in cls.__dataclass_fields__:
+            print(f"Unknown config key {k} for {cls.__name__}")
+            continue
         d[k] = v
     return cls(**d)
 

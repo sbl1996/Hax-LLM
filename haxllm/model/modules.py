@@ -13,6 +13,7 @@ from flax.linen import Module, compact, initializers
 from flax.linen.attention import Dtype, Array, PRNGKey, Shape, combine_masks, dot_product_attention
 from flax.linen.module import merge_param
 
+from haxllm.model.memory_efficient_attention import dot_product_attention as dot_product_attention_m
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -119,7 +120,6 @@ class DenseGeneral(nn.Module):
 
 
 class MultiHeadDotProductAttention(Module):
-
     num_heads: int
     dtype: Optional[Dtype] = None
     param_dtype: Dtype = jnp.float32
@@ -132,6 +132,7 @@ class MultiHeadDotProductAttention(Module):
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
     use_bias: bool = True
     decode: bool = False
+    memory_efficient: bool = False
 
     @compact
     def __call__(self,
@@ -209,17 +210,27 @@ class MultiHeadDotProductAttention(Module):
         else:
             m_deterministic = True
 
-        # apply attention
-        x = dot_product_attention(
-            query,
-            key,
-            value,
-            mask=mask,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.dropout_rate,
-            broadcast_dropout=self.broadcast_dropout,
-            deterministic=m_deterministic,
-            dtype=self.dtype)  # pytype: disable=wrong-keyword-args
+        if self.memory_efficient:
+            assert not self.dropout_rate, "dropout not supported with memory_efficient_attention"
+            assert mask is None, "masking not supported with memory_efficient_attention, default to causal attention"
+            x = dot_product_attention_m(
+                query,
+                key,
+                value,
+                casual=True,
+                dtype=self.dtype)
+        else:
+            x = dot_product_attention(
+                query,
+                key,
+                value,
+                mask=mask,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.dropout_rate,
+                broadcast_dropout=self.broadcast_dropout,
+                deterministic=m_deterministic,
+                dtype=self.dtype)
+        
         # back to the original inputs dimensions
         out = DenseGeneral(
             features=features,

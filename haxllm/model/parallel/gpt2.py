@@ -151,16 +151,10 @@ class TransformerBlock(nn.Module):
     scan: bool = False
 
     @nn.compact
-    def __call__(self, x):
-        inputs, attn_mask = x
+    def __call__(self, inputs):
         config = self.config
 
-        if attn_mask is not None:
-            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-            attn_mask_ = attn_mask[:, None, None, :]
-            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
-        else:
-            attn_mask_ = None
+        attn_mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
 
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
                          dtype=config.dtype, name='ln_1')(inputs)
@@ -171,23 +165,23 @@ class TransformerBlock(nn.Module):
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
             decode=config.decode,
-            name='attn')(x, attn_mask_)
+            name='attn')(x, attn_mask)
         x = x + inputs
 
         y = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
                          dtype=config.dtype, name='ln_2')(x)
         y = MlpBlock(config=config, deterministic=self.deterministic, name='mlp')(y)
         if self.scan:
-            return (x + y, attn_mask), None
+            return x + y, None
         else:    
-            return x + y, attn_mask
+            return x + y
 
 
 class TransformerModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train):
+    def __call__(self, *, inputs, train):
         config = self.config
         remat = config.remat or config.remat_scan
 
@@ -226,7 +220,7 @@ class TransformerModel(nn.Module):
                 variable_axes={True: 0}, split_rngs={True: True},
                 metadata_params1={nn.PARTITION_NAME: None}, metadata_params2={nn.PARTITION_NAME: None})
             x = TransformerBlockStack(
-                config, deterministic=not train, name='hs')((x, attn_mask))[0]
+                config, deterministic=not train, name='hs')(x)
         else:
             if config.remat and train:
                 block_fn = nn.remat(TransformerBlock)
@@ -235,7 +229,7 @@ class TransformerModel(nn.Module):
             TransformerBlockStack = nn.scan(
                 block_fn, length=config.scan_layers(), variable_axes={True: 0},
                 split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
-            x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
+            x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')(x)[0]
 
         norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
         x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
@@ -248,7 +242,7 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
         batch_size = inputs.shape[0]
         seq_len = (jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1)
@@ -269,7 +263,7 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
         x = Dense(
             config.vocab_size,

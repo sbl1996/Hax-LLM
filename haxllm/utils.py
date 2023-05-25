@@ -188,22 +188,22 @@ def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
         if mesh is None:
             x = jax.device_put(x)
         else:
-            if isinstance(p, nn.Partitioned):
-                print("Before p", p.value.sharding)
-                print(p.names)
-            else:
-                print("Before", p.sharding)
+            # if isinstance(p, nn.Partitioned):
+            #     print("Before p", p.value.sharding)
+            #     print(p.names)
+            # else:
+            #     print("Before", p.sharding)
             with mesh:
                 x = jax.device_put(x, NamedSharding(mesh, spec))
         if isinstance(p, nn.Partitioned):
             params[full_key] = p.replace_boxed(x)
         else:
             params[full_key] = x
-        if isinstance(p, nn.Partitioned):
-            print("After p", params[full_key].value.sharding)
-            print(params[full_key].names)
-        else:
-            print("After", params[full_key].sharding)
+        # if isinstance(p, nn.Partitioned):
+        #     print("After p", params[full_key].value.sharding)
+        #     print(params[full_key].names)
+        # else:
+        #     print("After", params[full_key].sharding)
         del p, x
     params = unflatten_dict(params, sep=".")
     if frozen:

@@ -12,6 +12,7 @@ from flax import struct
 
 from haxllm.model.modules import Dtype, Array, PRNGKey, Shape, default_kernel_init, DenseGeneral, dot_product_attention, combine_masks, RMSNorm
 from haxllm.model.utils import load_config as _load_config
+from haxllm.model.memory_efficient_attention import dot_product_attention as dot_product_attention_m
 
 config_hub = {
     "llama-t": dict(
@@ -75,6 +76,7 @@ class TransformerConfig:
     scan: bool = False
     remat_scan: bool = False
     decode: bool = False
+    memory_efficient: bool = False
 
     def scan_layers(self):
         return self.n_layers if self.scan else 0
@@ -147,6 +149,7 @@ class SelfAttention(nn.Module):
     param_dtype: Dtype = jnp.float32
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     decode: bool = False
+    memory_efficient: bool = False
 
     @nn.compact
     def __call__(self, x: Array, mask: Optional[Array] = None):
@@ -211,7 +214,11 @@ class SelfAttention(nn.Module):
                     jnp.broadcast_to(jnp.arange(max_length) <= cur_index,
                                      tuple(batch_dims) + (1, 1, max_length)))
 
-        x = dot_product_attention(query, key, value, mask=mask, dtype=self.dtype)
+        if self.memory_efficient:
+            assert mask is None, 'Masking is not supported for memory efficient attention, default to causal attention.'
+            x = dot_product_attention_m(query, key, value, causal=True, dtype=self.dtype)
+        else:
+            x = dot_product_attention(query, key, value, mask=mask, dtype=self.dtype)
 
         out = DenseGeneral(
             features=features,
@@ -234,10 +241,8 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        if attn_mask is not None:
-            casual_mask = nn.make_causal_mask(attn_mask, dtype=attn_mask.dtype)
-            attn_mask_ = attn_mask[:, None, None, :]
-            attn_mask_ = nn.combine_masks(casual_mask, attn_mask_)
+        if not config.memory_efficient:
+            attn_mask_ = nn.make_causal_mask(inputs, dtype=jnp.bool_)
         else:
             attn_mask_ = None
 
@@ -248,22 +253,23 @@ class TransformerBlock(nn.Module):
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
             decode=config.decode,
+            memory_efficient=config.memory_efficient,
             name='attn')(x, attn_mask_)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
         y = MlpBlock(config=config, name='mlp')(y)
         if self.scan:
-            return (x + y, attn_mask), None
+            return x + y, None
         else:    
-            return x + y, attn_mask
+            return x + y
     
 
 class TransformerModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train):
+    def __call__(self, *, inputs, train):
         config = self.config
 
         embed_layer = nn.Embed
@@ -280,17 +286,17 @@ class TransformerModel(nn.Module):
         if config.remat_scan:
             remat_scan_lengths = config.remat_scan_lengths()
             TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
-            x = TransformerBlockStack(config, name='hs')((x, attn_mask))[0]
+            x = TransformerBlockStack(config, name='hs')(x)
         else:
             block_fn = TransformerBlock
             if config.remat:
                 block_fn = nn.remat(block_fn)
             if config.scan:
                 TransformerBlockStack = nn.scan(block_fn, length=config.n_layers, variable_axes={True: 0}, split_rngs={True: True})
-                x = TransformerBlockStack(config, scan=True, name='hs')((x, attn_mask))[0][0]
+                x = TransformerBlockStack(config, scan=True, name='hs')(x)[0]
             else:
                 for i in range(config.n_layers):
-                    x = block_fn(config, name=f'h_{i}')((x, attn_mask))[0]
+                    x = block_fn(config, name=f'h_{i}')(x)
 
         norm_layer = nn.remat(RMSNorm) if config.remat or config.remat_scan else RMSNorm
         x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
@@ -303,7 +309,7 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
         batch_size = inputs.shape[0]
         seq_len = (jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1)
@@ -324,7 +330,7 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
         x = nn.Dense(
             config.vocab_size,
