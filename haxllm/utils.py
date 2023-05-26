@@ -139,8 +139,6 @@ def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
     transformer_params = load_file(path)
     transformer_params = unflatten_dict(transformer_params, sep=".")
 
-    # p_replace_val = jax.jit(replace_val, donate_argnums=(0,))
-
     if isinstance(params, FrozenDict):
         params = params.unfreeze()
         frozen = True
@@ -177,18 +175,19 @@ def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
         print(f"Loading param {key}")
         x = new_transformer_params[key]
         if isinstance(p, nn.Partitioned):
-            spec = p.get_partition_spec()
             dtype = p.value.dtype
         else:
-            spec = p.sharding.spec
             dtype = p.dtype
         x = x.astype(dtype)
-        # if cpu:
-        #     x = jax.device_put(x, jax.devices("cpu")[0])
-        if mesh is None:
+        if cpu:
+            x = jax.device_put(x, jax.devices("cpu")[0])
+        elif mesh is None:
             x = jax.device_put(x)
         else:
-            # if isinstance(p, nn.Partitioned):
+            if isinstance(p, nn.Partitioned):
+                spec = p.get_partition_spec()
+            else:
+                spec = p.sharding.spec
             #     print("Before p", p.value.sharding)
             #     print(p.names)
             # else:

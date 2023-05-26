@@ -240,7 +240,7 @@ class TransformerLMHeadModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
+    def __call__(self, *, inputs, train=False):
         config = self.config
         x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 

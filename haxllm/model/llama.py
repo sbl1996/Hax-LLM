@@ -237,14 +237,13 @@ class TransformerBlock(nn.Module):
     scan: bool = False
 
     @nn.compact
-    def __call__(self, x):
-        inputs, attn_mask = x
+    def __call__(self, inputs):
         config = self.config
 
         if not config.memory_efficient:
-            attn_mask_ = nn.make_causal_mask(inputs, dtype=jnp.bool_)
+            attn_mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
         else:
-            attn_mask_ = None
+            attn_mask = None
 
         x = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
@@ -254,7 +253,7 @@ class TransformerBlock(nn.Module):
             kernel_init=config.kernel_init,
             decode=config.decode,
             memory_efficient=config.memory_efficient,
-            name='attn')(x, attn_mask_)
+            name='attn')(x, attn_mask)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
@@ -328,7 +327,7 @@ class TransformerLMHeadModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
+    def __call__(self, *, inputs, train=False):
         config = self.config
         x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
