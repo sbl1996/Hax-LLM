@@ -16,18 +16,19 @@ def fresh():
     return result
 
 
-num_heads = 2
-feature_dims = 64
+batch_size = 16
+num_heads = 4
+feature_dims = 128
 causal = True
 
 
 def fresh_qkv(size, dtype=jnp.bfloat16):
-    qkv_shape = (2, size, num_heads, feature_dims)
+    qkv_shape = (batch_size, size, num_heads, feature_dims)
     return jax.random.normal(fresh(), qkv_shape, dtype=dtype)
 
 
 def fresh_mask(size):
-    return nn.make_causal_mask(jnp.ones((2, size), dtype=jnp.bool_), dtype=jnp.bool_)
+    return nn.make_causal_mask(jnp.ones((batch_size, size), dtype=jnp.bool_), dtype=jnp.bool_)
 
 
 def standard_attention(query, key, value, mask=None, dtype=jnp.float32, precision=None):
@@ -59,7 +60,7 @@ execute_memory_efficient_att = True
 execute_memory_efficient_att2 = True
 repeats = 200
 
-for i in range(8, 15, 1):
+for i in range(8, 12, 1):
     q_size = 2**i
     memsize = 2**i
     print("\nAttention size:", q_size, "x", memsize)
@@ -118,7 +119,8 @@ for i in range(8, 15, 1):
 
     if execute_memory_efficient_att2:
         mefficient_attn2 = functools.partial(
-            mefficient_attention, causal=causal, sparse=True, precision=precision, dtype=dtype
+            mefficient_attention, causal=causal, sparse=True, precision=precision, dtype=dtype,
+            query_chunk_size=1024, key_chunk_size=1024,
         )
 
         compilation_start = time.time()
@@ -175,14 +177,15 @@ def loss_ckpt(query, key, value):
     return jnp.sum(mefficient_attention(query, key, value, causal=causal, precision=precision))
 
 def loss_ckpt2(query, key, value):
-    return jnp.sum(mefficient_attention(query, key, value, causal=causal, sparse=True, precision=precision))
+    return jnp.sum(mefficient_attention(query, key, value, causal=causal, sparse=True, precision=precision,
+                                        query_chunk_size=1024, key_chunk_size=1024))
 
 
 diff_attention_simp = jax.jit(jax.grad(loss_simp, argnums=[0, 1, 2]))
 diff_mefficient_attention = jax.jit(jax.grad(loss_ckpt, argnums=[0, 1, 2]))
 diff_mefficient_attention2 = jax.jit(jax.grad(loss_ckpt2, argnums=[0, 1, 2]))
 
-for i in range(8, 15, 1):
+for i in range(8, 12, 1):
     q_size = 2**i
     memsize = 2**i
     print("\nAttention size:", q_size, "x", memsize)

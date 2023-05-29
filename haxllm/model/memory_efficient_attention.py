@@ -104,6 +104,7 @@ def _mefficient_attention(
     causal=True,
     sparse=False,
     query_chunk_size=1024,
+    key_chunk_size=4096,
     precision=None,
     dtype=jnp.float32,
 ):
@@ -119,7 +120,9 @@ def _mefficient_attention(
             chunk_idx + query_chunk_size,
             _query_chunk_attention(
                 query_chunk, key, value, chunk_idx,
-                causal=causal, sparse=sparse, precision=precision, dtype=dtype
+                causal=causal, sparse=sparse,
+                key_chunk_size=key_chunk_size,
+                precision=precision, dtype=dtype
             ),
         )
 
@@ -130,7 +133,7 @@ def _mefficient_attention(
 
 
 # TODO: add support for key_padding_mask
-@functools.partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
+@functools.partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def dot_product_attention(
     query,
     key,
@@ -138,9 +141,10 @@ def dot_product_attention(
     causal=True,
     sparse=False,
     query_chunk_size=1024,
+    key_chunk_size=4096,
     precision=None,
     dtype=jnp.float32,
 ):
-    return jax.vmap(_mefficient_attention, in_axes=(0, 0, 0, None, None, None, None, None))(
-        query, key, value, causal, sparse, query_chunk_size, precision, dtype
+    return jax.vmap(_mefficient_attention, in_axes=(0, 0, 0, None, None, None, None, None, None))(
+        query, key, value, causal, sparse, query_chunk_size, key_chunk_size, precision, dtype
     )
