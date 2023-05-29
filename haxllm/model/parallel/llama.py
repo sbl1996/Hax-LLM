@@ -202,12 +202,25 @@ class TransformerModel(nn.Module):
             name='wte'
         )(inputs)
 
-        remat_scan_lengths = config.remat_scan_lengths()
-        TransformerBlockStack = remat_scan(
-            TransformerBlock, lengths=remat_scan_lengths,
-            variable_axes={True: 0}, split_rngs={True: True},
-            metadata_params1={nn.PARTITION_NAME: None}, metadata_params2={nn.PARTITION_NAME: None})
-        x = TransformerBlockStack(config, name='hs')(x)
+        if config.remat_scan:
+            remat_scan_lengths = config.remat_scan_lengths()
+            TransformerBlockStack = remat_scan(
+                TransformerBlock, lengths=remat_scan_lengths,
+                variable_axes={True: 0}, split_rngs={True: True},
+                metadata_params1={nn.PARTITION_NAME: None}, metadata_params2={nn.PARTITION_NAME: None})
+            x = TransformerBlockStack(config, name='hs')(x)
+        else:
+            block_fn = TransformerBlock
+            if config.remat:
+                block_fn = nn.remat(block_fn)
+            if config.scan:
+                TransformerBlockStack = nn.scan(
+                    block_fn, length=config.scan_layers(), variable_axes={True: 0},
+                    split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
+                x = TransformerBlockStack(config, scan=True, name='hs')(x)[0]
+            else:
+                for i in range(config.n_layers):
+                    x = block_fn(config, name=f'h_{i}')(x)
 
         norm_layer = nn.remat(RMSNorm) if remat else RMSNorm
         x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
@@ -240,7 +253,7 @@ class TransformerLMHeadModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
+    def __call__(self, *, inputs, train=False):
         config = self.config
         x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
 
