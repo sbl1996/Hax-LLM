@@ -5,7 +5,7 @@ import jax
 import functools
 from flax import linen as nn
 
-from haxllm.model.memory_efficient_attention import dot_product_attention as mefficient_attention
+from haxllm.model.efficient_attention import dot_product_attention as mefficient_attention
 
 _cur_key = jax.random.PRNGKey(4)
 

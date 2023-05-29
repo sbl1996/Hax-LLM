@@ -1,6 +1,6 @@
 import math
 import functools
-from typing import Callable, Optional, Tuple, Union, Sequence, Iterable
+from typing import Callable, Optional, Tuple, Union, Sequence, Iterable, Any
 
 import jax
 import jax.numpy as jnp
@@ -9,11 +9,15 @@ from jax import lax
 from flax.core import meta
 import flax.linen as nn
 from flax.linen.dtypes import promote_dtype
-from flax.linen import Module, compact, initializers
+from flax.linen import initializers
 from flax.linen.attention import Dtype, Array, PRNGKey, Shape, combine_masks, dot_product_attention
 from flax.linen.module import merge_param
 
-from haxllm.model.memory_efficient_attention import dot_product_attention as dot_product_attention_m
+from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
+from haxllm.model.parallel import remat_scan, remat
+from haxllm.gconfig import get_remat_policy
+from haxllm.config_utils import RematScanConfigMixin
+
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -119,142 +123,6 @@ class DenseGeneral(nn.Module):
         return out
 
 
-class MultiHeadDotProductAttention(Module):
-    num_heads: int
-    dtype: Optional[Dtype] = None
-    param_dtype: Dtype = jnp.float32
-    qkv_features: Optional[int] = None
-    out_features: Optional[int] = None
-    broadcast_dropout: bool = True
-    dropout_rate: float = 0.
-    deterministic: Optional[bool] = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-    use_bias: bool = True
-    decode: bool = False
-    memory_efficient: bool = False
-
-    @compact
-    def __call__(self,
-                 inputs_q: Array,
-                 inputs_kv: Array,
-                 mask: Optional[Array] = None,
-                 deterministic: Optional[bool] = None):
-        features = self.out_features or inputs_q.shape[-1]
-        qkv_features = self.qkv_features or inputs_q.shape[-1]
-        assert qkv_features % self.num_heads == 0, (
-            'Memory dimension must be divisible by number of heads.')
-        head_dim = qkv_features // self.num_heads
-
-        dense = functools.partial(
-            DenseGeneral,
-            axis=-1,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            features=(self.num_heads, head_dim),
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            use_bias=self.use_bias,
-        )
-        # project inputs_q to multi-headed q/k/v
-        # dimensions are then [batch..., length, num_attention_headss, n_features_per_head]
-        query, key, value = (dense(name='query')(inputs_q),
-                             dense(name='key')(inputs_kv),
-                             dense(name='value')(inputs_kv))
-
-        # During fast autoregressive decoding, we feed one position at a time,
-        # and cache the keys and values step by step.
-        if self.decode:
-            # detect if we're initializing by absence of existing cache data.
-            is_initialized = self.has_variable('cache', 'cached_key')
-            cached_key = self.variable('cache', 'cached_key',
-                                       jnp.zeros, key.shape, key.dtype)
-            cached_value = self.variable('cache', 'cached_value',
-                                         jnp.zeros, value.shape, value.dtype)
-            cache_index = self.variable('cache', 'cache_index',
-                                        lambda: jnp.array(0, dtype=jnp.int32))
-            if is_initialized:
-                *batch_dims, max_length, num_heads, depth_per_head = (
-                    cached_key.value.shape)
-                # shape check of cached keys against query input
-                expected_shape = tuple(batch_dims) + \
-                    (1, num_heads, depth_per_head)
-                if expected_shape != query.shape:
-                    raise ValueError('Autoregressive cache shape error, '
-                                     'expected query shape %s instead got %s.' %
-                                     (expected_shape, query.shape))
-                # update key, value caches with our new 1d spatial slices
-                cur_index = cache_index.value
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(
-                    cached_value.value, value, indices)
-                cached_key.value = key
-                cached_value.value = value
-                cache_index.value = cache_index.value + 1
-                # causal mask for cached decoder self-attention:
-                # our single query position should only attend to those key
-                # positions that have already been generated and cached,
-                # not the remaining zero elements.
-                mask = combine_masks(
-                    mask,
-                    jnp.broadcast_to(jnp.arange(max_length) <= cur_index,
-                                     tuple(batch_dims) + (1, 1, max_length)))
-
-        dropout_rng = None
-        if self.dropout_rate > 0.:  # Require `deterministic` only if using dropout.
-            m_deterministic = merge_param('deterministic', self.deterministic,
-                                          deterministic)
-            if not m_deterministic:
-                dropout_rng = self.make_rng('dropout')
-        else:
-            m_deterministic = True
-
-        if self.memory_efficient:
-            assert not self.dropout_rate, "dropout not supported with memory_efficient_attention"
-            assert mask is None, "masking not supported with memory_efficient_attention, default to causal attention"
-            x = dot_product_attention_m(
-                query,
-                key,
-                value,
-                casual=True,
-                dtype=self.dtype)
-        else:
-            x = dot_product_attention(
-                query,
-                key,
-                value,
-                mask=mask,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.dropout_rate,
-                broadcast_dropout=self.broadcast_dropout,
-                deterministic=m_deterministic,
-                dtype=self.dtype)
-        
-        # back to the original inputs dimensions
-        out = DenseGeneral(
-            features=features,
-            axis=(-2, -1),
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name='out',  # type: ignore[call-arg]
-        )(x)
-        return out
-
-
-class SelfAttention(MultiHeadDotProductAttention):
-    """Self-attention special case of multi-head dot-product attention."""
-
-    @compact
-    def __call__(self, inputs_q: Array, mask: Optional[Array] = None,  # type: ignore
-                 deterministic: Optional[bool] = None):
-        return super().__call__(inputs_q, inputs_q, mask,
-                                deterministic=deterministic)
-
-
 class MlpBlock(nn.Module):
     intermediate_size: Optional[int] = None
     activation: str = 'gelu'
@@ -286,3 +154,41 @@ class MlpBlock(nn.Module):
             x = nn.gelu(x, approximate=True)
         x = dense(actual_out_dim, name="fc_2")(x)
         return x
+
+
+def make_block_stack(block_fn, n_layers, config: RematScanConfigMixin):
+    remat_policy = get_remat_policy()
+
+    def stack_fn(x, train):
+        block_fn_ = block_fn
+        if config.remat_scan:
+            remat_scan_lengths = config.remat_scan_lengths()
+            if len(remat_scan_lengths) == 3:
+                n_loop = remat_scan_lengths[0]
+                lengths = remat_scan_lengths[1:]
+            else:
+                n_loop = None
+                lengths = remat_scan_lengths
+            TransformerBlockStack = remat_scan(
+                block_fn_, lengths=lengths, policy=remat_policy,
+                variable_axes={True: 0}, split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
+            if n_loop is not None:
+                for i in range(n_loop):
+                    x = TransformerBlockStack(config=config, name=f'hs_{i}')(x)
+            else:
+                x = TransformerBlockStack(config=config, name='hs')(x)
+        else:
+            if config.scan:
+                if config.remat and train:
+                    block_fn_ = remat(block_fn_, prevent_cse=False, policy=remat_policy)
+                TransformerBlockStack = nn.scan(
+                    block_fn_, length=config.scan_lengths()[0], variable_axes={True: 0},
+                    split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
+                x = TransformerBlockStack(config=config, scan=True, name='hs')(x)[0]
+            else:
+                if config.remat and train:
+                    block_fn_ = remat(block_fn_, policy=remat_policy)
+                for i in range(n_layers):
+                    x = block_fn_(config=config, name=f'h_{i}')(x)
+        return x
+    return stack_fn

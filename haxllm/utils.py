@@ -1,3 +1,4 @@
+from typing import  Union
 import math
 import re
 from datetime import datetime, timedelta
@@ -9,7 +10,7 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P, NamedSharding
+from jax.sharding import PartitionSpec as P, NamedSharding, Mesh
 
 from flax import linen as nn
 from flax import traverse_util
@@ -91,7 +92,7 @@ def freeze_params_optimizer(optimizer, params, trainable_pattern):
     return tx
 
 
-def convert_scan_params(params, src_keys, tgt_key, lengths):
+def convert_scan_params(params, src_keys, tgt_keys, lengths):
     if isinstance(lengths, int):
         lengths = [lengths]
     scan_layers = math.prod(lengths)
@@ -99,19 +100,34 @@ def convert_scan_params(params, src_keys, tgt_key, lengths):
         raise ValueError(
             f'Number of remat scan layers ({scan_layers}) must be less than or equal to the number of source keys ({len(src_keys)})')
     src_keys = src_keys[-scan_layers:]
-    level_trees = []
     if len(lengths) == 1:
+        level_trees = []
         for i in range(lengths[0]):
             level_trees.append(params.pop(src_keys[i]))
-    else:
+        params[tgt_keys] = jax.tree_map(
+            lambda *xs: np.stack(xs, axis=0), *level_trees)
+    elif len(lengths) == 2:
+        level_trees = []
         for i in range(lengths[0]):
             loop_trees = []
             for j in range(lengths[1]):
                 loop_trees.append(params.pop(src_keys[i * lengths[1] + j]))
             level_trees.append(jax.tree_map(
                 lambda *xs: np.stack(xs, axis=0), *loop_trees))
-    params[tgt_key] = jax.tree_map(
-        lambda *xs: np.stack(xs, axis=0), *level_trees)
+        params[tgt_keys] = jax.tree_map(
+            lambda *xs: np.stack(xs, axis=0), *level_trees)
+    else:
+        for l in range(lengths[0]):
+            level_trees = []
+            ol = l * lengths[1] * lengths[2]
+            for i in range(lengths[1]):
+                loop_trees = []
+                for j in range(lengths[2]):
+                    loop_trees.append(params.pop(src_keys[ol + i * lengths[2] + j]))
+                level_trees.append(jax.tree_map(
+                    lambda *xs: np.stack(xs, axis=0), *loop_trees))
+            params[tgt_keys[l]] = jax.tree_map(
+                lambda *xs: np.stack(xs, axis=0), *level_trees)
     return params
 
 
@@ -135,7 +151,19 @@ def get_partition_spec(p: nn.Partitioned):
     return p.get_partition_spec()
 
 
-def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
+def load_transformer_params(
+        params,
+        path: str,
+        device,
+        lm_head=False):
+    cpu = False
+    mesh = None
+    if isinstance(device, str):
+        assert device == 'cpu'
+        cpu = True
+    elif isinstance(device, Mesh):
+        mesh = device
+
     transformer_params = load_file(path)
     transformer_params = unflatten_dict(transformer_params, sep=".")
 
@@ -146,20 +174,33 @@ def merge_transformer_params(params, path, mesh=None, lm_head=False, cpu=False):
         frozen = False
     params = flatten_dict(params, sep=".")
 
-    if any([k.startswith("transformer.hs") for k in params.keys()]):
+    # detect scan or remat_scan
+    hs_keys = [k for k in params.keys() if k.startswith('transformer.hs')]
+    if hs_keys:
         src_keys = [k for k in transformer_params if k.startswith('h_')]
         h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
         sample_key = next(iter(h_params.keys()))
-        hs_param = params[f"transformer.hs.{sample_key}"]
+
+        loop_hs_keys = [k for k in hs_keys if k.startswith("transformer.hs_")]
+        if loop_hs_keys:
+            n_loop = len(set([k.split('.')[1] for k in loop_hs_keys]))
+            tgt_keys = [f"hs_{i}" for i in range(n_loop)]
+            hs_param = params[f"transformer.hs_0.{sample_key}"]
+            scan_lengths = (n_loop,)
+        else:
+            tgt_keys = 'hs'
+            hs_param = params[f"transformer.hs.{sample_key}"]
+            scan_lengths = ()
         if isinstance(hs_param, nn.Partitioned):
             hs_param = hs_param.value
         hs_shape = hs_param.shape
         h_shape = h_params[sample_key].shape
         del h_params, hs_param
-        scan_lengths = hs_shape[:(len(hs_shape) - len(h_shape))]
-        src_keys = [f"h_{i}" for i in range(scan_lengths[0])]
+        scan_lengths = scan_lengths + tuple(hs_shape[:(len(hs_shape) - len(h_shape))])
+        src_keys = [f"h_{i}" for i in range(np.prod(scan_lengths))]
+        print(src_keys, tgt_keys, scan_lengths)
         transformer_params = convert_scan_params(
-            transformer_params, src_keys=src_keys, tgt_key='hs', lengths=scan_lengths)
+            transformer_params, src_keys=src_keys, tgt_keys=tgt_keys, lengths=scan_lengths)
     new_transformer_params = flatten_dict(transformer_params, sep=".")
 
     prefix = "transformer."

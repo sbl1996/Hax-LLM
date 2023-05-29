@@ -6,7 +6,8 @@ import jax.numpy as jnp
 from flax import struct
 from flax import linen as nn
 
-from haxllm.model.modules import SelfAttention, MlpBlock
+from haxllm.model.parallel import SelfAttention, MlpBlock
+from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
 
 
@@ -67,23 +68,7 @@ class TransformerConfig:
     pad_token_id: int = 0
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.zeros_init()
-    remat: bool = False
-    scan: bool = False
-    remat_scan: bool = False
-
-    def scan_layers(self):
-        return self.n_layers if self.scan else 0
-
-    def remat_scan_lengths(self):
-        return (self.n_layers, 1) if self.remat_scan else None
-
-    def scan_lengths(self):
-        if self.remat_scan:
-            return self.remat_scan_lengths()
-        elif self.scan:
-            return self.scan_layers()
-        else:
-            return None
+    shard: bool = False
 
 
 class TransformerBlock(nn.Module):
@@ -103,13 +88,17 @@ class TransformerBlock(nn.Module):
 
         x = SelfAttention(
             num_heads=config.n_heads,
+            max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
-            broadcast_dropout=False,
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
+            broadcast_dropout=False,
+            qkv_shard_axes = ("X", None, "Y"),
+            out_shard_axes = ("Y", None, "X"),
+            shard=config.shard,
             name='attn')(inputs, attn_mask_)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
@@ -122,6 +111,9 @@ class TransformerBlock(nn.Module):
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
+            shard_axes1=("X", "Y"),
+            shard_axes2=("Y", "X"),
+            shard=config.shard,
             name='mlp')(x)
         y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
         y = x + y
@@ -163,20 +155,25 @@ class TransformerModel(nn.Module):
         dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
         x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
-        if config.remat_scan:
-            remat_scan_lengths = config.remat_scan_lengths()
-            TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
-            x = TransformerBlockStack(config, deterministic=not train, name='hs')((x, attn_mask))[0]
-        else:
-            block_fn = TransformerBlock
-            if config.remat:
-                block_fn = nn.remat(TransformerBlock, prevent_cse=not config.scan)
-            if config.scan:
-                TransformerBlockStack = nn.scan(block_fn, length=config.scan_layers(), variable_axes={True: 0}, split_rngs={True: True})
-                x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
-            else:
-                for d in range(config.n_layers):
-                    x = block_fn(config, deterministic=not train, name=f'h_{d}')((x, attn_mask))[0]
+        block_fn = functools.partial(
+            TransformerBlock, deterministic=not train)
+        x = make_block_stack(block_fn, config.n_layers, config)(x, train)
+
+
+        # if config.remat_scan:
+        #     remat_scan_lengths = config.remat_scan_lengths()
+        #     TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
+        #     x = TransformerBlockStack(config, deterministic=not train, name='hs')((x, attn_mask))[0]
+        # else:
+        #     block_fn = TransformerBlock
+        #     if config.remat:
+        #         block_fn = nn.remat(TransformerBlock, prevent_cse=not config.scan)
+        #     if config.scan:
+        #         TransformerBlockStack = nn.scan(block_fn, length=config.scan_layers(), variable_axes={True: 0}, split_rngs={True: True})
+        #         x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
+        #     else:
+        #         for d in range(config.n_layers):
+        #             x = block_fn(config, deterministic=not train, name=f'h_{d}')((x, attn_mask))[0]
         
         if config.pooler:
             x = nn.Dense(
@@ -188,7 +185,6 @@ class TransformerModel(nn.Module):
                 name="pooler_fc")(x[:, 0])
             x = jnp.tanh(x)
         return x
-
 
 
 class TransformerSequenceClassifier(nn.Module):
