@@ -30,11 +30,13 @@ def get_optimizer(cfg, steps_per_epoch):
     init_lr = cfg.optimizer.warmup_min_lr
     peak_lr = cfg.optimizer.learning_rate
     warmup_steps = cfg.optimizer.warmup_steps
+    min_ratio = getattr(cfg.optimizer, "min_ratio", 0.0)
     print(f"init_lr: {init_lr}, peak_lr: {peak_lr}, warmup_steps: {warmup_steps}")
     if warmup_steps == 0:
         init_lr = peak_lr
     lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_lr, peak_lr, warmup_steps=warmup_steps, decay_steps=steps_per_epoch * cfg.epochs)
+        init_lr, peak_lr, warmup_steps=warmup_steps, decay_steps=steps_per_epoch * cfg.epochs,
+        end_value=peak_lr * min_ratio)
 
     optimizer = []
     if cfg.optimizer.clip_norm > 0:

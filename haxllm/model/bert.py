@@ -9,6 +9,7 @@ from flax import linen as nn
 from haxllm.model.parallel import SelfAttention, MlpBlock
 from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
+from haxllm.config_utils import RematScanConfigMixin
 
 
 config_hub = {
@@ -48,7 +49,7 @@ def load_config(name, **kwargs):
 
 
 @struct.dataclass
-class TransformerConfig:
+class TransformerConfig(RematScanConfigMixin):
     vocab_size: int = 30522
     type_vocab_size: int = 2
     num_labels: int = 2
@@ -65,6 +66,7 @@ class TransformerConfig:
     embd_pdrop: float = 0.1
     attn_pdrop: float = 0.1
     resid_pdrop: float = 0.1
+    cls_pdrop: float = 0.1
     pad_token_id: int = 0
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.zeros_init()
@@ -96,8 +98,8 @@ class TransformerBlock(nn.Module):
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
             broadcast_dropout=False,
-            qkv_shard_axes = ("X", None, "Y"),
-            out_shard_axes = ("Y", None, "X"),
+            qkv_shard_axes=("X", None, "Y"),
+            out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             name='attn')(inputs, attn_mask_)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
@@ -131,14 +133,12 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train):
         config = self.config
-        remat = config.remat or config.remat_scan
 
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
         type_token_ids = jnp.zeros_like(position_ids, dtype=jnp.int32)
 
-        embed_layer = nn.remat(nn.Embed) if remat else nn.Embed
         embed_layer = functools.partial(
-            embed_layer, dtype=config.dtype, param_dtype=config.param_dtype)
+            nn.Embed, dtype=config.dtype, param_dtype=config.param_dtype)
 
         inputs_embeds = embed_layer(
             num_embeddings=config.vocab_size, features=config.hidden_size, name='word_embeddings')(inputs)
@@ -149,32 +149,14 @@ class TransformerModel(nn.Module):
             
         x = inputs_embeds + position_embeds + token_type_embeds
 
-        norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
-        x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln')(x)
+        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln')(x)
 
-        dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
-        x = dropout_layer(rate=config.embd_pdrop)(x, not train)
+        x = nn.Dropout(rate=config.embd_pdrop)(x, not train)
 
         block_fn = functools.partial(
             TransformerBlock, deterministic=not train)
-        x = make_block_stack(block_fn, config.n_layers, config)(x, train)
+        x = make_block_stack(block_fn, config.n_layers, config)((x, attn_mask), train)[0]
 
-
-        # if config.remat_scan:
-        #     remat_scan_lengths = config.remat_scan_lengths()
-        #     TransformerBlockStack = nn.remat_scan(TransformerBlock, lengths=remat_scan_lengths)
-        #     x = TransformerBlockStack(config, deterministic=not train, name='hs')((x, attn_mask))[0]
-        # else:
-        #     block_fn = TransformerBlock
-        #     if config.remat:
-        #         block_fn = nn.remat(TransformerBlock, prevent_cse=not config.scan)
-        #     if config.scan:
-        #         TransformerBlockStack = nn.scan(block_fn, length=config.scan_layers(), variable_axes={True: 0}, split_rngs={True: True})
-        #         x = TransformerBlockStack(config, deterministic=not train, scan=True, name='hs')((x, attn_mask))[0][0]
-        #     else:
-        #         for d in range(config.n_layers):
-        #             x = block_fn(config, deterministic=not train, name=f'h_{d}')((x, attn_mask))[0]
-        
         if config.pooler:
             x = nn.Dense(
                 config.hidden_size,
@@ -197,7 +179,8 @@ class TransformerSequenceClassifier(nn.Module):
 
         if not config.pooler:
             x = x[:, 0]
-            
+        
+        x = nn.Dropout(rate=config.cls_pdrop)(x, not train)
         x = nn.Dense(
             config.num_labels,
             dtype=config.dtype,

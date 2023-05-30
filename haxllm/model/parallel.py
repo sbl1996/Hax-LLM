@@ -128,19 +128,23 @@ class Dense(ShardMixIn, nn.Dense):
 class Embed(ShardMixIn, nn.Embed):
     pass
 
+ShardAxis = Optional[str]
 
 class SelfAttention(ShardModule):
     num_heads: int
     max_len: int
     dtype: Optional[Dtype] = None
     param_dtype: Optional[Dtype] = jnp.float32
+    broadcast_dropout: bool = False
     dropout_rate: float = 0.
     deterministic: Optional[bool] = None
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
     use_bias: bool = True
     decode: bool = False
+    qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", None, "Y")
+    out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
-    qkv_shard_axes = ("X", None, "Y")
-    out_shard_axes = ("Y", None, "X")
 
     @nn.compact
     def __call__(self, x, mask: Optional[Array] = None):
@@ -155,6 +159,8 @@ class SelfAttention(ShardModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             features=(self.num_heads, head_dim),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
             use_bias=self.use_bias,
             shard_axes={"kernel": self.qkv_shard_axes},
             shard=self.shard,
@@ -208,26 +214,32 @@ class SelfAttention(ShardModule):
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:
             dropout_rng = self.make_rng('dropout')
+            deterministic = False
+        else:
+            deterministic = True
+
 
         x = dot_product_attention(
             query, key, value,
             mask=mask,
             dropout_rng=dropout_rng,
             dropout_rate=self.dropout_rate,
-            broadcast_dropout=False,
-            deterministic=self.deterministic,
+            broadcast_dropout=self.broadcast_dropout,
+            deterministic=deterministic,
             dtype=self.dtype)
 
         out = DenseGeneral(
             features=features,
             axis=(-2, -1),
             use_bias=self.use_bias,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            shard_axes={"kernel": self.out_shard_axis},
+            shard_axes={"kernel": self.out_shard_axes},
             shard=self.shard,
             name='out',
-        )(x)
+        )(x)  # type: ignore
         # out = self.with_sharding_constraint(
         #     out, ("X", None, "Y"))
         return out

@@ -6,12 +6,16 @@ import jax.numpy as jnp
 def load_config(cls, base_config, **kwargs):
     d = {**base_config}
     kwargs = {**kwargs}
-    assert not (kwargs['remat_scan'] and (kwargs['remat'] or kwargs['scan'])), \
+
+    remat_scan = kwargs.get('remat_scan', False)
+    remat = kwargs.get('remat', False)
+    scan = kwargs.get('scan', False)
+    assert not (remat_scan and (remat or scan)), \
         "Cannot use remat_scan with remat or scan"
 
     n_layers = d['n_layers']
     lengths = kwargs.get('lengths', None)
-    if kwargs['remat_scan']:
+    if remat_scan:
         if lengths is None:
             lengths = (n_layers, 1)
         assert len(lengths) in [2, 3], "remat_scan_lengths must be a tuple of length 2 or 3" 
@@ -24,7 +28,7 @@ def load_config(cls, base_config, **kwargs):
             lengths = tuple(lengths)
         else:
             assert sum(lengths) == n_layers, "sum of lengths must equal n_layers"
-    else:  # scan
+    elif scan:  # scan
         if lengths is None:
             lengths = (n_layers,)
         if isinstance(lengths, int):
@@ -35,7 +39,7 @@ def load_config(cls, base_config, **kwargs):
         else:
             assert lengths[0] == n_layers, "lengths must equal n_layers"
     print(f"Using lengths {lengths}")
-    kwargs['lengths'] = lengths
+    kwargs['lengths'] = tuple(lengths)
 
     for k, v in kwargs.items():
         if k not in cls.__dataclass_fields__:
