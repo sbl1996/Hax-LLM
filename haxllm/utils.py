@@ -198,7 +198,6 @@ def load_transformer_params(
         del h_params, hs_param
         scan_lengths = scan_lengths + tuple(hs_shape[:(len(hs_shape) - len(h_shape))])
         src_keys = [f"h_{i}" for i in range(np.prod(scan_lengths))]
-        print(src_keys, tgt_keys, scan_lengths)
         transformer_params = convert_scan_params(
             transformer_params, src_keys=src_keys, tgt_keys=tgt_keys, lengths=scan_lengths)
     new_transformer_params = flatten_dict(transformer_params, sep=".")
@@ -210,6 +209,7 @@ def load_transformer_params(
     for key in all_keys:
         if key not in new_transformer_params:
             print(f"Key {key} not found in transformer params")
+            continue
         
         full_key = key if key.startswith("lm_head") else prefix + key
         p = params[full_key]

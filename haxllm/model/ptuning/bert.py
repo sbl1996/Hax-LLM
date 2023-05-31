@@ -1,12 +1,12 @@
-import functools
 from typing import Any, Callable
+import functools
 
 import jax.numpy as jnp
 
 from flax import struct
 from flax import linen as nn
 
-from haxllm.model.parallel import SelfAttention, MlpBlock
+from haxllm.model.parallel import SelfAttention, MlpBlock, Embed, PrefixEmbed
 from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
 from haxllm.config_utils import RematScanConfigMixin
@@ -78,6 +78,9 @@ class TransformerConfig(RematScanConfigMixin):
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.zeros_init()
     shard: bool = False
+    pre_seq_len: int = 0
+    prefix_projection: bool = False
+    prefix_hidden_size: int = 512
 
 
 class TransformerBlock(nn.Module):
@@ -90,11 +93,23 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
+        past_key_value = PrefixEmbed(
+            seq_len=config.pre_seq_len,
+            projection=config.prefix_projection,
+            prefix_features=config.prefix_hidden_size,
+            features=(config.n_heads, config.hidden_size // config.n_heads),
+            dtype=config.dtype,
+            name="prefix"
+        )(inputs)
+
         if attn_mask is not None:
-            attn_mask_ = attn_mask[:, None, None, :]
+            # (B, H, Q, KV)
+            attn_mask_ = jnp.concatenate(
+                (jnp.ones((attn_mask.shape[0], config.pre_seq_len), dtype=attn_mask.dtype), attn_mask), axis=-1)
+            attn_mask_ = attn_mask_[:, None, None, :]
         else:
             attn_mask_ = None
-
+        
         x = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -108,7 +123,7 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name='attn')(inputs, attn_mask_)
+            name='attn')(inputs, attn_mask_, past_key_value)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(x)
@@ -143,6 +158,7 @@ class TransformerModel(nn.Module):
 
         if position_ids is None:
             position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
+        position_ids = position_ids + config.pre_seq_len
         type_token_ids = jnp.zeros_like(position_ids, dtype=jnp.int32)
 
         embed_layer = functools.partial(

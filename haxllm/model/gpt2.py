@@ -86,7 +86,7 @@ class TransformerBlock(nn.Module):
             dropout_rate=config.attn_pdrop,
             deterministic=self.deterministic,
             decode=config.decode,
-            qkv_shard_axes = ("X", None, "Y"),
+            qkv_shard_axes = ("X", "Y", None),
             out_shard_axes = ("Y", None, "X"),
             shard=config.shard,
             name='attn')(x, attn_mask)

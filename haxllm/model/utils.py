@@ -38,7 +38,8 @@ def load_config(cls, base_config, **kwargs):
             lengths = (n_layers,)
         else:
             assert lengths[0] == n_layers, "lengths must equal n_layers"
-    print(f"Using lengths {lengths}")
+    else:
+        lengths = []
     kwargs['lengths'] = tuple(lengths)
 
     for k, v in kwargs.items():

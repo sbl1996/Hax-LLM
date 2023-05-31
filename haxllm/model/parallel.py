@@ -12,6 +12,7 @@ from flax.linen import partitioning as nn_partitioning, initializers
 from flax.linen.attention import dot_product_attention, Dtype, Array, combine_masks, PRNGKey, Shape
 
 from haxllm.gconfig import get as get_gconfig
+from haxllm.model.modules import PrefixEmbed as _PrefixEmbed
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -128,6 +129,11 @@ class Dense(ShardMixIn, nn.Dense):
 class Embed(ShardMixIn, nn.Embed):
     pass
 
+
+class PrefixEmbed(ShardMixIn, _PrefixEmbed):
+    pass
+
+
 ShardAxis = Optional[str]
 
 class SelfAttention(ShardModule):
@@ -142,12 +148,13 @@ class SelfAttention(ShardModule):
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
     use_bias: bool = True
     decode: bool = False
-    qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", None, "Y")
+    qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
 
     @nn.compact
-    def __call__(self, x, mask: Optional[Array] = None):
+    def __call__(self, x, mask: Optional[Array] = None,
+                 past_key_value: Optional[Tuple[Array]] = None):
         features = x.shape[-1]
         assert features % self.num_heads == 0, (
             'Memory dimension must be divisible by number of heads.')
@@ -175,6 +182,10 @@ class SelfAttention(ShardModule):
             qkv_constraint(dense(name='key')(x)),
             qkv_constraint(dense(name='value')(x)),
         )
+
+        if past_key_value is not None:
+            key = jnp.concatenate([past_key_value[0], key], axis=1)
+            value = jnp.concatenate([past_key_value[1], value], axis=1)
 
         if self.decode:
             is_initialized = self.has_variable('cache', 'cached_key')
