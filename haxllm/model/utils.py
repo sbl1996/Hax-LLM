@@ -27,7 +27,7 @@ def load_config(cls, base_config, **kwargs):
             lengths[lengths.index(-1)] = int(n)
             lengths = tuple(lengths)
         else:
-            assert sum(lengths) == n_layers, "sum of lengths must equal n_layers"
+            assert math.prod(lengths) == n_layers, "sum of lengths must equal n_layers"
     elif scan:  # scan
         if lengths is None:
             lengths = (n_layers,)

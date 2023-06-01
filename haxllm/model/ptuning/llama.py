@@ -9,47 +9,16 @@ from jax import lax
 
 import flax.linen as nn
 from flax import struct
-from flax.linen.attention import dot_product_attention, Dtype, Array, combine_masks
+from flax.linen import initializers
+from flax.linen.attention import Dtype, Array, combine_masks
 
 from haxllm.model.modules import PRNGKey, Shape, default_kernel_init, RMSNorm, make_block_stack
-from haxllm.model.parallel import DenseGeneral, Dense, Embed, ShardModule
+from haxllm.model.parallel import DenseGeneral, Dense, Embed, ShardModule, dot_product_attention, PrefixEmbed
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
 from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.llama import config_hub, remap_state_dict, TransformerConfig as BaseTransformerConfig
 
-
-config_hub = {
-    "llama-t": dict(
-        hidden_size=1024,
-        intermediate_size=2816,
-        n_heads=8,
-        n_layers=2,
-    ),
-    "llama-7b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_layers=32,
-    ),
-    "llama-13b": dict(
-        hidden_size=5120,
-        intermediate_size=13824,
-        n_heads=40,
-        n_layers=40,
-    ),
-    "llama-30b": dict(
-        hidden_size=6656,
-        intermediate_size=17920,
-        n_heads=52,
-        n_layers=60,
-    ),
-    "llama-65b": dict(
-        hidden_size=8192,
-        intermediate_size=22016,
-        n_heads=64,
-        n_layers=80,
-    ),
-}
 
 def load_config(name, **kwargs):
     if name in config_hub:
@@ -60,25 +29,11 @@ def load_config(name, **kwargs):
 
 
 @struct.dataclass
-class TransformerConfig(RematScanConfigMixin):
-    vocab_size: int = 32000
-    num_labels: int = 2
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    n_heads: int = 32
-    n_layers: int = 32
-    rms_norm_eps: float = 1e-6
-    n_positions: int = 2048
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    kernel_init: Callable = nn.initializers.xavier_uniform()
-    bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    decode: bool = False
-    memory_efficient: bool = False
-    shard: bool = False
+class TransformerConfig(BaseTransformerConfig):
+    pre_seq_len: int = 0
+    prefix_projection: bool = False
+    prefix_hidden_size: int = 512
+    zero_init_prefix_attn: bool = False
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32):
@@ -100,11 +55,17 @@ def rotate_half(x):
 def apply_rotary_pos_emb(q, k, cos, sin):
     # x: (batch_size, seq_len, num_heads, head_dim)
     # cos, sin: (seq_len, head_dim)
-    seq_len = q.shape[1]
-    cos = cos[None, :seq_len, None, :]
-    sin = sin[None, :seq_len, None, :]
-    q = (q * cos) + (rotate_half(q) * sin)
-    k = (k * cos) + (rotate_half(k) * sin)
+    q_len = q.shape[1]
+    kv_len = k.shape[1]
+    prefix_len = kv_len - q_len
+
+    cos_k = cos[None, :kv_len, None, :]
+    sin_k = sin[None, :kv_len, None, :]
+    k = (k * cos_k) + (rotate_half(k) * sin_k)
+
+    cos_q = cos_k[:, prefix_len:]
+    sin_q = sin_k[:, prefix_len:]
+    q = (q * cos_q) + (rotate_half(q) * sin_q)
     return q, k
 
 
@@ -148,18 +109,20 @@ class MlpBlock(ShardModule):
         return x
 
 
-class SelfAttention(ShardModule):
+class RoPESelfAttention(ShardModule):
     num_heads: int
     max_len: int
     dtype: Optional[Dtype] = None
     param_dtype: Dtype = jnp.float32
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     decode: bool = False
+    zero_init: bool = False
     memory_efficient: bool = False
     shard: bool = True
 
     @nn.compact
-    def __call__(self, x: Array, mask: Optional[Array] = None):
+    def __call__(self, x: Array, mask: Optional[Array] = None,
+                 prefix_key_value: Optional[Array] = None):
         features = x.shape[-1]
         assert features % self.num_heads == 0, (
             'Memory dimension must be divisible by number of heads.')
@@ -186,6 +149,13 @@ class SelfAttention(ShardModule):
             qkv_constraint(dense(name='key')(x)),
             qkv_constraint(dense(name='value')(x)),
         )
+
+        if prefix_key_value is not None:
+            key = jnp.concatenate([prefix_key_value[0], key], axis=1)
+            value = jnp.concatenate([prefix_key_value[1], value], axis=1)
+            prefix_len = prefix_key_value[0].shape[1]
+        else:
+            prefix_len = None
 
         cos, sin = precompute_freqs_cis(dim=head_dim, end=self.max_len, dtype=self.dtype)
 
@@ -233,10 +203,17 @@ class SelfAttention(ShardModule):
 
         if self.memory_efficient:
             assert mask is None, 'Masking is not supported for memory efficient attention, default to causal attention.'
+            assert not self.zero_init, 'Zero init is not supported for memory efficient attention'
             x = dot_product_attention_m(query, key, value, causal=True, dtype=self.dtype)
         else:
-            x = dot_product_attention(query, key, value, mask=mask, dtype=self.dtype)
-
+            if self.zero_init:
+                prefix_gate = self.param(
+                    "prefix_gate", initializers.zeros, (self.num_heads,), jnp.float32)
+                prefix_gate = prefix_gate[None, :, None, None]
+            else:
+                prefix_gate = None
+            x = dot_product_attention(query, key, value, prefix_gate,
+                                      mask=mask, prefix_len=prefix_len, dtype=self.dtype)
 
         # x = self.with_sharding_constraint(
         #     x, axes=("X", None, "Y", None))
@@ -264,13 +241,26 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        prefix_key_value = PrefixEmbed(
+            seq_len=config.pre_seq_len,
+            projection=config.prefix_projection,
+            prefix_features=config.prefix_hidden_size,
+            features=(config.n_heads, config.hidden_size // config.n_heads),
+            dtype=config.dtype,
+            name="prefix"
+        )(inputs)
+
         if not config.memory_efficient:
-            attn_mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            prefix_len = config.pre_seq_len
+            kv_len = config.pre_seq_len + inputs.shape[1]
+            idxs = jnp.arange(kv_len, dtype=jnp.int32)
+            mask = (idxs[:, None] > idxs[None, :])[prefix_len:, :]
+            mask = jnp.broadcast_to(mask, (inputs.shape[0], 1, kv_len - prefix_len, kv_len))
         else:
-            attn_mask = None
+            mask = None
 
         x = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_1")(inputs)
-        x = SelfAttention(
+        x = RoPESelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
             dtype=config.dtype,
@@ -279,7 +269,8 @@ class TransformerBlock(nn.Module):
             decode=config.decode,
             memory_efficient=config.memory_efficient,
             shard=config.shard,
-            name='attn')(x, attn_mask)
+            zero_init=config.zero_init_prefix_attn,
+            name='attn')(x, mask, prefix_key_value)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
@@ -353,39 +344,3 @@ class TransformerLMHeadModel(nn.Module):
             kernel_init=config.kernel_init,
             name='lm_head')(x)
         return x
-
-
-def remap_state_dict(state_dict, config: TransformerConfig):
-    root = {}
-    root['wte'] = {'embedding': state_dict.pop('model.embed_tokens.weight')}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
-
-    for d in range(config.n_layers):
-        block_d = {}
-        block_d['ln_1'] = {'scale': state_dict.pop(f'model.layers.{d}.input_layernorm.weight')}
-        block_d['attn'] = {
-            'query': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.q_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'key': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.k_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'value': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.v_proj.weight').T.reshape(hidden_size, n_heads, -1),
-            },
-            'out': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.o_proj.weight').T.reshape(n_heads, -1, hidden_size),
-            },
-        }
-        block_d['ln_2'] = {'scale': state_dict.pop(f'model.layers.{d}.post_attention_layernorm.weight')}
-        block_d['mlp'] = {
-            'gate': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.gate_proj.weight').T},
-            'up': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.up_proj.weight').T},
-            'down': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.down_proj.weight').T},
-        }
-        root[f'h_{d}'] = block_d
-
-    root['ln_f'] = {'scale': state_dict.pop('model.norm.weight')}
-    root['lm_head'] = {'kernel': state_dict.pop('lm_head.weight').T}
-    return root

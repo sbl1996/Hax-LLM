@@ -10,77 +10,24 @@ from haxllm.model.parallel import SelfAttention, MlpBlock, Embed, PrefixEmbed
 from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
 from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.bert import config_hub, remap_state_dict, TransformerConfig as BaseTransformerConfig
 
-
-config_hub = {
-    "bert-base-uncased": dict(
-        hidden_size=768,
-        intermediate_size=3072,
-        n_heads=12,
-        n_layers=12,
-    ),
-    "bert-large-uncased": dict(
-        hidden_size=1024,
-        intermediate_size=4096,
-        n_heads=16,
-        n_layers=24,
-    ),
-    "bert-base-cased": dict(
-        hidden_size=768,
-        intermediate_size=3072,
-        n_heads=12,
-        n_layers=12,
-    ),
-    "bert-large-cased": dict(
-        hidden_size=1024,
-        intermediate_size=4096,
-        n_heads=16,
-        n_layers=24,
-    ),
-    "roberta-large": dict(
-        hidden_size=1024,
-        intermediate_size=4096,
-        n_heads=16,
-        n_layers=24,
-        vocab_size=50265,
-    ),
-}
 
 def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        raise ValueError(f"Unknown ptuning bert model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 
 
 @struct.dataclass
-class TransformerConfig(RematScanConfigMixin):
-    vocab_size: int = 30522
-    type_vocab_size: int = 2
-    num_labels: int = 2
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-    pooler: bool = True
-    hidden_size: int = 768
-    intermediate_size: int = 3072
-    n_heads: int = 12
-    n_layers: int = 12
-    layer_norm_epsilon: float = 1e-12
-    n_positions: int = 512
-    initializer_range: float = 0.02
-    embd_pdrop: float = 0.1
-    attn_pdrop: float = 0.1
-    resid_pdrop: float = 0.1
-    cls_pdrop: float = 0.1
-    pad_token_id: int = 0
-    kernel_init: Callable = nn.initializers.xavier_uniform()
-    bias_init: Callable = nn.initializers.zeros_init()
-    shard: bool = False
+class TransformerConfig(BaseTransformerConfig):
     pre_seq_len: int = 0
     prefix_projection: bool = False
     prefix_hidden_size: int = 512
+    zero_init_prefix_attn: bool = False
 
 
 class TransformerBlock(nn.Module):
@@ -93,7 +40,7 @@ class TransformerBlock(nn.Module):
         inputs, attn_mask = x
         config = self.config
 
-        past_key_value = PrefixEmbed(
+        prefix_key_value = PrefixEmbed(
             seq_len=config.pre_seq_len,
             projection=config.prefix_projection,
             prefix_features=config.prefix_hidden_size,
@@ -109,7 +56,7 @@ class TransformerBlock(nn.Module):
             attn_mask_ = attn_mask_[:, None, None, :]
         else:
             attn_mask_ = None
-        
+
         x = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -123,7 +70,8 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name='attn')(inputs, attn_mask_, past_key_value)
+            zero_init=config.zero_init_prefix_attn,
+            name='attn')(inputs, attn_mask_, prefix_key_value)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
         x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(x)
@@ -213,55 +161,3 @@ class TransformerSequenceClassifier(nn.Module):
             bias_init=config.bias_init,
             name='score')(x)
         return x
-
-
-def remap_state_dict(state_dict, config: TransformerConfig):
-    state_dict = {k.replace('bert.', ''): v for k, v in state_dict.items()}
-    root = {}
-    root['word_embeddings'] = {'embedding': state_dict.pop('embeddings.word_embeddings.weight')}
-    root['position_embeddings'] = {'embedding': state_dict.pop('embeddings.position_embeddings.weight')}
-    root['token_type_embeddings'] = {'embedding': state_dict.pop('embeddings.token_type_embeddings.weight')}
-    root['ln'] = {'scale': state_dict.pop('embeddings.LayerNorm.gamma'), 'bias': state_dict.pop('embeddings.LayerNorm.beta')}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
-
-    for d in range(config.n_layers):
-        block_d = {}
-        block_d['attn'] = {
-            'query': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.attention.self.query.weight').T.reshape(hidden_size, n_heads, -1),
-                'bias': state_dict.pop(f'encoder.layer.{d}.attention.self.query.bias').reshape(n_heads, -1),
-            },
-            'key': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.attention.self.key.weight').T.reshape(hidden_size, n_heads, -1),
-                'bias': state_dict.pop(f'encoder.layer.{d}.attention.self.key.bias').reshape(n_heads, -1),
-            },
-            'value': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.attention.self.value.weight').T.reshape(hidden_size, n_heads, -1),
-                'bias': state_dict.pop(f'encoder.layer.{d}.attention.self.value.bias').reshape(n_heads, -1),
-            },
-            'out': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.attention.output.dense.weight').T.reshape(n_heads, -1, hidden_size),
-                'bias': state_dict.pop(f'encoder.layer.{d}.attention.output.dense.bias'),
-            },
-        }
-        block_d['ln_1'] = {'scale': state_dict.pop(f'encoder.layer.{d}.attention.output.LayerNorm.gamma'),
-                           'bias': state_dict.pop(f'encoder.layer.{d}.attention.output.LayerNorm.beta')}
-
-        block_d['mlp'] = {
-            'fc_1': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.intermediate.dense.weight').T,
-                'bias': state_dict.pop(f'encoder.layer.{d}.intermediate.dense.bias'),
-            },
-            'fc_2': {
-                'kernel': state_dict.pop(f'encoder.layer.{d}.output.dense.weight').T,
-                'bias': state_dict.pop(f'encoder.layer.{d}.output.dense.bias'),
-            },
-        }
-        block_d['ln_2'] = {'scale': state_dict.pop(f'encoder.layer.{d}.output.LayerNorm.gamma'),
-                           'bias': state_dict.pop(f'encoder.layer.{d}.output.LayerNorm.beta')}
-        root[f'h_{d}'] = block_d
-
-    root['pooler_fc'] = {'kernel': state_dict.pop('pooler.dense.weight').T, 'bias': state_dict.pop('pooler.dense.bias')}
-
-    return root

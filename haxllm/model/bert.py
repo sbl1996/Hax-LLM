@@ -50,7 +50,7 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        raise ValueError(f"Unknown ptuning bert model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 

@@ -83,7 +83,10 @@ def freeze_params_optimizer(optimizer, params, trainable_pattern):
         path_str = ".".join(path)
         match = re.findall(trainable_pattern, path_str) != []
         if match:
-            print(f"Trainable: {path_str}")
+            if isinstance(v, nn.Partitioned):
+                print(f"Trainable: {path_str} {v.get_partition_spec()} {v.value.dtype}")
+            else:
+                print(f"Trainable: {path_str} {v.dtype}")
         return 'trainable' if match else 'frozen'
 
     param_labels = freeze(
