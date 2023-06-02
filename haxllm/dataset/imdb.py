@@ -1,20 +1,12 @@
-from typing import Sequence
-import numpy as np
 from datasets import load_dataset
-from sklearn.model_selection import train_test_split
+from haxllm.dataset.hub import register_dataset
 
 
-def load_data(split, tokenize_function, cache_dir):
-    dataset = load_dataset('imdb', split=split, cache_dir=cache_dir)
-    tokenized_dataset = dataset.map(tokenize_function, batched=True)
-    tokenized_dataset.set_format(type='numpy', columns=['input_ids', 'attention_mask', 'label'])
-    input_ids = tokenized_dataset['input_ids']
-    attention_mask = tokenized_dataset['attention_mask']
-    labels = tokenized_dataset['label']
-    return input_ids, attention_mask, labels
+def load_fn(split, cache_dir):
+    return load_dataset('imdb', split=split, cache_dir=cache_dir)
 
 
-def tokenize_function(tokenizer, example, max_len):
+def preprocess_fn(tokenizer, example, max_len):
     return tokenizer(
         example['text'],
         truncation=True,
@@ -22,65 +14,7 @@ def tokenize_function(tokenizer, example, max_len):
         max_length=max_len,
         return_tensors='np'
     )
-    
 
-def create_dataset(tokenizer, max_len=512, eval_size=0.2, batch_size=128, eval_batch_size=None,
-                seed=42, with_test=False, sub_ratio=None, loader='tf', cache_dir=None, num_workers=0):
-    if eval_batch_size is None:
-        eval_batch_size = batch_size
-    tokenize_fn = lambda x: tokenize_function(tokenizer, x, max_len)
-    if with_test:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
-        test_input_ids, test_attention_mask, test_labels = load_data('test', tokenize_fn, cache_dir=cache_dir)
-    else:
-        train_input_ids, train_attention_mask, train_labels = load_data('train', tokenize_fn, cache_dir=cache_dir)
 
-        train_input_ids, test_input_ids, train_attention_mask, test_attention_mask, train_labels, test_labels = train_test_split(
-            train_input_ids, train_attention_mask, train_labels, test_size=eval_size, random_state=seed)
-
-    # shuffle train data first
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(train_input_ids))
-    train_input_ids = train_input_ids[perm]
-    train_attention_mask = train_attention_mask[perm]
-    train_labels = train_labels[perm]
-
-    if sub_ratio is not None:
-        if isinstance(sub_ratio, Sequence):
-            train_sub_ratio = sub_ratio[0]
-            test_sub_ratio = sub_ratio[1]
-        else:
-            train_sub_ratio = sub_ratio
-            test_sub_ratio = 1.0
-        if train_sub_ratio < 1.0:
-            train_input_ids, _, train_attention_mask, _, train_labels, _ = train_test_split(
-                train_input_ids, train_attention_mask, train_labels, test_size=1-train_sub_ratio, random_state=seed)
-        if test_sub_ratio < 1.0:
-            test_input_ids, _, test_attention_mask, _, test_labels, _ = train_test_split(
-                test_input_ids, test_attention_mask, test_labels, test_size=1-test_sub_ratio, random_state=seed)
-
-    train_data = {'inputs': train_input_ids, 'attn_mask': train_attention_mask, 'labels': train_labels}
-    test_data = {'inputs': test_input_ids, 'attn_mask': test_attention_mask, 'labels': test_labels}
-
-    def cast_dtype(x):
-        x['inputs'] = x['inputs'].astype(np.int32)
-        x['attn_mask'] = x['attn_mask'].astype(np.bool_)
-        return x
-
-    train_data = cast_dtype(train_data)
-    test_data = cast_dtype(test_data)
-
-    if loader == 'tf':
-        from haxllm.dataset.utils import create_tfds
-        ds_train, steps_per_epoch = create_tfds(train_data, batch_size, train=True, seed=seed)
-        ds_eval, eval_steps = create_tfds(test_data, eval_batch_size, train=False, seed=seed)
-    elif loader == 'paddle':
-        from haxllm.dataset.paddle.utils import create_paddle_loader
-        if isinstance(num_workers, Sequence):
-            num_workers_train, num_workers_eval  = num_workers
-        else:
-            num_workers_train = num_workers_eval = num_workers
-        ds_train, steps_per_epoch = create_paddle_loader(train_data, batch_size, train=True, num_workers=num_workers_train)
-        ds_eval, eval_steps = create_paddle_loader(test_data, eval_batch_size, train=False, num_workers=num_workers_eval)
-
-    return ds_train, steps_per_epoch, ds_eval, eval_steps
+register_dataset('imdb', load_fn, preprocess_fn, ('train', 'validation', 'test'),
+                 split_train_for_validation=True, split_ratio=0.2)
