@@ -1,16 +1,19 @@
-from typing import Any, Callable
 import functools
 
 import jax.numpy as jnp
 
+import flax.linen as nn
 from flax import struct
-from flax import linen as nn
 
-from haxllm.model.parallel import SelfAttention, MlpBlock, Embed, PrefixEmbed
+from haxllm.model.parallel import MlpBlock
 from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
-from haxllm.config_utils import RematScanConfigMixin
-from haxllm.model.bert import config_hub, remap_state_dict, TransformerConfig as BaseTransformerConfig
+from haxllm.model.bert import (
+    config_hub,
+    remap_state_dict,
+    TransformerConfig as BaseTransformerConfig,
+)
+from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
 
 
 def load_config(name, **kwargs):
@@ -19,7 +22,6 @@ def load_config(name, **kwargs):
     else:
         raise ValueError(f"Unknown ptuning bert model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
-
 
 
 @struct.dataclass
@@ -42,17 +44,24 @@ class TransformerBlock(nn.Module):
 
         prefix_key_value = PrefixEmbed(
             seq_len=config.pre_seq_len,
+            features=(config.n_heads, config.hidden_size // config.n_heads),
             projection=config.prefix_projection,
             prefix_features=config.prefix_hidden_size,
-            features=(config.n_heads, config.hidden_size // config.n_heads),
             dtype=config.dtype,
-            name="prefix"
+            name="prefix",
         )(inputs)
 
         if attn_mask is not None:
             # (B, H, Q, KV)
             attn_mask_ = jnp.concatenate(
-                (jnp.ones((attn_mask.shape[0], config.pre_seq_len), dtype=attn_mask.dtype), attn_mask), axis=-1)
+                (
+                    jnp.ones(
+                        (attn_mask.shape[0], config.pre_seq_len), dtype=attn_mask.dtype
+                    ),
+                    attn_mask,
+                ),
+                axis=-1,
+            )
             attn_mask_ = attn_mask_[:, None, None, :]
         else:
             attn_mask_ = None
@@ -71,14 +80,17 @@ class TransformerBlock(nn.Module):
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             zero_init=config.zero_init_prefix_attn,
-            name='attn')(inputs, attn_mask_, prefix_key_value)
+            name="attn",
+        )(inputs, attn_mask_, prefix_key_value)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
-        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_1')(x)
+        x = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1"
+        )(x)
 
         y = MlpBlock(
             intermediate_size=config.intermediate_size,
-            activation='gelu',
+            activation="gelu",
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
@@ -86,14 +98,17 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
-            name='mlp')(x)
+            name="mlp",
+        )(x)
         y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
         y = x + y
-        y = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_2')(y)
+        y = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_2"
+        )(y)
 
         if self.scan:
             return (y, attn_mask), None
-        else:    
+        else:
             return y, attn_mask
 
 
@@ -110,24 +125,37 @@ class TransformerModel(nn.Module):
         type_token_ids = jnp.zeros_like(position_ids, dtype=jnp.int32)
 
         embed_layer = functools.partial(
-            nn.Embed, dtype=config.dtype, param_dtype=config.param_dtype)
+            nn.Embed, dtype=config.dtype, param_dtype=config.param_dtype
+        )
 
         inputs_embeds = embed_layer(
-            num_embeddings=config.vocab_size, features=config.hidden_size, name='word_embeddings')(inputs)
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            name="word_embeddings",
+        )(inputs)
         position_embeds = embed_layer(
-            num_embeddings=config.n_positions, features=config.hidden_size, name='position_embeddings')(position_ids)
+            num_embeddings=config.n_positions,
+            features=config.hidden_size,
+            name="position_embeddings",
+        )(position_ids)
         token_type_embeds = embed_layer(
-            num_embeddings=config.type_vocab_size, features=config.hidden_size, name='token_type_embeddings')(type_token_ids)
-            
+            num_embeddings=config.type_vocab_size,
+            features=config.hidden_size,
+            name="token_type_embeddings",
+        )(type_token_ids)
+
         x = inputs_embeds + position_embeds + token_type_embeds
 
-        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln')(x)
+        x = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln"
+        )(x)
 
         x = nn.Dropout(rate=config.embd_pdrop)(x, not train)
 
-        block_fn = functools.partial(
-            TransformerBlock, deterministic=not train)
-        x = make_block_stack(block_fn, config.n_layers, config)((x, attn_mask), train)[0]
+        block_fn = functools.partial(TransformerBlock, deterministic=not train)
+        x = make_block_stack(block_fn, config.n_layers, config)((x, attn_mask), train)[
+            0
+        ]
 
         if config.pooler:
             x = nn.Dense(
@@ -136,7 +164,8 @@ class TransformerModel(nn.Module):
                 param_dtype=config.param_dtype,
                 kernel_init=truncated_normal_init(stddev=config.initializer_range),
                 bias_init=config.bias_init,
-                name="pooler_fc")(x[:, 0])
+                name="pooler_fc",
+            )(x[:, 0])
             x = jnp.tanh(x)
         return x
 
@@ -147,11 +176,13 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, attn_mask=attn_mask, train=train)
+        x = TransformerModel(config=config, name="transformer")(
+            inputs=inputs, attn_mask=attn_mask, train=train
+        )
 
         if not config.pooler:
             x = x[:, 0]
-        
+
         x = nn.Dropout(rate=config.cls_pdrop)(x, not train)
         x = nn.Dense(
             config.num_labels,
@@ -159,5 +190,6 @@ class TransformerSequenceClassifier(nn.Module):
             param_dtype=config.param_dtype,
             kernel_init=nn.initializers.normal(stddev=config.initializer_range),
             bias_init=config.bias_init,
-            name='score')(x)
+            name="score",
+        )(x)
         return x

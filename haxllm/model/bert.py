@@ -70,10 +70,10 @@ class TransformerConfig(RematScanConfigMixin):
     layer_norm_epsilon: float = 1e-12
     n_positions: int = 512
     initializer_range: float = 0.02
-    embd_pdrop: float = 0.1
-    attn_pdrop: float = 0.1
-    resid_pdrop: float = 0.1
-    cls_pdrop: float = 0.1
+    embd_pdrop: float = 0.0
+    attn_pdrop: float = 0.0
+    resid_pdrop: float = 0.0
+    cls_pdrop: float = 0.0
     pad_token_id: int = 0
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.zeros_init()

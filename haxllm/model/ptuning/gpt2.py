@@ -1,24 +1,27 @@
 import functools
-from typing import Optional, Any, Callable, Tuple
 
 import jax.numpy as jnp
-from jax import lax
-import flax.linen as nn
-from flax import struct
 
-from haxllm.model.parallel import SelfAttention, Dense, Embed, MlpBlock, PrefixEmbed
-from haxllm.model.utils import load_config as _load_config
+from flax import struct
+import flax.linen as nn
+
+from haxllm.model.parallel import Dense, Embed, MlpBlock
 from haxllm.model.modules import make_block_stack
-from haxllm.model.gpt2 import config_hub, remap_state_dict, TransformerConfig as BaseTransformerConfig
+from haxllm.model.utils import load_config as _load_config
+from haxllm.model.gpt2 import (
+    config_hub,
+    remap_state_dict,
+    TransformerConfig as BaseTransformerConfig,
+)
+from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
 
 
 def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        raise ValueError(f"Unknown ptuning gpt2 model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
-
 
 
 @struct.dataclass
@@ -44,7 +47,7 @@ class TransformerBlock(nn.Module):
             prefix_features=config.prefix_hidden_size,
             features=(config.n_heads, config.hidden_size // config.n_heads),
             dtype=config.dtype,
-            name="prefix"
+            name="prefix",
         )(inputs)
 
         prefix_len = config.pre_seq_len
@@ -53,8 +56,9 @@ class TransformerBlock(nn.Module):
         mask = (idxs[:, None] > idxs[None, :])[prefix_len:, :]
         mask = jnp.broadcast_to(mask, (inputs.shape[0], 1, kv_len - prefix_len, kv_len))
 
-        x = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                         dtype=config.dtype, name='ln_1')(inputs)
+        x = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1"
+        )(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -67,25 +71,28 @@ class TransformerBlock(nn.Module):
             out_shard_axes=("Y", None, "X"),
             zero_init=config.zero_init_prefix_attn,
             shard=config.shard,
-            name='attn')(x, mask, prefix_key_value)
+            name="attn",
+        )(x, mask, prefix_key_value)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
-        y = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                         dtype=config.dtype, name='ln_2')(x)
+        y = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_2"
+        )(x)
         y = MlpBlock(
-            activation='gelu_new',
+            activation="gelu_new",
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
-            name='mlp')(y)
+            name="mlp",
+        )(y)
         y = nn.Dropout(rate=config.resid_pdrop)(y, deterministic=self.deterministic)
 
         if self.scan:
             return x + y, None
-        else:    
+        else:
             return x + y
 
 
@@ -110,29 +117,36 @@ class TransformerModel(nn.Module):
         position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
         position_ids = position_ids + config.pre_seq_len
         if config.decode:
-            is_initialized = self.has_variable('cache', 'cache_index')
-            cache_index = self.variable('cache', 'cache_index', lambda: jnp.array(0, dtype=jnp.uint32))
+            is_initialized = self.has_variable("cache", "cache_index")
+            cache_index = self.variable(
+                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.uint32)
+            )
             if is_initialized:
                 i = cache_index.value
                 cache_index.value = i + 1
                 position_ids = jnp.tile(i, (inputs.shape[0], 1))
 
-        inputs_embeds = embed_layer(
-            num_embeddings=config.vocab_size, name='wte')(inputs)
-        position_embeds = embed_layer(
-            num_embeddings=config.n_positions, name='wpe')(position_ids)
+        inputs_embeds = embed_layer(num_embeddings=config.vocab_size, name="wte")(
+            inputs
+        )
+        position_embeds = embed_layer(num_embeddings=config.n_positions, name="wpe")(
+            position_ids
+        )
 
         x = inputs_embeds + position_embeds
 
-        dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
+        dropout_layer = (
+            nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
+        )
         x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
-        block_fn = functools.partial(
-            TransformerBlock, deterministic=not train)
+        block_fn = functools.partial(TransformerBlock, deterministic=not train)
         x = make_block_stack(block_fn, config.n_layers, config)(x, train)
 
         norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
-        x = norm_layer(epsilon=config.layer_norm_epsilon, dtype=config.dtype, name='ln_f')(x)
+        x = norm_layer(
+            epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_f"
+        )(x)
         return x
 
 
@@ -142,10 +156,12 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
+        x = TransformerModel(config=config, name="transformer")(
+            inputs=inputs, train=train
+        )
 
         batch_size = inputs.shape[0]
-        seq_len = (jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1)
+        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
         x = x[jnp.arange(batch_size), seq_len]
 
         x = Dense(
@@ -153,7 +169,8 @@ class TransformerSequenceClassifier(nn.Module):
             dtype=config.dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
-            name='score')(x)
+            name="score",
+        )(x)
         return x
 
 
@@ -163,7 +180,9 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
+        x = TransformerModel(config=config, name="transformer")(
+            inputs=inputs, train=train
+        )
 
         x = Dense(
             config.vocab_size,
@@ -171,5 +190,6 @@ class TransformerLMHeadModel(nn.Module):
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            name='lm_head')(x)
+            name="lm_head",
+        )(x)
         return x

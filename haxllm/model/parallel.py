@@ -2,15 +2,14 @@ from typing import Mapping, Optional, Tuple, Callable
 import functools
 import dataclasses
 
-import jax
+import numpy as np
+
 import jax.numpy as jnp
-import jax.random as random
 from jax import lax
 
 import flax.linen as nn
 from flax.core.frozen_dict import FrozenDict
 from flax.core import lift
-from flax.linen.dtypes import promote_dtype
 from flax.linen import partitioning as nn_partitioning, initializers
 from flax.linen.attention import (
     Dtype,
@@ -18,10 +17,11 @@ from flax.linen.attention import (
     combine_masks,
     PRNGKey,
     Shape,
+    dot_product_attention,
 )
 
 from haxllm.gconfig import get as get_gconfig
-from haxllm.model.modules import PrefixEmbed as _PrefixEmbed
+
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -158,116 +158,44 @@ class Embed(ShardMixIn, nn.Embed):
     pass
 
 
-class PrefixEmbed(ShardMixIn, _PrefixEmbed):
-    pass
-
-
 ShardAxis = Optional[str]
 
 
-def dot_product_attention_weights(
-    query: Array,
-    key: Array,
-    gate: Optional[Array] = None,
-    bias: Optional[Array] = None,
-    mask: Optional[Array] = None,
-    prefix_len: Optional[int] = None,
-    broadcast_dropout: bool = True,
-    dropout_rng: Optional[PRNGKey] = None,
-    dropout_rate: float = 0.0,
-    deterministic: bool = False,
-    dtype: Optional[Dtype] = None,
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32
 ):
-    query, key = promote_dtype(query, key, dtype=dtype)
-    dtype = query.dtype
-
-    assert query.ndim == key.ndim, "q, k must have same rank."
-    assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
-    assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
-    assert query.shape[-1] == key.shape[-1], "q, k depths must match."
-
-    # calculate attention matrix
-    depth = query.shape[-1]
-    query = query / jnp.sqrt(depth).astype(dtype)
-    # attn weight shape is (batch..., num_heads, q_length, kv_length)
-    attn_weights = jnp.einsum("...qhd,...khd->...hqk", query, key)
-
-    # apply attention bias: masking, dropout, proximity bias, etc.
-    if bias is not None:
-        attn_weights = attn_weights + bias
-    # apply attention mask
-    if mask is not None:
-        big_neg = jnp.finfo(dtype).min
-        attn_weights = jnp.where(mask, attn_weights, big_neg)
-
-    # normalize the attention weights
-    if gate is None:
-        attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
-    else:
-        if prefix_len is None:
-            q_len, k_len = attn_weights.shape[-2:]
-            prefix_len = k_len - q_len
-        attn_weights1 = jax.nn.softmax(attn_weights[..., :prefix_len]) * gate
-        attn_weights2 = jax.nn.softmax(attn_weights[..., prefix_len:])
-        attn_weights = jnp.concatenate([attn_weights1, attn_weights2], axis=-1).astype(dtype)
-
-    # apply attention dropout
-    if not deterministic and dropout_rate > 0.0:
-        keep_prob = 1.0 - dropout_rate
-        if broadcast_dropout:
-            # dropout is broadcast across the batch + head dimensions
-            dropout_shape = tuple([1] * (key.ndim - 2)) + attn_weights.shape[-2:]
-            keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
-        else:
-            keep = random.bernoulli(dropout_rng, keep_prob, attn_weights.shape)  # type: ignore
-        multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
-        attn_weights = attn_weights * multiplier
-
-    return attn_weights
-
-
-def dot_product_attention(
-    query: Array,
-    key: Array,
-    value: Array,
-    prefix_gate: Optional[Array] = None,
-    bias: Optional[Array] = None,
-    mask: Optional[Array] = None,
-    prefix_len: Optional[int] = None,
-    broadcast_dropout: bool = True,
-    dropout_rng: Optional[PRNGKey] = None,
-    dropout_rate: float = 0.0,
-    deterministic: bool = False,
-    dtype: Optional[Dtype] = None,
-):
-    query, key, value = promote_dtype(query, key, value, dtype=dtype)
-    dtype = query.dtype
-    assert key.ndim == query.ndim == value.ndim, "q, k, v must have same rank."
-    assert (
-        query.shape[:-3] == key.shape[:-3] == value.shape[:-3]
-    ), "q, k, v batch dims must match."
-    assert (
-        query.shape[-2] == key.shape[-2] == value.shape[-2]
-    ), "q, k, v num_heads must match."
-    assert key.shape[-3] == value.shape[-3], "k, v lengths must match."
-
-    # compute attention weights
-    attn_weights = dot_product_attention_weights(
-        query,
-        key,
-        prefix_gate,
-        bias,
-        mask,
-        prefix_len,
-        broadcast_dropout,
-        dropout_rng,
-        dropout_rate,
-        deterministic,
-        dtype,
+    freqs = 1.0 / (
+        theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim)
     )
+    t = np.arange(end, dtype=np.float32)  # type: ignore
+    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
+    freqs = np.concatenate((freqs, freqs), axis=-1)
+    cos, sin = np.cos(freqs), np.sin(freqs)
+    return jnp.array(cos, dtype=dtype), jnp.array(sin, dtype=dtype)
 
-    # return weighted sum over values for each query position
-    return jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # x: (batch_size, seq_len, num_heads, head_dim)
+    # cos, sin: (seq_len, head_dim)
+    q_len = q.shape[1]
+    kv_len = k.shape[1]
+    prefix_len = kv_len - q_len
+
+    cos_k = cos[None, :kv_len, None, :]
+    sin_k = sin[None, :kv_len, None, :]
+    k = (k * cos_k) + (rotate_half(k) * sin_k)
+
+    cos_q = cos_k[:, prefix_len:]
+    sin_q = sin_k[:, prefix_len:]
+    q = (q * cos_q) + (rotate_half(q) * sin_q)
+    return q, k
 
 
 class SelfAttention(ShardModule):
@@ -282,7 +210,7 @@ class SelfAttention(ShardModule):
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
     use_bias: bool = True
     decode: bool = False
-    zero_init: bool = False
+    rope: bool = False
     qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
@@ -290,16 +218,14 @@ class SelfAttention(ShardModule):
     @nn.compact
     def __call__(
         self,
-        x,
+        x: Array,
         mask: Optional[Array] = None,
-        prefix_key_value: Optional[Tuple[Array]] = None,
     ):
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
         head_dim = features // self.num_heads
-
         dense = functools.partial(
             DenseGeneral,
             axis=-1,
@@ -323,28 +249,32 @@ class SelfAttention(ShardModule):
             qkv_constraint(dense(name="value")(x)),
         )
 
-        if prefix_key_value is not None:
-            key = jnp.concatenate([prefix_key_value[0], key], axis=1)
-            value = jnp.concatenate([prefix_key_value[1], value], axis=1)
-            prefix_len = prefix_key_value[0].shape[1]
-        else:
-            prefix_len = None
+        if self.rope:
+            cos, sin = precompute_freqs_cis(
+                dim=head_dim, end=self.max_len, dtype=self.dtype
+            )
 
-        if self.decode:
+        if not self.decode:
+            if self.rope:
+                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        else:
             is_initialized = self.has_variable("cache", "cached_key")
-            zero_init = jnp.zeros
+            init_fn = jnp.zeros
             if self.shard:
-                zero_init = nn.with_partitioning(zero_init, self.qkv_shard_axes)
+                init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
             cached_key = self.variable(
-                "cache", "cached_key", zero_init, key.shape, key.dtype
+                "cache", "cached_key", init_fn, key.shape, key.dtype
             )
             cached_value = self.variable(
-                "cache", "cached_value", zero_init, value.shape, value.dtype
+                "cache", "cached_value", init_fn, value.shape, value.dtype
             )
             cache_index = self.variable(
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
-            if is_initialized:
+            if not is_initialized:
+                if self.rope:
+                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            else:
                 (
                     *batch_dims,
                     max_length,
@@ -361,6 +291,10 @@ class SelfAttention(ShardModule):
                     )
                 # update key, value caches with our new 1d spatial slices
                 cur_index = cache_index.value
+                if self.rope:
+                    pos_index = jnp.array([cur_index], dtype=jnp.int32)
+                    cos, sin = cos[pos_index], sin[pos_index]
+                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
@@ -382,19 +316,11 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
-        if self.zero_init:
-            prefix_gate = self.param(
-                "prefix_gate", initializers.zeros, (self.num_heads,), self.param_dtype)
-            prefix_gate = prefix_gate[None, :, None, None]
-        else:
-            prefix_gate = None
         x = dot_product_attention(
             query,
             key,
             value,
-            prefix_gate=prefix_gate,
             mask=mask,
-            prefix_len=prefix_len,
             dropout_rng=dropout_rng,
             dropout_rate=self.dropout_rate,
             broadcast_dropout=self.broadcast_dropout,
@@ -465,4 +391,54 @@ class MlpBlock(ShardModule):
             shard_axes={"kernel": self.shard_axes2},
             name="fc_2",
         )(x)
+        return x
+
+
+class GLUMlpBlock(ShardModule):
+    intermediate_size: int
+    dtype: Dtype = jnp.float32
+    param_dtype: Dtype = jnp.float32
+    use_bias: bool = False
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+    shard_axes1: Tuple[str, str] = ("X", "Y")
+    shard_axes2: Tuple[str, str] = ("Y", "X")
+    shard: bool = False
+
+    @nn.compact
+    def __call__(self, inputs):
+        dense = functools.partial(
+            # p_remat(Dense),  # Hack: remat here with less memory and same speed
+            Dense,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            shard=self.shard,
+        )
+
+        actual_out_dim = inputs.shape[-1]
+        g = dense(
+            features=self.intermediate_size,
+            shard_axes={"kernel": self.shard_axes1},
+            name="gate",
+        )(inputs)
+        g = nn.silu(g)
+        # g = self.with_sharding_constraint(
+        #     g, ("X", None, "Y"))
+        x = g * dense(
+            features=self.intermediate_size,
+            shard_axes={"kernel": self.shard_axes1},
+            name="up",
+        )(inputs)
+        # x = self.with_sharding_constraint(
+        #     x, ("X", None, "Y"))
+        x = dense(
+            features=actual_out_dim,
+            shard_axes={"kernel": self.shard_axes2},
+            name="down",
+        )(x)
+        # x = self.with_sharding_constraint(
+        #     x, ("X", None, "Y"))
         return x

@@ -11,7 +11,6 @@ import flax.linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen import initializers
 from flax.linen.attention import Dtype, Array, PRNGKey, Shape
-from flax.linen.linear import default_embed_init
 
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
 from haxllm.gconfig import get_remat_policy
@@ -48,53 +47,6 @@ class RMSNorm(nn.Module):
         scale = self.param('scale', nn.initializers.ones, reduced_feature_shape, self.param_dtype)
         x = x * scale
         return jnp.asarray(x, self.dtype)
-
-
-class PrefixEmbed(nn.Module):
-    seq_len: int
-    features: Union[int, Sequence[int]]
-    projection: bool = False
-    prefix_features: int = 512
-    inif_fn: Callable = default_embed_init
-    dtype: Dtype = jnp.float32
-    param_dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, inputs):
-        features = _canonicalize_tuple(self.features)
-        n_features = len(features)
-        if self.projection:
-            hidden_size = math.prod(features)
-            embed = self.param("embed", self.inif_fn, (self.seq_len, hidden_size), self.param_dtype)
-            embed = jnp.tile(embed[None], (inputs.shape[0],) + (1,) * embed.ndim).astype(self.dtype)
-
-            dense = functools.partial(
-                nn.DenseGeneral,
-                use_bias=False,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            )
-            x = dense(features=self.prefix_features, name="trans1")(embed)
-            x = nn.tanh(x)
-            key = dense(features=features, name="trans2_key")(x)
-            value = dense(features=features, name="trans2_value")(x)
-        else:
-            def init_wrap(rng, shape, dtype=jnp.float32):
-                flat_shape = (
-                    math.prod(shape[0:1]),
-                    math.prod(shape[-n_features:]),
-                )
-                flat_shape = jax.tree_map(int, flat_shape)
-                kernel = self.inif_fn(rng, flat_shape, dtype)
-                if isinstance(kernel, meta.AxisMetadata):
-                    return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
-                return jnp.reshape(kernel, shape)
-            shape = (self.seq_len,) + features
-            key = self.param("key", init_wrap, shape, self.param_dtype)
-            value = self.param("value", init_wrap, shape, self.param_dtype)
-            key = jnp.tile(key[None], (inputs.shape[0],) + (1,) * key.ndim).astype(self.dtype)
-            value = jnp.tile(value[None], (inputs.shape[0],) + (1,) * value.ndim).astype(self.dtype)
-        return key, value
 
 
 class DenseGeneral(nn.Module):
@@ -167,39 +119,6 @@ class DenseGeneral(nn.Module):
             bias = jnp.reshape(bias, expanded_batch_shape + features)
             out += bias
         return out
-
-
-class MlpBlock(nn.Module):
-    intermediate_size: Optional[int] = None
-    activation: str = 'gelu'
-    dtype: Dtype = jnp.float32
-    param_dtype: Dtype = jnp.float32
-    use_bias: bool = True
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-
-    @nn.compact
-    def __call__(self, inputs):
-        assert self.activation in ['gelu', 'gelu_new']
-        intermediate_size = self.intermediate_size or 4 * inputs.shape[-1]
-
-        dense = functools.partial(
-            nn.Dense,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-        )
-
-        actual_out_dim = inputs.shape[-1]
-        x = dense(intermediate_size, name="fc_1")(inputs)
-        if self.activation == 'gelu':
-            x = nn.gelu(x, approximate=False)
-        elif self.activation == 'gelu_new':
-            x = nn.gelu(x, approximate=True)
-        x = dense(actual_out_dim, name="fc_2")(x)
-        return x
 
 
 def make_block_stack(block_fn, n_layers, config: RematScanConfigMixin):

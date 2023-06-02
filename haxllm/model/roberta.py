@@ -8,6 +8,7 @@ from flax import linen as nn
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.bert import TransformerConfig as BertConfig, TransformerModel
 
+
 config_hub = {
     "roberta-large": dict(
         hidden_size=1024,
