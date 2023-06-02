@@ -19,4 +19,4 @@ def preprocess_fn(tokenizer, example, max_len):
     return d
     
 
-register_dataset('sst2', load_fn, preprocess_fn, ('train', 'validation'))
+register_dataset('boolq', load_fn, preprocess_fn, ('train', 'validation'))
