@@ -12,7 +12,9 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen import initializers
 from flax.linen.attention import Dtype, Array, PRNGKey, Shape
 
-from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
+from haxllm.model.efficient_attention import (
+    dot_product_attention as dot_product_attention_m,
+)
 from haxllm.gconfig import get_remat_policy
 from haxllm.config_utils import RematScanConfigMixin
 
@@ -44,7 +46,9 @@ class RMSNorm(nn.Module):
         x = x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.epsilon)
 
         reduced_feature_shape = (x.shape[-1],)
-        scale = self.param('scale', nn.initializers.ones, reduced_feature_shape, self.param_dtype)
+        scale = self.param(
+            "scale", nn.initializers.ones, reduced_feature_shape, self.param_dtype
+        )
         x = x * scale
         return jnp.asarray(x, self.dtype)
 
@@ -52,7 +56,6 @@ class RMSNorm(nn.Module):
 class DenseGeneral(nn.Module):
     features: Union[int, Sequence[int]]
     axis: Union[int, Sequence[int]] = -1
-    batch_dims: Sequence[int] = ()
     use_bias: bool = True
     dtype: Optional[Dtype] = None
     param_dtype: Dtype = jnp.float32
@@ -61,7 +64,6 @@ class DenseGeneral(nn.Module):
 
     @nn.compact
     def __call__(self, inputs: Array) -> Array:
-
         features = _canonicalize_tuple(self.features)
         axis = _canonicalize_tuple(self.axis)
         ndim = inputs.ndim
@@ -79,30 +81,22 @@ class DenseGeneral(nn.Module):
                 return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
             return jnp.reshape(kernel, shape)
 
-        expanded_batch_shape = tuple(
-            1 for ax in range(inputs.ndim) if ax not in axis
-        )
+        expanded_batch_shape = tuple(1 for ax in range(inputs.ndim) if ax not in axis)
         kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
-        kernel = self.param(
-            "kernel", kernel_init_wrap, kernel_shape, self.param_dtype
-        )
+        kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
 
         contract_ind = tuple(range(0, n_axis))
 
         if self.use_bias:
 
             def bias_init_wrap(rng, shape, dtype=jnp.float32):
-                flat_shape = (
-                    math.prod(shape[-n_features:]),
-                )
+                flat_shape = (math.prod(shape[-n_features:]),)
                 bias = self.bias_init(rng, flat_shape, dtype)
                 if isinstance(bias, meta.AxisMetadata):
                     return meta.replace_boxed(bias, jnp.reshape(bias.unbox(), shape))
                 return jnp.reshape(bias, shape)
 
-            bias = self.param(
-                "bias", bias_init_wrap, features, self.param_dtype
-            )
+            bias = self.param("bias", bias_init_wrap, features, self.param_dtype)
         else:
             bias = None
 
@@ -113,7 +107,7 @@ class DenseGeneral(nn.Module):
             kernel,
             ((axis, contract_ind), ((), ())),
         )
-        # dot_general output has shape [batch_dims/group_dims] + [feature_dims]
+        # dot_general output has shape [/group_dims] + [feature_dims]
         if self.use_bias:
             # expand bias shape to broadcast bias over batch dims.
             bias = jnp.reshape(bias, expanded_batch_shape + features)
@@ -123,6 +117,7 @@ class DenseGeneral(nn.Module):
 
 def make_block_stack(block_fn, n_layers, config: RematScanConfigMixin):
     from haxllm.model.parallel import remat_scan, remat
+
     remat_policy = get_remat_policy()
 
     def stack_fn(x, train):
@@ -136,25 +131,35 @@ def make_block_stack(block_fn, n_layers, config: RematScanConfigMixin):
                 n_loop = None
                 lengths = remat_scan_lengths
             TransformerBlockStack = remat_scan(
-                block_fn_, lengths=lengths, policy=remat_policy,
-                variable_axes={True: 0}, split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
+                block_fn_,
+                lengths=lengths,
+                policy=remat_policy,
+                variable_axes={True: 0},
+                split_rngs={True: True},
+                metadata_params={nn.PARTITION_NAME: None},
+            )
             if n_loop is not None:
                 for i in range(n_loop):
-                    x = TransformerBlockStack(config=config, name=f'hs_{i}')(x)
+                    x = TransformerBlockStack(config=config, name=f"hs_{i}")(x)
             else:
-                x = TransformerBlockStack(config=config, name='hs')(x)
+                x = TransformerBlockStack(config=config, name="hs")(x)
         else:
             if config.scan:
                 if config.remat and train:
                     block_fn_ = remat(block_fn_, prevent_cse=False, policy=remat_policy)
                 TransformerBlockStack = nn.scan(
-                    block_fn_, length=config.scan_lengths()[0], variable_axes={True: 0},
-                    split_rngs={True: True}, metadata_params={nn.PARTITION_NAME: None})
-                x = TransformerBlockStack(config=config, scan=True, name='hs')(x)[0]
+                    block_fn_,
+                    length=config.scan_lengths()[0],
+                    variable_axes={True: 0},
+                    split_rngs={True: True},
+                    metadata_params={nn.PARTITION_NAME: None},
+                )
+                x = TransformerBlockStack(config=config, scan=True, name="hs")(x)[0]
             else:
                 if config.remat and train:
                     block_fn_ = remat(block_fn_, policy=remat_policy)
                 for i in range(n_layers):
-                    x = block_fn_(config=config, name=f'h_{i}')(x)
+                    x = block_fn_(config=config, name=f"h_{i}")(x)
         return x
+
     return stack_fn

@@ -7,9 +7,10 @@ from flax import struct
 
 from haxllm.model.parallel import DenseGeneral
 from haxllm.model.utils import load_config as _load_config
-from haxllm.model.ptuning.bert import (
+from haxllm.model.lora.bert import (
     TransformerConfig as BertConfig,
     TransformerModel,
+    TransformerBlock,
 )
 from haxllm.model.roberta import (
     config_hub,
@@ -22,8 +23,17 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown ptuning roberta model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
+        raise ValueError(f"Unknown lora roberta model {name}")
+
+    d = {**kwargs}
+    if "attn_lora_r" in d and d["attn_lora_r"] is not None:
+        assert len(d["attn_lora_r"]) == 4
+        d["attn_lora_r"] = tuple(d["attn_lora_r"])
+    if "ffn_lora_r" in d and d["ffn_lora_r"] is not None:
+        assert len(d["ffn_lora_r"]) == 2
+        d["ffn_lora_r"] = tuple(d["ffn_lora_r"])
+
+    return _load_config(TransformerConfig, config, **d)
 
 
 @struct.dataclass
@@ -40,7 +50,7 @@ class TransformerSequenceClassifier(nn.Module):
         offset = config.pad_token_id + 1
         position_ids = jnp.arange(
             offset, inputs.shape[-1] + offset, dtype=jnp.int32)[None]
-        x = TransformerModel(config=config, name="transformer")(
+        x = TransformerModel(config=config, block_cls=TransformerBlock, name="transformer")(
             inputs=inputs, attn_mask=attn_mask, position_ids=position_ids, train=train)
 
         if not config.pooler:
@@ -50,7 +60,7 @@ class TransformerSequenceClassifier(nn.Module):
         dense = functools.partial(
             DenseGeneral,
             dtype=config.dtype,
-            param_dtype=config.param_dtype,
+            param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
         )

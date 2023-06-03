@@ -57,12 +57,12 @@ def get_optimizer(cfg, steps_per_epoch):
     opt_name = cfg.optimizer.name
 
     extras = {}
-    if opt_name in ['adamw', 'lion']:
-        set_extra(extras, cfg.optimizer, 'b1')
-        set_extra(extras, cfg.optimizer, 'b2')
-        set_extra(extras, cfg.optimizer, 'mu_dtype')
-    if opt_name == 'adamw':
-        set_extra(extras, cfg.optimizer, 'eps')
+    if opt_name in ["adamw", "lion"]:
+        set_extra(extras, cfg.optimizer, "b1")
+        set_extra(extras, cfg.optimizer, "b2")
+        set_extra(extras, cfg.optimizer, "mu_dtype")
+    if opt_name == "adamw":
+        set_extra(extras, cfg.optimizer, "eps")
 
     optimizer.append(getattr(optax, opt_name)(learning_rate=lr_schedule, weight_decay=cfg.optimizer.weight_decay, **extras))
     optimizer = optax.chain(*optimizer)

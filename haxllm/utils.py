@@ -22,22 +22,22 @@ import optax
 
 
 def spec_from_dataset(dataset, input_keys):
-    if 'paddle' in str(type(dataset)):
+    if "paddle" in str(type(dataset)):
         loader = dataset
         tensors = loader.dataset.tensor_dict
         batch_size = loader.batch_size
         return {
             key: {
-                'shape': (batch_size,) + tensors[key].shape[1:],
-                'dtype': tensors[key].dtype.name,
+                "shape": (batch_size,) + tensors[key].shape[1:],
+                "dtype": tensors[key].dtype.name,
             } for key in input_keys
         }
     else:
         element_spec = dataset.element_spec
         return {
             key: {
-                'shape': element_spec[key].shape.as_list(),
-                'dtype': element_spec[key].dtype.name,
+                "shape": element_spec[key].shape.as_list(),
+                "dtype": element_spec[key].dtype.name,
             } for key in input_keys
         }
 
@@ -45,7 +45,7 @@ def spec_from_dataset(dataset, input_keys):
 def init_model(input_spec, model, init_rng):
     def init_fn(init_rng):
         inputs = {
-            key: jnp.ones(spec['shape'], spec['dtype'])
+            key: jnp.ones(spec["shape"], spec["dtype"])
             for key, spec in input_spec.items()
         }
         init_variables = model.init(init_rng, **inputs, train=False)
@@ -68,7 +68,7 @@ def get_metrics(all_metrics, pmap=True):
         # metrics_np = jax.device_get(all_metrics)
         all_metrics = jax.tree_util.tree_map(
             lambda *xs: np.stack(xs).sum(), *all_metrics)
-    denominator = all_metrics.pop('total')
+    denominator = all_metrics.pop("total")
     summary = jax.tree_util.tree_map(
         lambda x: x / denominator, all_metrics)
     return summary
@@ -77,7 +77,7 @@ def get_metrics(all_metrics, pmap=True):
 def freeze_params_optimizer(optimizer, params, trainable_pattern):
     if not trainable_pattern:
         return optimizer
-    optimizers = {'trainable': optimizer, 'frozen': optax.set_to_zero()}
+    optimizers = {"trainable": optimizer, "frozen": optax.set_to_zero()}
 
     def match_label(path, v):
         path_str = ".".join(path)
@@ -87,7 +87,7 @@ def freeze_params_optimizer(optimizer, params, trainable_pattern):
                 print(f"Trainable: {path_str} {v.get_partition_spec()} {v.value.dtype}")
             else:
                 print(f"Trainable: {path_str} {v.dtype}")
-        return 'trainable' if match else 'frozen'
+        return "trainable" if match else "frozen"
 
     param_labels = freeze(
         traverse_util.path_aware_map(match_label, params))
@@ -101,7 +101,7 @@ def convert_scan_params(params, src_keys, tgt_keys, lengths):
     scan_layers = math.prod(lengths)
     if scan_layers > len(src_keys):
         raise ValueError(
-            f'Number of remat scan layers ({scan_layers}) must be less than or equal to the number of source keys ({len(src_keys)})')
+            f"Number of remat scan layers ({scan_layers}) must be less than or equal to the number of source keys ({len(src_keys)})")
     src_keys = src_keys[-scan_layers:]
     if len(lengths) == 1:
         level_trees = []
@@ -162,7 +162,7 @@ def load_transformer_params(
     cpu = False
     mesh = None
     if isinstance(device, str):
-        assert device == 'cpu'
+        assert device == "cpu"
         cpu = True
     elif isinstance(device, Mesh):
         mesh = device
@@ -178,20 +178,20 @@ def load_transformer_params(
     params = flatten_dict(params, sep=".")
 
     # detect scan or remat_scan
-    hs_keys = [k for k in params.keys() if k.startswith('transformer.hs')]
+    hs_keys = [k for k in params.keys() if k.startswith("transformer.hs")]
     if hs_keys:
-        src_keys = [k for k in transformer_params if k.startswith('h_')]
+        src_keys = [k for k in transformer_params if k.startswith("h_")]
         h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
         sample_key = next(iter(h_params.keys()))
 
         loop_hs_keys = [k for k in hs_keys if k.startswith("transformer.hs_")]
         if loop_hs_keys:
-            n_loop = len(set([k.split('.')[1] for k in loop_hs_keys]))
+            n_loop = len(set([k.split(".")[1] for k in loop_hs_keys]))
             tgt_keys = [f"hs_{i}" for i in range(n_loop)]
             hs_param = params[f"transformer.hs_0.{sample_key}"]
             scan_lengths = (n_loop,)
         else:
-            tgt_keys = 'hs'
+            tgt_keys = "hs"
             hs_param = params[f"transformer.hs.{sample_key}"]
             scan_lengths = ()
         if isinstance(hs_param, nn.Partitioned):

@@ -3,13 +3,14 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, Dense, Embed
+from haxllm.model.modules import RMSNorm
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.llama import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
+    TransformerModel
 )
 from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
 
@@ -56,11 +57,10 @@ class TransformerBlock(nn.Module):
                 mask, (inputs.shape[0], 1, kv_len - prefix_len, kv_len)
             )
         else:
-            mask = None
+            raise NotImplementedError
 
-        x = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_1")(
-            inputs
-        )
+        x = RMSNorm(epsilon=config.rms_norm_eps,
+                    dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -75,11 +75,11 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn",
-        )(x, mask, prefix_key_value)
+            name="attn")(x, mask, prefix_key_value)
         x = x + inputs
 
-        y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
+        y = RMSNorm(epsilon=config.rms_norm_eps,
+                    dtype=config.dtype, name="ln_2")(x)
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,
             dtype=config.dtype,
@@ -88,38 +88,11 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
-            name="mlp",
-        )(y)
+            name="mlp")(y)
         if self.scan:
             return x + y, None
         else:
             return x + y
-
-
-class TransformerModel(nn.Module):
-    config: TransformerConfig
-
-    @nn.compact
-    def __call__(self, inputs, train):
-        config = self.config
-        remat = config.remat or config.remat_scan
-
-        embed_layer = Embed if remat else Embed
-        x = embed_layer(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=config.dtype,
-            param_dtype=config.param_dtype,
-            shard_axes={"embedding": (None, "Y")},
-            shard=config.shard,
-            name="wte",
-        )(inputs)
-
-        x = make_block_stack(TransformerBlock, config.n_layers, config)(x, train)
-
-        norm_layer = RMSNorm if remat else RMSNorm
-        x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_f")(x)
-        return x
 
 
 class TransformerSequenceClassifier(nn.Module):
@@ -128,19 +101,19 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name="transformer")(inputs, train)
+        x = TransformerModel(
+            config=config, block_cls=TransformerBlock, name="transformer")(inputs, train)
 
         batch_size = inputs.shape[0]
         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
         x = x[jnp.arange(batch_size), seq_len]
 
-        x = Dense(
+        x = DenseGeneral(
             config.num_labels,
             dtype=config.dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
-            name="score",
-        )(x)
+            name="score")(x)
         return x
 
 
@@ -150,16 +123,14 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, train=False):
         config = self.config
-        x = TransformerModel(config=config, name="transformer")(
-            inputs=inputs, train=train
-        )
+        x = TransformerModel(
+            config=config, block_cls=TransformerBlock, name="transformer")(inputs, train)
 
-        x = Dense(
+        x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            name="lm_head",
-        )(x)
+            name="lm_head")(x)
         return x

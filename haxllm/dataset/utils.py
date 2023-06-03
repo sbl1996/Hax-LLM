@@ -6,7 +6,7 @@ def create_tfds(data, batch_size, train=True, seed=None):
     import tensorflow as tf
     drop_remainder = train
     n = next(iter(data.values())).shape[0]
-    data = {**data, 'mask': np.ones(n, dtype=np.bool_)}
+    data = {**data, "mask": np.ones(n, dtype=np.bool_)}
     ds = tf.data.Dataset.from_tensor_slices(data)
     ds = ds.cache()
     if train:

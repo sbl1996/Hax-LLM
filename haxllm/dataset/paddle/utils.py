@@ -46,7 +46,7 @@ def default_collate_fn(batch):
 def create_paddle_loader(data, batch_size, train, num_workers):
     drop_last = train
     n = next(iter(data.values())).shape[0]
-    data = {**data, 'mask': np.ones(n, dtype=np.bool_)}
+    data = {**data, "mask": np.ones(n, dtype=np.bool_)}
     if drop_last:
         steps_per_epoch = n // batch_size
     else:

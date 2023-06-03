@@ -1,4 +1,4 @@
-from typing import Mapping, Optional, Tuple, Callable
+from typing import Mapping, Optional, Tuple, Callable, Sequence, Union
 import functools
 import dataclasses
 
@@ -20,6 +20,7 @@ from flax.linen.attention import (
     dot_product_attention,
 )
 
+from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
 
 
@@ -146,11 +147,7 @@ class ShardMixIn:
         return param
 
 
-class DenseGeneral(ShardMixIn, nn.DenseGeneral):
-    pass
-
-
-class Dense(ShardMixIn, nn.Dense):
+class DenseGeneral(ShardMixIn, DenseGeneral):
     pass
 
 
@@ -197,6 +194,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     q = (q * cos_q) + (rotate_half(q) * sin_q)
     return q, k
 
+ModuleClass = Callable[..., nn.Module]
 
 class SelfAttention(ShardModule):
     num_heads: int
@@ -214,6 +212,7 @@ class SelfAttention(ShardModule):
     qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
+    dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
     def __call__(
@@ -226,27 +225,36 @@ class SelfAttention(ShardModule):
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
         head_dim = features // self.num_heads
-        dense = functools.partial(
-            DenseGeneral,
-            axis=-1,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            features=(self.num_heads, head_dim),
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            use_bias=self.use_bias,
-            shard_axes={"kernel": self.qkv_shard_axes},
-            shard=self.shard,
-        )
+
+        if not isinstance(self.dense_cls, Sequence):
+            dense_cls = [self.dense_cls for _ in range(4)]
+        else:
+            assert len(self.dense_cls) == 4, "dense_cls must be a sequence of length 4 for query, key, value, and out."
+            dense_cls = self.dense_cls
+
+        qkv_dense = [
+            functools.partial(
+                cls,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                features=(self.num_heads, head_dim),
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                use_bias=self.use_bias,
+                shard_axes={"kernel": self.qkv_shard_axes},
+                shard=self.shard,
+                axis=-1,
+            ) for cls in dense_cls[:3]
+        ]
 
         qkv_constraint = lambda x: x
         # qkv_constraint = functools.partial(
         #     self.with_sharding_constraint, axes=("X", None, "Y", None))
 
         query, key, value = (
-            qkv_constraint(dense(name="query")(x)),
-            qkv_constraint(dense(name="key")(x)),
-            qkv_constraint(dense(name="value")(x)),
+            qkv_constraint(qkv_dense[0](name="query")(x)),
+            qkv_constraint(qkv_dense[1](name="key")(x)),
+            qkv_constraint(qkv_dense[2](name="value")(x)),
         )
 
         if self.rope:
@@ -328,7 +336,7 @@ class SelfAttention(ShardModule):
             dtype=self.dtype,
         )
 
-        out = DenseGeneral(
+        out = dense_cls[3](
             features=features,
             axis=(-2, -1),
             use_bias=self.use_bias,
@@ -339,9 +347,7 @@ class SelfAttention(ShardModule):
             shard_axes={"kernel": self.out_shard_axes},
             shard=self.shard,
             name="out",
-        )(
-            x
-        )  # type: ignore
+        )(x)
         # out = self.with_sharding_constraint(
         #     out, ("X", None, "Y"))
         return out
@@ -358,24 +364,33 @@ class MlpBlock(ShardModule):
     shard_axes1: Tuple[str, str] = ("X", "Y")
     shard_axes2: Tuple[str, str] = ("Y", "X")
     shard: bool = False
+    dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
     def __call__(self, inputs):
         assert self.activation in ["gelu", "gelu_new"]
         intermediate_size = self.intermediate_size or 4 * inputs.shape[-1]
 
-        dense = functools.partial(
-            Dense,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            shard=self.shard,
-        )
+        if not isinstance(self.dense_cls, Sequence):
+            dense_cls = [self.dense_cls for _ in range(2)]
+        else:
+            assert len(self.dense_cls) == 2, "dense_cls must be a sequence of length 2 for fc_1 and fc_2"
+            dense_cls = self.dense_cls
+
+        dense = [
+            functools.partial(
+                cls,
+                use_bias=self.use_bias,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                shard=self.shard,
+            ) for cls in dense_cls
+        ]
 
         actual_out_dim = inputs.shape[-1]
-        x = dense(
+        x = dense[0](
             features=intermediate_size,
             shard_axes={"kernel": self.shard_axes1},
             name="fc_1",
@@ -386,7 +401,7 @@ class MlpBlock(ShardModule):
             x = nn.gelu(x, approximate=False)
         elif self.activation == "gelu_new":
             x = nn.gelu(x, approximate=True)
-        x = dense(
+        x = dense[1](
             features=actual_out_dim,
             shard_axes={"kernel": self.shard_axes2},
             name="fc_2",
@@ -404,22 +419,31 @@ class GLUMlpBlock(ShardModule):
     shard_axes1: Tuple[str, str] = ("X", "Y")
     shard_axes2: Tuple[str, str] = ("Y", "X")
     shard: bool = False
+    dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
     def __call__(self, inputs):
-        dense = functools.partial(
-            # p_remat(Dense),  # Hack: remat here with less memory and same speed
-            Dense,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            shard=self.shard,
-        )
+        if not isinstance(self.dense_cls, Sequence):
+            dense_cls = [self.dense_cls for _ in range(3)]
+        else:
+            assert len(self.dense_cls) == 3, "dense_cls must be a sequence of length 3 for gate, up and down"
+            dense_cls = self.dense_cls
+
+        dense = [
+            functools.partial(
+                # p_remat(DenseGeneral),  # Hack: remat here with less memory and same speed
+                cls,
+                use_bias=self.use_bias,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                shard=self.shard,
+            ) for cls in dense_cls
+        ]
 
         actual_out_dim = inputs.shape[-1]
-        g = dense(
+        g = dense[0](
             features=self.intermediate_size,
             shard_axes={"kernel": self.shard_axes1},
             name="gate",
@@ -427,14 +451,14 @@ class GLUMlpBlock(ShardModule):
         g = nn.silu(g)
         # g = self.with_sharding_constraint(
         #     g, ("X", None, "Y"))
-        x = g * dense(
+        x = g * dense[1](
             features=self.intermediate_size,
             shard_axes={"kernel": self.shard_axes1},
             name="up",
         )(inputs)
         # x = self.with_sharding_constraint(
         #     x, ("X", None, "Y"))
-        x = dense(
+        x = dense[2](
             features=actual_out_dim,
             shard_axes={"kernel": self.shard_axes2},
             name="down",

@@ -46,7 +46,7 @@ class PrefixEmbed(nn.Module):
             ).astype(self.dtype)
 
             dense = functools.partial(
-                nn.DenseGeneral,
+                DenseGeneral,
                 use_bias=False,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,

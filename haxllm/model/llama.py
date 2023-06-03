@@ -1,4 +1,3 @@
-import functools
 from typing import Callable, Any
 
 import jax.numpy as jnp
@@ -7,7 +6,7 @@ import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import Dense, Embed, GLUMlpBlock, SelfAttention
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.utils import load_config as _load_config
 from haxllm.config_utils import RematScanConfigMixin
 
@@ -44,6 +43,7 @@ config_hub = {
         n_layers=80,
     ),
 }
+
 
 def load_config(name, **kwargs):
     if name in config_hub:
@@ -84,11 +84,12 @@ class TransformerBlock(nn.Module):
         config = self.config
 
         if not config.memory_efficient:
-            attn_mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
         else:
-            attn_mask = None
+            mask = None
 
-        x = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_1")(inputs)
+        x = RMSNorm(epsilon=config.rms_norm_eps,
+                    dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -102,12 +103,12 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn",
-        )(x, attn_mask)
+            name="attn")(x, mask)
 
         x = x + inputs
 
-        y = RMSNorm(epsilon=config.rms_norm_eps, dtype=config.dtype, name="ln_2")(x)
+        y = RMSNorm(epsilon=config.rms_norm_eps,
+                    dtype=config.dtype, name="ln_2")(x)
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,
             dtype=config.dtype,
@@ -116,16 +117,16 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
-            name='mlp'
-        )(y)
+            name="mlp")(y)
         if self.scan:
             return x + y, None
-        else:    
+        else:
             return x + y
 
 
 class TransformerModel(nn.Module):
     config: TransformerConfig
+    block_cls: Callable = TransformerBlock
 
     @nn.compact
     def __call__(self, inputs, train):
@@ -140,13 +141,14 @@ class TransformerModel(nn.Module):
             param_dtype=config.param_dtype,
             shard_axes={"embedding": (None, "Y")},
             shard=config.shard,
-            name='wte'
-        )(inputs)
+            name="wte")(inputs)
 
-        x = make_block_stack(TransformerBlock, config.n_layers, config)(x, train)
+        x = make_block_stack(
+            self.block_cls, config.n_layers, config)(x, train)
 
         norm_layer = RMSNorm if remat else RMSNorm
-        x = norm_layer(epsilon=config.rms_norm_eps, dtype=config.dtype, name='ln_f')(x)
+        x = norm_layer(epsilon=config.rms_norm_eps,
+                       dtype=config.dtype, name="ln_f")(x)
         return x
 
 
@@ -156,18 +158,19 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs, train)
+        x = TransformerModel(
+            config=config, name="transformer")(inputs, train)
 
         batch_size = inputs.shape[0]
-        seq_len = (jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1)
+        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
         x = x[jnp.arange(batch_size), seq_len]
 
-        x = Dense(
+        x = DenseGeneral(
             config.num_labels,
             dtype=config.dtype,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
-            name='score')(x)
+            name="score")(x)
         return x
 
 
@@ -177,49 +180,52 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, train=False):
         config = self.config
-        x = TransformerModel(config=config, name='transformer')(inputs=inputs, train=train)
+        x = TransformerModel(
+            config=config, name="transformer")(inputs=inputs, train=train)
 
-        x = Dense(
+        x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            name='lm_head')(x)
+            name="lm_head")(x)
         return x
 
 
 def remap_state_dict(state_dict, config: TransformerConfig):
     root = {}
-    root['wte'] = {'embedding': state_dict.pop('model.embed_tokens.weight')}
+    root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight")}
     hidden_size = config.hidden_size
     n_heads = config.n_heads
 
     for d in range(config.n_layers):
         block_d = {}
-        block_d['ln_1'] = {'scale': state_dict.pop(f'model.layers.{d}.input_layernorm.weight')}
-        block_d['attn'] = {
-            'query': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.q_proj.weight').T.reshape(hidden_size, n_heads, -1),
+        block_d["ln_1"] = {"scale": state_dict.pop(
+            f"model.layers.{d}.input_layernorm.weight")}
+        block_d["attn"] = {
+            "query": {
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.q_proj.weight").T.reshape(hidden_size, n_heads, -1),
             },
-            'key': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.k_proj.weight').T.reshape(hidden_size, n_heads, -1),
+            "key": {
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.weight").T.reshape(hidden_size, n_heads, -1),
             },
-            'value': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.v_proj.weight').T.reshape(hidden_size, n_heads, -1),
+            "value": {
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.weight").T.reshape(hidden_size, n_heads, -1),
             },
-            'out': {
-                'kernel': state_dict.pop(f'model.layers.{d}.self_attn.o_proj.weight').T.reshape(n_heads, -1, hidden_size),
+            "out": {
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.o_proj.weight").T.reshape(n_heads, -1, hidden_size),
             },
         }
-        block_d['ln_2'] = {'scale': state_dict.pop(f'model.layers.{d}.post_attention_layernorm.weight')}
-        block_d['mlp'] = {
-            'gate': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.gate_proj.weight').T},
-            'up': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.up_proj.weight').T},
-            'down': {'kernel': state_dict.pop(f'model.layers.{d}.mlp.down_proj.weight').T},
+        block_d["ln_2"] = {"scale": state_dict.pop(
+            f"model.layers.{d}.post_attention_layernorm.weight")}
+        block_d["mlp"] = {
+            "gate": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.gate_proj.weight").T},
+            "up": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.up_proj.weight").T},
+            "down": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.down_proj.weight").T},
         }
-        root[f'h_{d}'] = block_d
+        root[f"h_{d}"] = block_d
 
-    root['ln_f'] = {'scale': state_dict.pop('model.norm.weight')}
-    root['lm_head'] = {'kernel': state_dict.pop('lm_head.weight').T}
+    root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
+    root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
     return root

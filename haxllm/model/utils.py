@@ -7,14 +7,14 @@ def load_config(cls, base_config, **kwargs):
     d = {**base_config}
     kwargs = {**kwargs}
 
-    remat_scan = kwargs.get('remat_scan', False)
-    remat = kwargs.get('remat', False)
-    scan = kwargs.get('scan', False)
+    remat_scan = kwargs.get("remat_scan", False)
+    remat = kwargs.get("remat", False)
+    scan = kwargs.get("scan", False)
     assert not (remat_scan and (remat or scan)), \
         "Cannot use remat_scan with remat or scan"
 
-    n_layers = d['n_layers']
-    lengths = kwargs.get('lengths', None)
+    n_layers = d["n_layers"]
+    lengths = kwargs.get("lengths", None)
     if remat_scan:
         if lengths is None:
             lengths = (n_layers, 1)
@@ -40,7 +40,7 @@ def load_config(cls, base_config, **kwargs):
             assert lengths[0] == n_layers, "lengths must equal n_layers"
     else:
         lengths = []
-    kwargs['lengths'] = tuple(lengths)
+    kwargs["lengths"] = tuple(lengths)
 
     for k, v in kwargs.items():
         if k not in cls.__dataclass_fields__:

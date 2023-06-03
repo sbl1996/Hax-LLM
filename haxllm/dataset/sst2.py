@@ -3,17 +3,17 @@ from haxllm.dataset.hub import register_dataset
 
 
 def load_fn(split, cache_dir=None):
-    return load_dataset('glue', 'sst2', split=split, cache_dir=cache_dir)
+    return load_dataset("glue", "sst2", split=split, cache_dir=cache_dir)
 
 
 def preprocess_fn(tokenizer, example, max_len):
     return tokenizer(
-        example['sentence'],
+        example["sentence"],
         truncation=True,
-        padding='max_length',
+        padding="max_length",
         max_length=max_len,
-        return_tensors='np'
+        return_tensors="np"
     )
 
 
-register_dataset('sst2', load_fn, preprocess_fn, ('train', 'validation'))
+register_dataset("sst2", load_fn, preprocess_fn, ("train", "validation"))

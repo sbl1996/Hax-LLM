@@ -2,10 +2,11 @@ import functools
 from typing import Any, Callable
 
 import jax.numpy as jnp
+
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.parallel import SelfAttention, Dense, Embed, MlpBlock
+from haxllm.model.parallel import SelfAttention, DenseGeneral, Embed, MlpBlock
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.modules import make_block_stack
 from haxllm.config_utils import RematScanConfigMixin
@@ -39,7 +40,7 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        raise ValueError(f"Unknown gpt2 model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 
@@ -57,6 +58,7 @@ class TransformerConfig(RematScanConfigMixin):
     embd_pdrop: float = 0.1
     attn_pdrop: float = 0.1
     resid_pdrop: float = 0.1
+    cls_pdrop: float = 0.1
     pad_token_id: int = 50256
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
@@ -89,8 +91,7 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn",
-        )(x, attn_mask)
+            name="attn")(x, attn_mask)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
@@ -116,6 +117,7 @@ class TransformerBlock(nn.Module):
 
 class TransformerModel(nn.Module):
     config: TransformerConfig
+    block_cls: Callable = TransformerBlock
 
     @nn.compact
     def __call__(self, *, inputs, train):
@@ -157,7 +159,7 @@ class TransformerModel(nn.Module):
         )
         x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
-        block_fn = functools.partial(TransformerBlock, deterministic=not train)
+        block_fn = functools.partial(self.block_cls, deterministic=not train)
         x = make_block_stack(block_fn, config.n_layers, config)(x, train)
 
         norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
@@ -181,7 +183,8 @@ class TransformerSequenceClassifier(nn.Module):
         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
         x = x[jnp.arange(batch_size), seq_len]
 
-        x = Dense(
+        x = nn.Dropout(rate=config.cls_pdrop)(x, not train)
+        x = DenseGeneral(
             config.num_labels,
             dtype=config.dtype,
             kernel_init=config.kernel_init,
@@ -201,7 +204,7 @@ class TransformerLMHeadModel(nn.Module):
             inputs=inputs, train=train
         )
 
-        x = Dense(
+        x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
@@ -237,16 +240,16 @@ def remap_state_dict(state_dict, config: TransformerConfig):
                 "bias": c_attn_bias[0:hidden_size].reshape(n_heads, -1),
             },
             "key": {
-                "kernel": c_attn_weight[:, hidden_size : hidden_size * 2].reshape(
+                "kernel": c_attn_weight[:, hidden_size: hidden_size * 2].reshape(
                     hidden_size, n_heads, -1
                 ),
-                "bias": c_attn_bias[hidden_size : hidden_size * 2].reshape(n_heads, -1),
+                "bias": c_attn_bias[hidden_size: hidden_size * 2].reshape(n_heads, -1),
             },
             "value": {
-                "kernel": c_attn_weight[:, hidden_size * 2 : hidden_size * 3].reshape(
+                "kernel": c_attn_weight[:, hidden_size * 2: hidden_size * 3].reshape(
                     hidden_size, n_heads, -1
                 ),
-                "bias": c_attn_bias[hidden_size * 2 : hidden_size * 3].reshape(
+                "bias": c_attn_bias[hidden_size * 2: hidden_size * 3].reshape(
                     n_heads, -1
                 ),
             },
