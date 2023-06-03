@@ -10,6 +10,7 @@ from haxllm.model.utils import load_config as _load_config
 from haxllm.model.ptuning.bert import (
     TransformerConfig as BertConfig,
     TransformerModel,
+    TransformerBlock,
 )
 from haxllm.model.roberta import (
     config_hub,
@@ -37,10 +38,10 @@ class TransformerSequenceClassifier(nn.Module):
     @nn.compact
     def __call__(self, *, inputs, attn_mask, train=False):
         config = self.config
-        offset = config.pad_token_id + 1
+        offset = config.pad_token_id + 1 + config.pre_seq_len
         position_ids = jnp.arange(
             offset, inputs.shape[-1] + offset, dtype=jnp.int32)[None]
-        x = TransformerModel(config=config, name="transformer")(
+        x = TransformerModel(config=config, block_cls=TransformerBlock, name="transformer")(
             inputs=inputs, attn_mask=attn_mask, position_ids=position_ids, train=train)
 
         if not config.pooler:
@@ -50,7 +51,7 @@ class TransformerSequenceClassifier(nn.Module):
         dense = functools.partial(
             DenseGeneral,
             dtype=config.dtype,
-            param_dtype=config.param_dtype,
+            param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
         )

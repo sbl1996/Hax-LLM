@@ -314,7 +314,7 @@ class SelfAttention(ShardModule):
 
         if self.zero_init:
             prefix_gate = self.param(
-                "prefix_gate", initializers.zeros, (self.num_heads,), self.param_dtype
+                "prefix_gate", initializers.zeros, (self.num_heads,), jnp.float32,
             )
             prefix_gate = prefix_gate[None, :, None, None]
         else:
