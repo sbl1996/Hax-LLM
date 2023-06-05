@@ -208,7 +208,7 @@ class TransformerSequenceClassifier(nn.Module):
         x = DenseGeneral(
             config.num_labels,
             dtype=config.dtype,
-            param_dtype=config.param_dtype,
+            param_dtype=jnp.float32,
             kernel_init=nn.initializers.normal(
                 stddev=config.initializer_range),
             bias_init=config.bias_init,

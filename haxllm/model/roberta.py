@@ -59,7 +59,7 @@ class TransformerSequenceClassifier(nn.Module):
         dense = functools.partial(
             DenseGeneral,
             dtype=config.dtype,
-            param_dtype=config.param_dtype,
+            param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
             bias_init=config.bias_init,
         )

@@ -137,7 +137,7 @@ class TransformerLMHeadModel(nn.Module):
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
-            param_dtype=config.param_dtype,
+            param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
             name="lm_head",
         )(x)
