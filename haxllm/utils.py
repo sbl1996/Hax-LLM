@@ -1,4 +1,4 @@
-from typing import  Union
+import time
 import math
 import re
 from datetime import datetime, timedelta
@@ -280,3 +280,34 @@ def create_input_iter(ds, device, prepare_fn):
     it = map(prepare_fn, ds)
     it = prefetch_to_device(it, 2, device)
     return it
+
+
+def calculate_num_params_from_pytree(params):
+    params_sizes = jax.tree_util.tree_map(jnp.size, params)
+    total_parameters = jax.tree_util.tree_reduce(lambda x, y: x + y, params_sizes)
+    return total_parameters
+
+
+class MovingAverage:
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.count = 0
+    
+    def mark_start(self):
+        self.start = time.time()
+    
+    def mark_end(self):
+        self.total += time.time() - self.start
+        self.count += 1
+    
+    def record(self, t):
+        self.total += t
+        self.count += 1
+    
+    def get_average(self):
+        return self.total / self.count
+
+    def reset(self):
+        self.total = 0
+        self.count = 0

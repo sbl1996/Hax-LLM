@@ -7,15 +7,12 @@ def load_fn(split, cache_dir=None):
     return load_dataset("boolq", split=split, cache_dir=cache_dir)
 
 
-def preprocess_fn(tokenizer, example, max_len, passage=False, concat="direct"):
-    assert concat in ["direct", "prompt"]
+def preprocess_fn(tokenizer, example, max_len, passage=True):
     if passage:
-        sentences = [
-            f"Question: {q}\nPassage: {p}" if concat == "prompt" else f"{q} {p}"
-            for q, p in zip(example["question"], example["passage"])
-        ]
+        sentences = list(zip(example["passage"], example["question"]))
     else:
         sentences = example["question"]
+
     d = tokenizer(
         sentences,
         truncation=True,

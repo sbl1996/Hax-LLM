@@ -25,7 +25,10 @@ def get_registered_dataset(name):
 
 def load_for_sequnece_classification(dataset, preprocess_fn):
     tokenized_dataset = dataset.map(preprocess_fn, batched=True)
-    tokenized_dataset.set_format(type="numpy", columns=["input_ids", "attention_mask", "label"]) # type: ignore
+    columns = ["input_ids", "attention_mask", "label"]
+    if "token_type_ids" in tokenized_dataset.column_names:
+        columns.append("token_type_ids")
+    tokenized_dataset.set_format(type="numpy", columns=columns) # type: ignore
     input_ids = tokenized_dataset["input_ids"] # type: ignore
     attention_mask = tokenized_dataset["attention_mask"] # type: ignore
     labels = tokenized_dataset["label"] # type: ignore
