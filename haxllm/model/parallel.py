@@ -4,6 +4,7 @@ import dataclasses
 
 import numpy as np
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
@@ -161,6 +162,8 @@ ShardAxis = Optional[str]
 def precompute_freqs_cis(
     dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32
 ):
+    # returns:
+    #   cos, sin: (end, dim)
     freqs = 1.0 / (
         theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim)
     )
@@ -179,8 +182,11 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    # x: (batch_size, seq_len, num_heads, head_dim)
-    # cos, sin: (seq_len, head_dim)
+    # inputs:
+    #   x: (batch_size, seq_len, num_heads, head_dim)
+    #   cos, sin: (seq_len, head_dim)
+    # returns:
+    #   q, k: (batch_size, seq_len, num_heads, head_dim)
     q_len = q.shape[1]
     kv_len = k.shape[1]
     prefix_len = kv_len - q_len
@@ -193,6 +199,34 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     sin_q = sin_k[:, prefix_len:]
     q = (q * cos_q) + (rotate_half(q) * sin_q)
     return q, k
+
+
+def apply_rotary_pos_emb_index(q, k, cos, sin, position_id):
+    # inputs:
+    #   x: (batch_size, seq_len, num_heads, head_dim)
+    #   cos, sin: (seq_len, head_dim)
+    #   position_id: (batch_size, seq_len)
+    # returns:
+    #   x: (batch_size, seq_len, num_heads, head_dim)
+    cos = jnp.take(cos, position_id, axis=0)[:, :, None, :]
+    sin = jnp.take(sin, position_id, axis=0)[:, :, None, :]
+
+    q = (q * cos) + (rotate_half(q) * sin)
+    k = (k * cos) + (rotate_half(k) * sin)
+    return q, k
+
+
+def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
+    q1, q2 = jnp.array_split(q, 2, axis=-1)
+    k1, k2 = jnp.array_split(k, 2, axis=-1)
+    block_position_ids = position_ids[:, 1, :]
+    position_ids = position_ids[:, 0, :]
+    q1, k1 = apply_rotary_pos_emb_index(q1, k1, cos, sin, position_ids)
+    q2, k2 = apply_rotary_pos_emb_index(q2, k2, cos, sin, block_position_ids)
+    q = jnp.concatenate([q1, q2], axis=-1)
+    k = jnp.concatenate([k1, k2], axis=-1)
+    return q, k
+
 
 ModuleClass = Callable[..., nn.Module]
 
@@ -219,12 +253,16 @@ class SelfAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
     ):
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
         head_dim = features // self.num_heads
+
+        if position_ids is not None:
+            assert position_ids.ndim == 3, "Only ChatGLM style 2D position_ids can be used."
 
         if not isinstance(self.dense_cls, Sequence):
             dense_cls = [self.dense_cls for _ in range(4)]
@@ -257,19 +295,28 @@ class SelfAttention(ShardModule):
             qkv_constraint(qkv_dense[2](name="value")(x)),
         )
 
+        # jax.debug.print("query {}", query[0, :, :2, :5])
+        # jax.debug.print("key {}", key[0, :, :2, :5])
+        # jax.debug.print("value {}", value[0, :, :2, :5])
+
         if self.rope:
+            pe_dim = head_dim // 2 if position_ids is not None else head_dim
             cos, sin = precompute_freqs_cis(
-                dim=head_dim, end=self.max_len, dtype=self.dtype
-            )
+                dim=pe_dim, end=self.max_len, dtype=self.dtype)
 
         if not self.decode:
             if self.rope:
-                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                if position_ids is None:
+                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                else:
+                    # ChatGLM style 2d position encoding
+                    # 2D position_ids is (batch_size, 2, seq_len)
+                    query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
         else:
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
-            if self.shard:
-                init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
+            # if self.shard:
+            #     init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
             cached_key = self.variable(
                 "cache", "cached_key", init_fn, key.shape, key.dtype
             )
@@ -281,41 +328,56 @@ class SelfAttention(ShardModule):
             )
             if not is_initialized:
                 if self.rope:
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                    if position_ids is None:
+                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                    else:
+                        # 2D position_ids is (batch_size, 2, seq_len)
+                        query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
             else:
-                (
-                    *batch_dims,
-                    max_length,
-                    num_heads,
-                    depth_per_head,
-                ) = cached_key.value.shape
+                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
                 # shape check of cached keys against query input
-                expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
-                if expected_shape != query.shape:
-                    raise ValueError(
-                        "Autoregressive cache shape error, "
-                        "expected query shape %s instead got %s."
-                        % (expected_shape, query.shape)
-                    )
+                # expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
+                # if expected_shape != query.shape:
+                #     raise ValueError(
+                #         "Autoregressive cache shape error, "
+                #         "expected query shape %s instead got %s."
+                #         % (expected_shape, query.shape)
+                #     )
                 # update key, value caches with our new 1d spatial slices
+                num_queries = query.shape[-3]
                 cur_index = cache_index.value
                 if self.rope:
-                    pos_index = jnp.array([cur_index], dtype=jnp.int32)
-                    cos, sin = cos[pos_index], sin[pos_index]
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                    if position_ids is None:
+                        assert num_queries == 1, "Only num queries 1 is supported, for casual LM decoding"
+                        pos_index = jnp.array([cur_index], dtype=jnp.int32)
+                        cos, sin = cos[pos_index], sin[pos_index]
+                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                    else:
+                        query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 cached_key.value = key
                 cached_value.value = value
-                cache_index.value = cache_index.value + 1
-                mask = combine_masks(
-                    mask,
-                    jnp.broadcast_to(
-                        jnp.arange(max_length) <= cur_index,
-                        tuple(batch_dims) + (1, 1, max_length),
-                    ),
-                )
+                if position_ids is not None and num_queries > 1:
+                    # First stage of decoding of ChatGLM
+                    context_length = position_ids[0, 0, -1] + 1
+                    idx1 = jnp.arange(num_queries)
+                    idx2 = jnp.arange(max_length)
+                    mask = (idx1[:, None] >= idx2[None, :]) | (idx2 < context_length)
+                    cache_index.value = context_length + 1
+                    mask = jnp.broadcast_to(
+                        mask, tuple(batch_dims) + (1, num_queries, max_length),
+                    )
+                else:
+                    cache_index.value = cache_index.value + num_queries
+                    mask = combine_masks(
+                        mask,
+                        jnp.broadcast_to(
+                            jnp.arange(max_length) <= cur_index,
+                            tuple(batch_dims) + (1, 1, max_length),
+                        ),
+                    )
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:

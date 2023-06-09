@@ -198,10 +198,10 @@ class TransformerLMHeadModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, train=False):
+    def __call__(self, *, input_ids, train=False):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
-            inputs=inputs, train=train
+            inputs=input_ids, train=train
         )
 
         x = DenseGeneral(
@@ -210,6 +210,8 @@ class TransformerLMHeadModel(nn.Module):
             dtype=config.dtype,
             param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
+            shard_axes={'kernel': ('Y', None)},
+            shard=config.shard,
             name="lm_head",
         )(x)
         return x

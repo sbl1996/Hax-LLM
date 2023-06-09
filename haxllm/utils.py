@@ -288,6 +288,15 @@ def calculate_num_params_from_pytree(params):
     return total_parameters
 
 
+def calculate_training_tflops(num_model_parameters, max_len, per_device_batch_size, config):
+    matmul_tflops = 6 * num_model_parameters * max_len * per_device_batch_size / 10**12
+    attention_tflops = 12 * config.hidden_size * config.n_layers * max_len**2 * per_device_batch_size / 10**12
+    total_tflops = matmul_tflops + attention_tflops
+    print(f'Per train step, total TFLOPs will be {total_tflops:.2f}, split as {100 * matmul_tflops/total_tflops:.2f}% matmul',
+        f'and {100 * attention_tflops/total_tflops:.2f}% attention')
+    return matmul_tflops + attention_tflops
+
+
 class MovingAverage:
 
     def __init__(self) -> None:
