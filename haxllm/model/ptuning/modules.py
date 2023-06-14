@@ -238,13 +238,6 @@ class SelfAttention(ShardModule):
             qkv_constraint(dense(name="value")(x)),
         )
 
-        if prefix_key_value is not None:
-            key = jnp.concatenate([prefix_key_value[0], key], axis=1)
-            value = jnp.concatenate([prefix_key_value[1], value], axis=1)
-            prefix_len = prefix_key_value[0].shape[1]
-        else:
-            prefix_len = None
-
         if self.rope:
             cos, sin = precompute_freqs_cis(
                 dim=head_dim, end=self.max_len, dtype=self.dtype
@@ -312,6 +305,13 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
+        if prefix_key_value is not None:
+            key = jnp.concatenate([prefix_key_value[0], key], axis=1)
+            value = jnp.concatenate([prefix_key_value[1], value], axis=1)
+            prefix_len = prefix_key_value[0].shape[1]
+        else:
+            prefix_len = None
+
         if self.zero_init:
             prefix_gate = self.param(
                 "prefix_gate", initializers.zeros, (self.num_heads,), jnp.float32,
@@ -319,6 +319,7 @@ class SelfAttention(ShardModule):
             prefix_gate = prefix_gate[None, :, None, None]
         else:
             prefix_gate = None
+
         x = dot_product_attention(
             query,
             key,

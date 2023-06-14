@@ -295,23 +295,21 @@ class SelfAttention(ShardModule):
             qkv_constraint(qkv_dense[2](name="value")(x)),
         )
 
-        # jax.debug.print("query {}", query[0, :, :2, :5])
-        # jax.debug.print("key {}", key[0, :, :2, :5])
-        # jax.debug.print("value {}", value[0, :, :2, :5])
+        # ChatGLM style 2d position encoding
+        position_encoding_2d = position_ids is not None
 
         if self.rope:
-            pe_dim = head_dim // 2 if position_ids is not None else head_dim
+            pe_dim = head_dim // 2 if position_encoding_2d else head_dim
             cos, sin = precompute_freqs_cis(
                 dim=pe_dim, end=self.max_len, dtype=self.dtype)
 
         if not self.decode:
             if self.rope:
-                if position_ids is None:
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
-                else:
-                    # ChatGLM style 2d position encoding
+                if position_encoding_2d:
                     # 2D position_ids is (batch_size, 2, seq_len)
                     query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
+                else:
+                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
         else:
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
@@ -328,11 +326,11 @@ class SelfAttention(ShardModule):
             )
             if not is_initialized:
                 if self.rope:
-                    if position_ids is None:
-                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
-                    else:
+                    if position_encoding_2d:
                         # 2D position_ids is (batch_size, 2, seq_len)
                         query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
+                    else:
+                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
             else:
                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
                 # shape check of cached keys against query input
@@ -347,30 +345,33 @@ class SelfAttention(ShardModule):
                 num_queries = query.shape[-3]
                 cur_index = cache_index.value
                 if self.rope:
-                    if position_ids is None:
-                        assert num_queries == 1, "Only num queries 1 is supported, for casual LM decoding"
-                        pos_index = jnp.array([cur_index], dtype=jnp.int32)
-                        cos, sin = cos[pos_index], sin[pos_index]
-                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
-                    else:
+                    if position_encoding_2d:
                         query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
+                    else:
+                        position_ids = jnp.arange(num_queries) + cur_index
+                        position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
+                        query, key = apply_rotary_pos_emb_index(query, key, cos, sin, position_ids)
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 cached_key.value = key
                 cached_value.value = value
-                if position_ids is not None and num_queries > 1:
-                    # First stage of decoding of ChatGLM
-                    context_length = position_ids[0, 0, -1] + 1
-                    idx1 = jnp.arange(num_queries)
-                    idx2 = jnp.arange(max_length)
-                    mask = (idx1[:, None] >= idx2[None, :]) | (idx2 < context_length)
-                    cache_index.value = context_length + 1
+                if num_queries > 1:
+                    idx = jnp.arange(max_length)
+                    mask = idx <= jnp.arange(num_queries)[:, None]
+                    if position_encoding_2d:
+                        # First stage of decoding of ChatGLM
+                        context_length_1 = position_ids[0, 0, -1]
+                        mask = mask | (idx <= context_length_1)
+                        offset = context_length_1 + 2
+                    else:
+                        offset = num_queries
+                    cache_index.value = cache_index.value + offset
                     mask = jnp.broadcast_to(
                         mask, tuple(batch_dims) + (1, num_queries, max_length),
                     )
                 else:
-                    cache_index.value = cache_index.value + num_queries
+                    cache_index.value = cache_index.value + 1
                     mask = combine_masks(
                         mask,
                         jnp.broadcast_to(
@@ -410,6 +411,7 @@ class SelfAttention(ShardModule):
             shard=self.shard,
             name="out",
         )(x)
+
         # out = self.with_sharding_constraint(
         #     out, ("X", None, "Y"))
         return out

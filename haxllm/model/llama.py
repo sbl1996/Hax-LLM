@@ -83,7 +83,7 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
-        if not config.memory_efficient:
+        if not config.memory_efficient and not config.decode:
             mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
         else:
             mask = None

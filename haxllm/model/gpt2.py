@@ -1,6 +1,7 @@
 import functools
 from typing import Any, Callable
 
+import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -75,7 +76,10 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
-        attn_mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+        if not config.decode:
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+        else:
+            mask = None
 
         x = nn.LayerNorm(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1"
@@ -91,7 +95,7 @@ class TransformerBlock(nn.Module):
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn")(x, attn_mask)
+            name="attn")(x, mask)
         x = nn.Dropout(rate=config.resid_pdrop)(x, deterministic=self.deterministic)
         x = x + inputs
 
@@ -120,7 +124,7 @@ class TransformerModel(nn.Module):
     block_cls: Callable = TransformerBlock
 
     @nn.compact
-    def __call__(self, *, inputs, train):
+    def __call__(self, *, input_ids, train):
         config = self.config
         remat = config.remat or config.remat_scan
 
@@ -134,29 +138,31 @@ class TransformerModel(nn.Module):
             shard=config.shard,
         )
 
-        position_ids = jnp.arange(0, inputs.shape[-1], dtype=jnp.int32)[None]
+        position_ids = jnp.arange(0, input_ids.shape[-1], dtype=jnp.int32)[None]
         if config.decode:
-            is_initialized = self.has_variable("cache", "cache_index")
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.uint32)
+            is_initialized = self.has_variable("cache", "cache_position_ids")
+            cache_position_ids = self.variable(
+                "cache", "cache_position_ids", lambda: jnp.array(0, dtype=jnp.int32)
             )
             if is_initialized:
-                i = cache_index.value
-                cache_index.value = i + 1
-                position_ids = jnp.tile(i, (inputs.shape[0], 1))
+                batch_size, seq_len = input_ids.shape[:2]
+                if seq_len != 1:
+                    # First stage of decoding
+                    offset = jnp.argmax(input_ids[0] == config.pad_token_id)
+                    offset = jnp.where(offset == 0, seq_len, offset)
+                    position_ids = jnp.arange(seq_len, dtype=jnp.int32)
+                else:
+                    offset = 1
+                    position_ids = cache_position_ids.value[None]
+                cache_position_ids.value = cache_position_ids.value + offset
+                position_ids = jnp.broadcast_to(position_ids, (batch_size, seq_len))
 
-        inputs_embeds = embed_layer(num_embeddings=config.vocab_size, name="wte")(
-            inputs
-        )
-        position_embeds = embed_layer(num_embeddings=config.n_positions, name="wpe")(
-            position_ids
-        )
+        inputs_embeds = embed_layer(num_embeddings=config.vocab_size, name="wte")(input_ids)
+        position_embeds = embed_layer(num_embeddings=config.n_positions, name="wpe")(position_ids)
 
         x = inputs_embeds + position_embeds
 
-        dropout_layer = (
-            nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
-        )
+        dropout_layer = nn.remat(nn.Dropout, static_argnums=(2,)) if remat else nn.Dropout
         x = dropout_layer(rate=config.embd_pdrop)(x, not train)
 
         block_fn = functools.partial(self.block_cls, deterministic=not train)
@@ -173,14 +179,14 @@ class TransformerSequenceClassifier(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
+    def __call__(self, *, input_ids, attn_mask, train=False):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
-            inputs=inputs, train=train
+            input_ids=input_ids, train=train
         )
 
-        batch_size = inputs.shape[0]
-        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
+        batch_size = input_ids.shape[0]
+        seq_len = jnp.not_equal(input_ids, config.pad_token_id).sum(-1) - 1
         x = x[jnp.arange(batch_size), seq_len]
 
         x = nn.Dropout(rate=config.cls_pdrop)(x, not train)
@@ -201,8 +207,7 @@ class TransformerLMHeadModel(nn.Module):
     def __call__(self, *, input_ids, train=False):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
-            inputs=input_ids, train=train
-        )
+            input_ids=input_ids, train=train)
 
         x = DenseGeneral(
             config.vocab_size,

@@ -1,7 +1,6 @@
 import functools
 from typing import Any, Callable
 
-import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -46,12 +45,76 @@ class TransformerConfig(RematScanConfigMixin):
     pad_token_id: int = 3
     bos_token_id: int = 130004
     eos_token_id: int = 130005
-    mask_token_id: int = 130000,
-    gmask_token_id: int = 130001,
+    mask_token_id: int = 130000
+    gmask_token_id: int = 130001
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     decode: bool = False
     shard: bool = False
+
+
+def get_position_ids(input_ids, bos_token_id, mask_token_id, gmask_token_id):
+    # Translated from: THUDM/chatglm-6b, tokenization_chatglm.py
+
+    # We assume that the bos token is always in the input
+    # if bos_token_id in required_input:
+    #   context_length = required_input.index(bos_token_id)
+    # else:
+    #   context_length = seq_length
+    context_lengths = jnp.argmax(input_ids == bos_token_id, axis=1, keepdims=True)
+
+    # Translated from:
+    # mask_token = mask_token_id if mask_token_id in required_input else gmask_token_id
+    mask_position = jnp.argmax(input_ids == mask_token_id, axis=1, keepdims=True)
+    gmask_position = jnp.argmax(input_ids == gmask_token_id, axis=1, keepdims=True)
+    mask_position = jnp.where(mask_position == 0, gmask_position, mask_position)
+    
+    # We skip it, asuming that the mask token is always in the input
+    # if mask_token in required_input:
+
+    # Translated from:
+    #   mask_position = required_input.index(mask_token)
+    #   position_ids[context_length:] = mask_position
+    seq_len = input_ids.shape[1]
+    B = jnp.arange(0, seq_len, dtype=jnp.int32)[None, :]
+    position_ids = jnp.where(B < context_lengths, B, mask_position)
+
+    # Translated from:
+    # block_position_ids = np.concatenate(
+    #   [np.zeros(context_length, dtype=np.int64),
+    #   np.arange(1, seq_length - context_length + 1, dtype=np.int64)])
+    # encoded_inputs["position_ids"] = np.stack([position_ids, block_position_ids], axis=0)
+    block_position_ids = jnp.maximum(B - context_lengths + 1, 0)
+    position_ids = jnp.stack([position_ids, block_position_ids], axis=1)  
+    return position_ids      
+
+
+def get_masks(position_ids):
+    # Translated from: THUDM/chatglm-6b, tokenization_chatglm.py
+
+    # We assume that the bos token is always in the input
+    # ```
+    # if bos_token_id in required_input:
+    #   context_length = required_input.index(bos_token_id)
+    # else:
+    #   context_length = seq_length
+    # ```
+    # We don't have input_ids here, so we infer it from position_ids
+    # See: position_ids = jnp.where(B < context_lengths, B, mask_position)
+    context_lengths_sub_1 = jnp.argmax(position_ids, axis=1, keepdims=True)
+
+    # Translated from:
+    # attention_mask = np.ones((1, seq_length, seq_length))
+    # attention_mask = np.tril(attention_mask)
+    # attention_mask[:, :, :context_length] = 1
+    # attention_mask = np.bool_(attention_mask < 0.5)
+    seq_len = position_ids.shape[-1]
+    idxs = jnp.arange(seq_len, dtype=jnp.int32)
+    idxs1 = idxs[None, :, None]
+    idxs2 = idxs[None, None, :]
+    mask = (idxs1 >= idxs2) | (idxs2 <= context_lengths_sub_1)
+    mask = mask[:, None, :, :]  # (batch_size, 1, seq_len, seq_len)
+    return mask
 
 
 # TODO: skip query_key_layer_scaling_coeff
@@ -66,23 +129,10 @@ class TransformerBlock(nn.Module):
         config = self.config
         x, position_ids = inputs
 
-        seq_len = x.shape[1]
-        if not config.decode:
-            # training
-            idxs = jnp.arange(seq_len, dtype=jnp.int32)
-            # autually context_lengths - 1
-            context_lengths = position_ids[:, :1, -1:]
-            idxs1 = idxs[None, :, None]
-            idxs2 = idxs[None, None, :]
-            mask = (idxs1 >= idxs2) | (idxs2 <= context_lengths)
-            mask = mask[:, None, :, :]
-        else:
-            # decode
-            mask = None
+        mask = get_masks(position_ids) if not config.decode else None
 
         attn_input = nn.LayerNorm(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1")(x)
-        # jax.debug.print("attn_input {}", attn_input[0, :, :10])
         attn_output = SelfAttention(
             num_heads=config.n_heads,
             max_len=config.n_positions,
@@ -95,15 +145,12 @@ class TransformerBlock(nn.Module):
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             name="attn")(attn_input, mask=mask, position_ids=position_ids)
-        # jax.debug.print("attn_output {}", attn_output[0, :, :10])
 
         alpha = (2 * config.n_layers) ** 0.5
         x = attn_input * alpha + attn_output
-        # jax.debug.print("res1 {}", x[0, :, :10])
 
         mlp_input = nn.LayerNorm(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_2")(x)
-        # jax.debug.print("mlp_input {}", mlp_input[0, :, :10])
         mlp_output = MlpBlock(
             activation="gelu_new",
             use_bias=True,
@@ -113,10 +160,8 @@ class TransformerBlock(nn.Module):
             shard_axes2=("Y", "X"),
             shard=config.shard,
             name="mlp")(mlp_input)
-        # jax.debug.print("mlp_output {}", mlp_output[0, :, :10])
 
         y = mlp_input * alpha + mlp_output
-        # jax.debug.print("res2 {}", y[0, :, :10])
         if self.scan:
             return (y, position_ids), None
         else:
@@ -128,9 +173,30 @@ class TransformerModel(nn.Module):
     block_cls: Callable = TransformerBlock
 
     @nn.compact
-    def __call__(self, *, inputs, position_ids, train):
+    def __call__(self, *, input_ids, train):
         config = self.config
         remat = config.remat or config.remat_scan
+
+        position_ids = get_position_ids(input_ids, config.bos_token_id, config.mask_token_id, config.gmask_token_id)
+        if config.decode:
+            is_initialized = self.has_variable("cache", "cache_position_ids")
+            cache_position_ids = self.variable(
+                "cache", "cache_position_ids", lambda: jnp.array([0, 0], dtype=jnp.uint32)
+            )
+            if is_initialized:
+                batch_size, seq_len = input_ids.shape
+                # See get_position_ids for details
+                if seq_len > 1:
+                    # First stage of ChatGLM decoding
+                    mask_position = jnp.argmax(input_ids[0] == config.mask_token_id)
+                    gmask_position = jnp.argmax(input_ids[0] == config.gmask_token_id)
+                    mask_position = jnp.where(mask_position == 0, gmask_position, mask_position)
+                    cache_position_ids.value = jnp.array([mask_position, 1], dtype=jnp.uint32)
+                else:
+                    p = cache_position_ids.value
+                    p = p.at[1].set(p[1] + 1)
+                    position_ids = jnp.broadcast_to(p[None, :, None], (batch_size, 2, 1))
+                    cache_position_ids.value = p
 
         embed_layer = nn.remat(Embed) if remat else Embed
         embed_layer = functools.partial(
@@ -142,9 +208,7 @@ class TransformerModel(nn.Module):
             shard=config.shard,
         )
 
-        x = embed_layer(num_embeddings=config.vocab_size, name="wte")(inputs)
-
-        # jax.debug.print("embed {}", x[0, :, :10])
+        x = embed_layer(num_embeddings=config.vocab_size, name="wte")(input_ids)
 
         block_fn = functools.partial(self.block_cls, deterministic=not train)
         x = make_block_stack(block_fn, config.n_layers, config)((x, position_ids), train)[0]
@@ -153,7 +217,6 @@ class TransformerModel(nn.Module):
         x = norm_layer(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_f"
         )(x)
-        # jax.debug.print("out {}", x[0, :, :10])
         return x
 
 
@@ -186,10 +249,10 @@ class TransformerLMHeadModel(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, *, input_ids, position_ids, train=False):
+    def __call__(self, *, input_ids, train=False):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
-            inputs=input_ids, position_ids=position_ids, train=train)
+            input_ids=input_ids, train=train)
 
         x = DenseGeneral(
             config.vocab_size,
