@@ -45,16 +45,19 @@ def sample_token(logits, rng, temperature=1.0, topk=5):
     return token, rng
 
 
-def random_sample(sentence, tokenizer, apply_fn, params, cache, max_len,
+def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
                   temperature=1.0, topk=10, rng=None, two_stage=False, pad_context=None, pad_token_id=None):
     if temperature != 0:
         assert rng is not None, "Must provide rng if temperature != 0"
     if pad_context is not None:
         assert two_stage, "Must use two_stage if pad_context is not None"
         assert pad_token_id is not None, "Must provide pad_token_id if pad_context is not None"
-    example = tokenizer(sentence)
-    tokens = example['input_ids']
+    if isinstance(inputs, str):
+        tokens = tokenizer(inputs)['input_ids']
+    else:
+        tokens = inputs
     context_length = len(tokens)
+    assert context_length < max_len, "Context length must be less than max_len"
 
     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), cache)
 
@@ -92,13 +95,15 @@ def random_sample(sentence, tokenizer, apply_fn, params, cache, max_len,
     return tokenizer.decode(live_seq)
 
 
-def beam_search(sentence, tokenizer, apply_fn, params, cache, max_len,
+def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
                 n_beams, two_stage=False, pad_context=None, pad_token_id=None):
     if pad_context is not None:
         assert two_stage, "Must use two_stage if pad_context is not None"
         assert pad_token_id is not None, "Must provide pad_token_id if pad_context is not None"
-    example = tokenizer(sentence)
-    tokens = example['input_ids']
+    if isinstance(inputs, str):
+        tokens = tokenizer(inputs)['input_ids']
+    else:
+        tokens = inputs
     context_length = len(tokens)
     assert context_length < max_len, "Context length must be less than max_len"
 
