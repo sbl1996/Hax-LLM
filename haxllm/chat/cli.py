@@ -197,7 +197,10 @@ def chat_app(cfg: DictConfig) -> None:
     pipeline = TextGenerationPipeline(
         tokenizer, model, mesh=mesh, max_len=cfg.max_len, seed=random_seed)
 
-    pipeline.init(transformer_weight=cfg.model.weight)
+    checkpoint = getattr(cfg, "checkpoint", None)
+    if checkpoint is None:
+        raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
+    pipeline.init(transformer_weight=checkpoint)
 
     pipeline.chat(max_len=cfg.max_len, temperature=cfg.temperature, topk=cfg.topk)
 

@@ -2,4 +2,3 @@ family: llama
 name: llama-7b
 tokenizer: huggyllama/llama-7b
 scan: True
-weight: llama-7b_np.safetensors
