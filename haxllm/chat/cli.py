@@ -165,6 +165,9 @@ class TextGenerationPipeline:
 
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
 def chat_app(cfg: DictConfig) -> None:
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache(os.path.expanduser("~/jax_cache"))
+
     start = time.time()
     jax_smi.initialise_tracking()
 
