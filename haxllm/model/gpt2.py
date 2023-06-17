@@ -222,16 +222,20 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, config: TransformerConfig):
+def remap_state_dict(state_dict):
+    n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("h.")]) + 1
+    hidden_size = state_dict['wte.weight'].shape[1]
+    # hard code for GPT-2
+    head_dim = 64
+    n_heads = hidden_size  // head_dim
+
     # Embedding
     root = {}
     root["wte"] = {"embedding": state_dict.pop("wte.weight")}
     root["wpe"] = {"embedding": state_dict.pop("wpe.weight")}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
 
     # TransformerBlock
-    for d in range(config.n_layers):
+    for d in range(n_layers):
         block_d = {}
         block_d["ln_1"] = {
             "scale": state_dict.pop(f"h.{d}.ln_1.weight"),

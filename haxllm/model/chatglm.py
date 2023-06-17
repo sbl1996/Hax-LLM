@@ -267,26 +267,29 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, config: TransformerConfig):
-    state_dict = {k.replace("transformer.", ""): v for k,
-                  v in state_dict.items()}
+def remap_state_dict(state_dict):
+    state_dict = {k.replace("transformer.", ""): v for k, v in state_dict.items()}
+
+    n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
+    hidden_size = state_dict['word_embeddings.weight'].shape[1]
+    # hard code for now
+    head_dim = 128
+    n_heads = hidden_size  // head_dim
+
     root = {}
     root["wte"] = {"embedding": state_dict.pop("word_embeddings.weight")}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
 
     # TransformerBlock
-    for d in range(config.n_layers):
+    for d in range(n_layers):
         block_d = {}
         block_d["ln_1"] = {
             "scale": state_dict.pop(f"layers.{d}.input_layernorm.weight"),
             "bias": state_dict.pop(f"layers.{d}.input_layernorm.bias"),
         }
         c_attn_weight = state_dict[f"layers.{d}.attention.query_key_value.weight"].T
-        c_attn_weight = c_attn_weight.reshape(hidden_size, n_heads, -1)
-        head_dim = c_attn_weight.shape[-1] // 3
+        c_attn_weight = c_attn_weight.reshape(hidden_size, n_heads, head_dim * 3)
         c_attn_bias = state_dict[f"layers.{d}.attention.query_key_value.bias"]
-        c_attn_bias = c_attn_bias.reshape(n_heads, -1)
+        c_attn_bias = c_attn_bias.reshape(n_heads, head_dim * 3)
         block_d["attn"] = {
             "query": {
                 "kernel": c_attn_weight[..., 0:head_dim],

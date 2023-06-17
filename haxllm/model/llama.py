@@ -195,13 +195,16 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, config: TransformerConfig):
+def remap_state_dict(state_dict):
+    n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
+    hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
+    head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0]
+    n_heads = hidden_size  // head_dim
+
     root = {}
     root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight")}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
 
-    for d in range(config.n_layers):
+    for d in range(n_layers):
         block_d = {}
         block_d["ln_1"] = {"scale": state_dict.pop(
             f"model.layers.{d}.input_layernorm.weight")}

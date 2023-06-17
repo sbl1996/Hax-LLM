@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+
+seed: 0
+dtype: bfloat16
+param_dtype: bfloat16
+mesh: [1, 8]
+max_len: 2048
+
+train:
+  transformer_weight: vicuna-7b_np.safetensors
+
+model:
+  family: llama
+  name: llama-7b
+  tokenizer: huggyllama/llama-7b
+  scan: True

@@ -75,8 +75,15 @@ class TransformerSequenceClassifier(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, config: TransformerConfig):
+def remap_state_dict(state_dict):
     state_dict = {k.replace("roberta.", ""): v for k, v in state_dict.items()}
+
+    n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("encoder.layer.")]) + 1
+    hidden_size = state_dict['embeddings.word_embeddings.weight'].shape[1]
+    # hard code for bert
+    head_dim = 64
+    n_heads = hidden_size  // head_dim
+
     root = {}
     root["word_embeddings"] = {"embedding": state_dict.pop(
         "embeddings.word_embeddings.weight")}
@@ -86,10 +93,8 @@ def remap_state_dict(state_dict, config: TransformerConfig):
         "embeddings.token_type_embeddings.weight")}
     root["ln"] = {"scale": state_dict.pop(
         "embeddings.LayerNorm.weight"), "bias": state_dict.pop("embeddings.LayerNorm.bias")}
-    hidden_size = config.hidden_size
-    n_heads = config.n_heads
 
-    for d in range(config.n_layers):
+    for d in range(n_layers):
         block_d = {}
         block_d["attn"] = {
             "query": {
