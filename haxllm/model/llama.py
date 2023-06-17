@@ -198,7 +198,7 @@ class TransformerLMHeadModel(nn.Module):
 def remap_state_dict(state_dict):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
-    head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0]
+    head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0] * 2
     n_heads = hidden_size  // head_dim
 
     root = {}
