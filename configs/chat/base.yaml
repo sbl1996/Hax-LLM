@@ -2,6 +2,9 @@ defaults:
   - model: vicuna-7b
   - _self_
 
+hydra:  
+  output_subdir: null
+
 seed: 0
 dtype: bfloat16
 param_dtype: bfloat16

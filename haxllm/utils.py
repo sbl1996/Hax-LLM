@@ -254,6 +254,98 @@ def load_transformer_params(
     return params
 
 
+def load_transformer_params2(
+        params,
+        path: str,
+        device,
+        lm_head=False):
+    cpu = False
+    mesh = None
+    if isinstance(device, str):
+        assert device == "cpu"
+        cpu = True
+    elif isinstance(device, Mesh):
+        mesh = device
+
+    transformer_params = load_file(path)
+    transformer_params = unflatten_dict(transformer_params, sep=".")
+
+    assert not isinstance(params, FrozenDict)
+
+    # detect scan or remat_scan
+    hs_keys = [k for k in params.keys() if k.startswith("transformer.hs")]
+    if hs_keys:
+        src_keys = [k for k in transformer_params if k.startswith("h_")]
+        h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
+        sample_key = next(iter(h_params.keys()))
+
+        loop_hs_keys = [k for k in hs_keys if k.startswith("transformer.hs_")]
+        if loop_hs_keys:
+            n_loop = len(set([k.split(".")[1] for k in loop_hs_keys]))
+            tgt_keys = [f"hs_{i}" for i in range(n_loop)]
+            hs_param = params[f"transformer.hs_0.{sample_key}"]
+            scan_lengths = (n_loop,)
+        else:
+            tgt_keys = "hs"
+            hs_param = params[f"transformer.hs.{sample_key}"]
+            scan_lengths = ()
+        if isinstance(hs_param, nn.Partitioned):
+            hs_param = hs_param.value
+        hs_shape = hs_param.shape
+        h_shape = h_params[sample_key].shape
+        del h_params, hs_param
+        scan_lengths = scan_lengths + tuple(hs_shape[:(len(hs_shape) - len(h_shape))])
+        src_keys = [f"h_{i}" for i in range(np.prod(scan_lengths))]
+        transformer_params = convert_scan_params(
+            transformer_params, src_keys=src_keys, tgt_keys=tgt_keys, lengths=scan_lengths)
+    new_transformer_params = flatten_dict(transformer_params, sep=".")
+
+    prefix = "transformer."
+    all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
+    if lm_head:
+        all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
+    for key in all_keys:
+        if key not in new_transformer_params:
+            print(f"Key {key} not found in transformer params")
+            continue
+        
+        full_key = key if key.startswith("lm_head") else prefix + key
+        p = params[full_key]
+        print(f"Loading param {key}")
+        x = new_transformer_params[key]
+        if isinstance(p, nn.Partitioned):
+            dtype = p.value.dtype
+        else:
+            dtype = p.dtype
+        x = x.astype(dtype)
+        if cpu:
+            x = jax.device_put(x, jax.devices("cpu")[0])
+        elif mesh is None:
+            x = jax.device_put(x)
+        else:
+            if isinstance(p, nn.Partitioned):
+                spec = p.get_partition_spec()
+            else:
+                spec = p.sharding.spec
+            #     print("Before p", p.value.sharding)
+            #     print(p.names)
+            # else:
+            #     print("Before", p.sharding)
+            with mesh:
+                x = jax.device_put(x, NamedSharding(mesh, spec))
+        if isinstance(p, nn.Partitioned):
+            params[full_key] = p.replace_boxed(x)
+        else:
+            params[full_key] = x
+        # if isinstance(p, nn.Partitioned):
+        #     print("After p", params[full_key].value.sharding)
+        #     print(params[full_key].names)
+        # else:
+        #     print("After", params[full_key].sharding)
+        del p, x
+    return params
+
+
 def partition_x(x, mesh):
     n = len(x.shape)
     partition = ["X"] + [None] * (n - 1)

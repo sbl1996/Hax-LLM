@@ -12,10 +12,11 @@ from jax.experimental.pjit import pjit
 
 import jax_smi
 
-from flax.core.frozen_dict import unfreeze
+from flax.core.frozen_dict import unfreeze, freeze
+from flax.traverse_util import unflatten_dict, flatten_dict
 from flax import linen as nn
 
-from haxllm.utils import load_transformer_params
+from haxllm.utils import load_transformer_params2
 from haxllm.model.decode import random_sample, beam_search, chat
 
 import hydra
@@ -88,11 +89,11 @@ class TextGenerationPipeline:
             with jax.default_device(jax.devices("cpu")[0]):
                 params, cache = p_init_fn(init_rng, input_ids)
 
-        params = unfreeze(params)
-
         if transformer_weight:
-            params = load_transformer_params(
+            params = unfreeze(flatten_dict(params, sep="."))
+            params = load_transformer_params2(
                 params, transformer_weight, lm_head=True, device=load_device)
+            params = freeze(unflatten_dict(params, sep="."))
 
         if not parallel:
             params = jax.device_put(params, jax.devices()[0])
@@ -171,6 +172,11 @@ def chat_app(cfg: DictConfig) -> None:
     random_seed = cfg.seed
     tokenizer_name = model_config.pop("tokenizer")
 
+    checkpoint = getattr(cfg, "checkpoint", None)
+    if checkpoint is None:
+        raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
+    assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
+
     print(f"Loading tokenizer from {tokenizer_name}...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
     tokenizer.decode(tokenizer("init")['input_ids'])
@@ -198,10 +204,6 @@ def chat_app(cfg: DictConfig) -> None:
     pipeline = TextGenerationPipeline(
         tokenizer, model, mesh=mesh, max_len=cfg.max_len, seed=random_seed)
 
-    checkpoint = getattr(cfg, "checkpoint", None)
-    if checkpoint is None:
-        raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
-    assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
     pipeline.init(transformer_weight=checkpoint)
 
     pipeline.chat(max_len=cfg.max_len, temperature=cfg.temperature, topk=cfg.topk)
