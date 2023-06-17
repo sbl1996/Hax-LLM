@@ -16,7 +16,7 @@ from flax.core.frozen_dict import unfreeze, freeze
 from flax.traverse_util import unflatten_dict, flatten_dict
 from flax import linen as nn
 
-from haxllm.utils import load_transformer_params2
+from haxllm.utils import load_transformer_params
 from haxllm.model.decode import random_sample, beam_search, chat
 
 import hydra
@@ -91,7 +91,7 @@ class TextGenerationPipeline:
 
         if transformer_weight:
             params = unfreeze(flatten_dict(params, sep="."))
-            params = load_transformer_params2(
+            params = load_transformer_params(
                 params, transformer_weight, lm_head=True, device=load_device)
             params = freeze(unflatten_dict(params, sep="."))
 
