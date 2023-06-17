@@ -1,3 +1,4 @@
+import os
 import time
 from functools import partial
 import importlib
@@ -200,6 +201,7 @@ def chat_app(cfg: DictConfig) -> None:
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
         raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
+    assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
     pipeline.init(transformer_weight=checkpoint)
 
     pipeline.chat(max_len=cfg.max_len, temperature=cfg.temperature, topk=cfg.topk)
