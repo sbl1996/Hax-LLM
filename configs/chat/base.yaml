@@ -1,0 +1,12 @@
+defaults:
+  - model: vicuna-7b
+  - _self_
+
+seed: 0
+dtype: bfloat16
+param_dtype: bfloat16
+mesh: [1, 8]
+
+max_len: 2048
+temperature: 0.7
+topk: 5
