@@ -167,6 +167,8 @@ class TextGenerationPipeline:
 def chat_app(cfg: DictConfig) -> None:
     from jax.experimental.compilation_cache import compilation_cache as cc
     cc.initialize_cache(os.path.expanduser("~/jax_cache"))
+    import logging
+    logging.getLogger("jax").setLevel(logging.WARNING)
 
     start = time.time()
     jax_smi.initialise_tracking()
