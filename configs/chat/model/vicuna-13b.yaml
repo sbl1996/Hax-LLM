@@ -2,3 +2,4 @@ family: llama
 name: llama-13b
 tokenizer: huggyllama/llama-7b
 scan: False
+conv_template: vicuna_v1.1

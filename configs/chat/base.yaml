@@ -16,6 +16,9 @@ mesh: [1, 8]
 
 max_len: 2048
 temperature: 0.7
-topk: 5
+topk: 1
 
 checkpoint: null
+
+debug: False
+style: rich

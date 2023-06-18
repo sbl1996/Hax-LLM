@@ -1,10 +1,7 @@
-from typing import Callable
-
 import jax
 import jax.numpy as jnp
 
 from flax.core.frozen_dict import unfreeze, FrozenDict
-from haxllm.chat.conversation import Conversation
 
 
 def add_beam_dim(x, n_beams):
@@ -165,62 +162,108 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
     return [tokenizer.decode(seq[:end_index[i]]) for i, seq in enumerate(live_seqs_t)]
 
 
-def chat(conv: Conversation, tokenizer, apply_fn, params, init_cache, max_len, temperature=1.0, topk=10, rng=None):
-    if temperature != 0:
-        assert rng is not None, "Must provide rng if temperature != 0"
+# def chat(conv: Conversation, chatio, tokenizer, apply_fn, params, init_cache, max_len, temperature=1.0, topk=10, rng=None):
+#     if temperature != 0:
+#         assert rng is not None, "Must provide rng if temperature != 0"
 
-    init_conv = conv
-    cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-    conv = init_conv.copy()
-    live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-    now = 0
+#     init_conv = conv
+#     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
+#     conv = init_conv.copy()
+#     live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
+#     now = 0
 
-    while True:
-        try:
-            inp = input(f"{conv.roles[0]}: ")
-        except EOFError:
-            inp = ""
+#     while True:
+#         try:
+#             inp = chatio.prompt_for_input(conv.roles[0])
+#         except EOFError:
+#             inp = ""
 
-        if inp == "!!exit" or not inp:
-            print("exit...")
-            break
+#         if inp == "!!exit" or not inp:
+#             print("exit...")
+#             break
 
-        if inp == "!!reset":
-            print("resetting...")
-            cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-            conv = init_conv.copy()
-            live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-            now = 0
-            continue
+#         if inp == "!!reset":
+#             print("resetting...")
+#             cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
+#             conv = init_conv.copy()
+#             live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
+#             now = 0
+#             continue
 
-        conv.append_message(conv.roles[0], inp)
-        conv.append_message(conv.roles[1], None)
+#         conv.append_message(conv.roles[0], inp)
+#         conv.append_message(conv.roles[1], None)
 
-        inp = conv.get_next_input()
-        pre = now
-        tokens = tokenizer(inp, add_special_tokens=pre == 0)['input_ids']
-        live_seq, now, cache = chat_round(
-            tokens, tokenizer, apply_fn, params, live_seq, pre, cache, max_len, temperature, topk, rng)
-        outputs = jax.device_get(live_seq[0, pre+len(tokens):now])
-        outputs = tokenizer.decode(outputs).strip()
-        print(f"{conv.roles[1]}: {outputs}")
-        print(f"Used: {now}/{max_len}")
+#         chatio.prompt_for_output(conv.roles[1])
 
-        conv.update_last_message(outputs)
+#         inp = conv.get_next_input()
+#         pre = now
+#         tokens = tokenizer(inp, add_special_tokens=pre == 0)['input_ids']
+#         live_seq, now, cache = chat_round(
+#             tokens, tokenizer, apply_fn, params, live_seq, pre, cache, max_len, temperature, topk, rng)
+#         outputs = jax.device_get(live_seq[0, pre+len(tokens):now])
+#         outputs = tokenizer.decode(outputs).strip()
+#         print(f"{conv.roles[1]}: {outputs}")
+#         print(f"Used: {now}/{max_len}")
+
+#         conv.update_last_message(outputs)
 
 
-def chat_round(tokens, tokenizer, apply_fn, params, live_seq, i, cache, max_len, temperature=1.0, topk=10, rng=None):
-    live_seq = live_seq.at[:, i:i+len(tokens)].set(tokens)
-    context_length = i + len(tokens)
-    while i < max_len:
-        input_ids = live_seq[:, [i]]
-        cache, logits = apply_fn(params, cache, input_ids)
-        i += 1
-        if i < context_length:
-            continue
-        logits = logits.astype(jnp.float32)[0, 0]
-        token, rng = sample_token(logits, rng, temperature, topk)
-        if token in [tokenizer.eos_token_id, 0]:
-            break
-        live_seq = live_seq.at[:, i].set(token)
-    return live_seq, i, cache
+# def simple_chat(conv: Conversation, tokenizer, apply_fn, params, init_cache, max_len, temperature=1.0, topk=10, rng=None):
+#     if temperature != 0:
+#         assert rng is not None, "Must provide rng if temperature != 0"
+
+#     init_conv = conv
+#     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
+#     conv = init_conv.copy()
+#     live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
+#     now = 0
+
+#     while True:
+#         try:
+#             inp = input(f"{conv.roles[0]}: ")
+#         except EOFError:
+#             inp = ""
+
+#         if inp == "!!exit" or not inp:
+#             print("exit...")
+#             break
+
+#         if inp == "!!reset":
+#             print("resetting...")
+#             cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
+#             conv = init_conv.copy()
+#             live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
+#             now = 0
+#             continue
+
+#         conv.append_message(conv.roles[0], inp)
+#         conv.append_message(conv.roles[1], None)
+
+#         inp = conv.get_next_input()
+#         pre = now
+#         tokens = tokenizer(inp, add_special_tokens=pre == 0)['input_ids']
+#         live_seq, now, cache = chat_round(
+#             tokens, tokenizer, apply_fn, params, live_seq, pre, cache, max_len, temperature, topk, rng)
+#         outputs = jax.device_get(live_seq[0, pre+len(tokens):now])
+#         outputs = tokenizer.decode(outputs).strip()
+#         print(f"{conv.roles[1]}: {outputs}")
+#         print(f"Used: {now}/{max_len}")
+
+#         conv.update_last_message(outputs)
+
+
+# def chat_round(tokens, tokenizer, apply_fn, params, live_seq, i, cache, max_len, temperature=1.0, topk=10, rng=None):
+#     live_seq = live_seq.at[:, i:i+len(tokens)].set(tokens)
+#     context_length = i + len(tokens)
+#     while i < max_len:
+#         input_ids = live_seq[:, [i]]
+#         cache, logits = apply_fn(params, cache, input_ids)
+#         i += 1
+#         if i < context_length:
+#             continue
+#         logits = logits.astype(jnp.float32)[0, 0]
+#         token, rng = sample_token(logits, rng, temperature, topk)
+#         if token in [tokenizer.eos_token_id, 0]:
+#             break
+#         live_seq = live_seq.at[:, i].set(token)
+#     return live_seq, i, cache

@@ -1,166 +1,146 @@
-import os
+# pyright: reportUnboundVariable=false
+
 import time
-from functools import partial
+import os
+import re
+import sys
 import importlib
 
-import jax
-import jax.numpy as jnp
-from jax import random
-from jax.sharding import Mesh
-from jax.experimental import mesh_utils
-from jax.experimental.pjit import pjit
-
-import jax_smi
-
-from flax.core.frozen_dict import unfreeze, freeze
-from flax.traverse_util import unflatten_dict, flatten_dict
-from flax import linen as nn
-
-from haxllm.utils import load_transformer_params
-from haxllm.model.decode import random_sample, beam_search, chat
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import InMemoryHistory
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from transformers import AutoTokenizer
 
+import jax.numpy as jnp
+from haxllm.chat.inference import ChatIO, generate_stream, chat_loop
 from haxllm.chat.conversation import get_conv_template
+from haxllm.pipeline.text_generation import TextGenerationPipeline
 
 
+class SimpleChatIO(ChatIO):
+    def prompt_for_input(self, role) -> str:
+        return input(f"{role}: ")
 
-def find_pad_context_length(seq_len, multiple=64):
-    # Find the smallest multiple of `multiple` that is larger than seq_len
-    return (seq_len + multiple - 1) // multiple * multiple
+    def prompt_for_output(self, role: str):
+        print(f"{role}: ", end="", flush=True)
 
-
-class TextGenerationPipeline:
-    
-    def __init__(self, tokenizer, model, mesh=None, max_len=512, seed=0, two_stage=False, pad_context=None, pad_multiple=64):
-        self.seed = seed
-
-        tokenizer.decode(tokenizer("init")['input_ids'])
-        self.tokenizer = tokenizer
-
-        self.model = model
-        self.mesh = mesh
-        self.max_len = max_len
-        self.two_stage = two_stage
-        if two_stage:
-            pad_context = True
-        self.pad_context = pad_context
-        self.pad_multiple = pad_multiple
-
-        self._rng = random.PRNGKey(self.seed)
-
-        self.params = None
-        self.cache = None
-        self._apply_fn = None
-
-    def init(self, transformer_weight=None):
-        self._rng, init_rng = random.split(self._rng)
-        input_ids = jnp.zeros((1, self.max_len), dtype=jnp.int32)
-
-        def init_fn(init_rng, input_ids, model):
-            state = model.init(init_rng, input_ids=input_ids)
-            return state['params'], state['cache']
-
-        mesh = self.mesh
-        parallel = mesh is not None
-        if parallel:
-            device_mesh = mesh_utils.create_device_mesh(mesh, contiguous_submeshes=True)
-            mesh = Mesh(devices=device_mesh, axis_names=("X", "Y"))
-            load_device = mesh
-            print("Init model on {}".format(mesh))
-
-            abs_params, abs_cache = jax.eval_shape(
-                partial(init_fn, model=self.model), init_rng, input_ids)
-            params_spec = nn.get_partition_spec(abs_params)
-            cache_spec = nn.get_partition_spec(abs_cache)
-
-            p_init_fn = pjit(
-                partial(init_fn, model=self.model), out_shardings=(params_spec, cache_spec))
-            with mesh:
-                params, cache = p_init_fn(init_rng, input_ids)
-        else:
-            print("Init model on CPU")
-            load_device = 'cpu'
-            p_init_fn = jax.jit(partial(init_fn, model=self.model))
-
-            with jax.default_device(jax.devices("cpu")[0]):
-                params, cache = p_init_fn(init_rng, input_ids)
-
-        if transformer_weight:
-            params = unfreeze(flatten_dict(params, sep="."))
-            params = load_transformer_params(
-                params, transformer_weight, lm_head=True, device=load_device)
-            params = freeze(unflatten_dict(params, sep="."))
-
-        if not parallel:
-            params = jax.device_put(params, jax.devices()[0])
-            cache = jax.device_put(cache, jax.devices()[0])
-
-        def apply_fn(params, cache, input_ids, model):
-            logits, new_vars = model.apply(
-                {"params": params, "cache": cache},
-                input_ids=input_ids,
-                train=False,
-                mutable=["cache"],
-            )
-            return new_vars['cache'], logits
-
-        p_apply_fn = jax.jit(partial(apply_fn, model=self.model))
-
-        self._apply_fn = p_apply_fn
-        self.params = params
-        self.cache = cache
-    
-    def check_init(self):
-        if self.params is None or self.cache is None or self._apply_fn is None:
-            raise RuntimeError("Please call init() first.")
-
-    def prepare_call_args(self, sentence, max_len):
-        self.check_init()
-        input_ids = self.tokenizer(sentence)['input_ids']
-        max_len = max_len or self.max_len
-        if self.two_stage and self.pad_context:
-            pad_context = find_pad_context_length(len(input_ids), self.pad_multiple)
-        else:
-            pad_context = None
-        pad_token_id = self.tokenizer.pad_token_id
-        return input_ids, {
-            "max_len": max_len,
-            "two_stage": self.two_stage,
-            "pad_token_id": pad_token_id,
-            "pad_context": pad_context,
-        }
-
-    def greedy_search(self, sentence, max_len=None):
-        inputs, kwargs = self.prepare_call_args(sentence, max_len)
-        return random_sample(
-            inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-            temperature=0.0, **kwargs)
-    
-    def random_sample(self, sentence, temperature=1.0, topk=1, max_len=None, rng=None):
-        if rng is None:
-            self._rng, rng = random.split(self._rng)
-        inputs, kwargs = self.prepare_call_args(sentence, max_len)
-        return random_sample(
-            inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-            temperature=temperature, topk=topk, rng=rng, **kwargs)
-    
-    def beam_search(self, sentence, beam_size=1, max_len=None):
-        inputs, kwargs = self.prepare_call_args(sentence, max_len)
-        return beam_search(
-            inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-            n_beams=beam_size, **kwargs)
+    def stream_output(self, output_stream):
+        pre = 0
+        for outputs in output_stream:
+            output_text = outputs["text"]
+            output_text = output_text.strip().split(" ")
+            now = len(output_text) - 1
+            if now > pre:
+                print(" ".join(output_text[pre:now]), end=" ", flush=True)
+                pre = now
+        print(" ".join(output_text[pre:]), flush=True)
+        return " ".join(output_text)
 
 
-    def chat(self, max_len=None, temperature=1.0, topk=1, rng=None):
-        max_len = max_len or self.max_len
-        if rng is None:
-            self._rng, rng = random.split(self._rng)
-        conv = get_conv_template("vicuna_v1.1")
-        chat(conv, self.tokenizer, self._apply_fn, self.params, self.cache, max_len, temperature, topk, rng=rng)
+class RichChatIO(ChatIO):
+    def __init__(self):
+        self._prompt_session = PromptSession(history=InMemoryHistory())
+        self._completer = WordCompleter(
+            words=["!!exit", "!!reset"], pattern=re.compile("$")
+        )
+        self._console = Console()
+
+    def prompt_for_input(self, role) -> str:
+        self._console.print(f"[bold]{role}:")
+        # TODO(suquark): multiline input has some issues. fix it later.
+        prompt_input = self._prompt_session.prompt(
+            completer=self._completer,
+            multiline=False,
+            auto_suggest=AutoSuggestFromHistory(),
+            key_bindings=None,
+        )
+        self._console.print()
+        return prompt_input
+
+    def prompt_for_output(self, role: str):
+        self._console.print(f"[bold]{role}:")
+
+    def stream_output(self, output_stream):
+        """Stream output from a role."""
+        # TODO(suquark): the console flickers when there is a code block
+        #  above it. We need to cut off "live" when a code block is done.
+
+        # Create a Live context for updating the console output
+        with Live(console=self._console, refresh_per_second=4) as live:
+            # Read lines from the stream
+            for outputs in output_stream:
+                if not outputs:
+                    continue
+                text = outputs["text"]
+                # Render the accumulated text as Markdown
+                # NOTE: this is a workaround for the rendering "unstandard markdown"
+                #  in rich. The chatbots output treat "\n" as a new line for
+                #  better compatibility with real-world text. However, rendering
+                #  in markdown would break the format. It is because standard markdown
+                #  treat a single "\n" in normal text as a space.
+                #  Our workaround is adding two spaces at the end of each line.
+                #  This is not a perfect solution, as it would
+                #  introduce trailing spaces (only) in code block, but it works well
+                #  especially for console output, because in general the console does not
+                #  care about trailing spaces.
+                lines = []
+                for line in text.splitlines():
+                    lines.append(line)
+                    if line.startswith("```"):
+                        # Code block marker - do not add trailing spaces, as it would
+                        #  break the syntax highlighting
+                        lines.append("\n")
+                    else:
+                        lines.append("  \n")
+                markdown = Markdown("".join(lines))
+                # Update the Live console output
+                live.update(markdown)
+        self._console.print()
+        return text
+
+
+class ProgrammaticChatIO(ChatIO):
+    def prompt_for_input(self, role) -> str:
+        print(f"[!OP:{role}]: ", end="", flush=True)
+        contents = ""
+        # `end_sequence` is a randomly-generated, 16-digit number
+        #  that signals the end of a message. It is unlikely to occur in
+        #  message content.
+        end_sequence = "9745805894023423"
+        while True:
+            if len(contents) >= 16:
+                last_chars = contents[-16:]
+                if last_chars == end_sequence:
+                    break
+            try:
+                char = sys.stdin.read(1)
+                contents = contents + char
+            except EOFError:
+                continue
+        return contents[:-16]
+
+    def prompt_for_output(self, role: str):
+        print(f"[!OP:{role}]: ", end="", flush=True)
+
+    def stream_output(self, output_stream):
+        pre = 0
+        for outputs in output_stream:
+            output_text = outputs["text"]
+            output_text = output_text.strip().split(" ")
+            now = len(output_text) - 1
+            if now > pre:
+                print(" ".join(output_text[pre:now]), end=" ", flush=True)
+                pre = now
+        print(" ".join(output_text[pre:]), flush=True)
+        return " ".join(output_text)
 
 
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
@@ -170,8 +150,17 @@ def chat_app(cfg: DictConfig) -> None:
     import logging
     logging.getLogger("jax").setLevel(logging.WARNING)
 
+    if cfg.style == "simple":
+        chatio = SimpleChatIO()
+    elif cfg.style == "rich":
+        chatio = RichChatIO()
+    elif cfg.style == "programmatic":
+        chatio = ProgrammaticChatIO()
+    else:
+        raise ValueError(f"Invalid style for console: {cfg.style}")
+
     start = time.time()
-    jax_smi.initialise_tracking()
+    # jax_smi.initialise_tracking()
 
     model_config = OmegaConf.to_container(cfg.model, resolve=True)
     random_seed = cfg.seed
@@ -180,6 +169,12 @@ def chat_app(cfg: DictConfig) -> None:
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
         raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
+
+    temperature = cfg.temperature
+    max_len = cfg.max_len
+    conv_template = cfg.model.conv_template
+    debug = cfg.debug
+
     assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
 
     print(f"Loading tokenizer from {tokenizer_name}...")
@@ -200,18 +195,26 @@ def chat_app(cfg: DictConfig) -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = config.pad_token_id
-    # tokenizer.padding_side = "right"
 
     model = getattr(mod, "TransformerLMHeadModel")(config)
 
     print("Load config {}".format(time.time() - start))
 
     pipeline = TextGenerationPipeline(
-        tokenizer, model, mesh=mesh, max_len=cfg.max_len, seed=random_seed)
-
+        tokenizer, model, mesh=mesh, max_len=max_len, seed=random_seed)
     pipeline.init(transformer_weight=checkpoint)
 
-    pipeline.chat(max_len=cfg.max_len, temperature=cfg.temperature, topk=cfg.topk)
+    try:
+        chat_loop(
+            pipeline,
+            chatio,
+            temperature=temperature,
+            max_len=max_len,
+            conv_template=conv_template,
+            debug=debug,
+        )
+    except KeyboardInterrupt:
+        print("exit...")
 
 
 if __name__ == "__main__":

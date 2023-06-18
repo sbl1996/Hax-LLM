@@ -14,6 +14,7 @@ class SeparatorStyle(Enum):
     DOLLY = auto()
     RWKV = auto()
     PHOENIX = auto()
+    CHAT_GLM = auto()
 
 
 @dataclasses.dataclass
@@ -39,27 +40,27 @@ class Conversation:
     # Stops generation if meeting any token in this list
     stop_token_ids: List[int] = None
 
-    def get_next_input(self) -> str:
-        """Get the next input for the model."""
-        if self.sep_style == SeparatorStyle.ADD_COLON_TWO:
-            seps = [self.sep, self.sep2]
-            if len(self.messages) == 2:
-                ret = self.system + self.sep
-                messages = self.messages
-            elif len(self.messages) > 2:
-                assert len(self.messages) % 2 == 0 and self.messages[-1][1] is None
-                ret = seps[1]
-                messages = self.messages[-2:]
-            else:
-                raise ValueError(f"Invalid number of messages: {len(self.messages)}")
-            for i, (role, message) in enumerate(messages):
-                if message:
-                    ret += role + ": " + message + seps[i % 2]
-                else:
-                    ret += role + ":"
-            return ret
-        else:
-            raise ValueError(f"Invalid style: {self.sep_style}")
+    # def get_next_input(self) -> str:
+    #     """Get the next input for the model."""
+    #     if self.sep_style == SeparatorStyle.ADD_COLON_TWO:
+    #         seps = [self.sep, self.sep2]
+    #         if len(self.messages) == 2:
+    #             ret = self.system + self.sep
+    #             messages = self.messages
+    #         elif len(self.messages) > 2:
+    #             assert len(self.messages) % 2 == 0 and self.messages[-1][1] is None
+    #             ret = seps[1]
+    #             messages = self.messages[-2:]
+    #         else:
+    #             raise ValueError(f"Invalid number of messages: {len(self.messages)}")
+    #         for i, (role, message) in enumerate(messages):
+    #             if message:
+    #                 ret += role + ": " + message + seps[i % 2]
+    #             else:
+    #                 ret += role + ":"
+    #         return ret
+    #     else:
+    #         raise ValueError(f"Invalid style: {self.sep_style}")
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -135,6 +136,16 @@ class Conversation:
                     ret += role + ": " + "<s>" + message + "</s>"
                 else:
                     ret += role + ": " + "<s>"
+            return ret
+        elif self.sep_style == SeparatorStyle.CHAT_GLM:
+            ret = self.system + '\n'
+            for i, (role, message) in enumerate(self.messages):
+                if i % 2 == 0:
+                    ret += f"[Round {i}]\n{role}：{message}"
+                else:
+                    ret += f"\n{role}："
+                    if message:
+                        ret += message + '\n'
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -225,5 +236,19 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",
         sep2="</s>",
+    )
+)
+
+
+# ChatGLM-6B template
+register_conv_template(
+    Conversation(
+        name="chatglm-6b",
+        system="",
+        roles=("问", "答"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.CHAT_GLM,
+        sep="\n",
     )
 )
