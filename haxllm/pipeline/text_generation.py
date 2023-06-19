@@ -130,13 +130,13 @@ class TextGenerationPipeline:
             inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
             temperature=0.0, **kwargs)
     
-    def random_sample(self, sentence, temperature=1.0, topk=1, max_len=None, rng=None):
+    def random_sample(self, sentence, temperature=1.0, top_k=-1, top_p=1.0, max_len=None, rng=None):
         if rng is None:
             self._rng, rng = random.split(self._rng)
         inputs, kwargs = self.prepare_call_args(sentence, max_len)
         return random_sample(
             inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-            temperature=temperature, topk=topk, rng=rng, **kwargs)
+            temperature=temperature, top_k=top_k, top_p=top_p, rng=rng, **kwargs)
     
     def beam_search(self, sentence, beam_size=1, max_len=None):
         inputs, kwargs = self.prepare_call_args(sentence, max_len)
@@ -156,6 +156,7 @@ class TextGenerationPipeline:
             inputs = jnp.full((1, pad_context), pad_token_id, dtype=jnp.int32)
             inputs = inputs.at[:, :seq_len].set(input_ids)
             cache, logits = self._apply_fn(self.params, cache, inputs)
+            logits = logits[:, :seq_len]
             cache = fix_cache_index(cache, seq_len)
         else:
             for i in range(seq_len):
@@ -163,20 +164,3 @@ class TextGenerationPipeline:
         logits = logits.astype(jnp.float32)
         self._ccache = cache
         return logits
-
-
-def chat_round(tokens, tokenizer, apply_fn, params, live_seq, i, cache, max_len, temperature=1.0, topk=10, rng=None):
-    live_seq = live_seq.at[:, i:i+len(tokens)].set(tokens)
-    context_length = i + len(tokens)
-    while i < max_len:
-        input_ids = live_seq[:, [i]]
-        cache, logits = apply_fn(params, cache, input_ids)
-        i += 1
-        if i < context_length:
-            continue
-        logits = logits.astype(jnp.float32)[0, 0]
-        token, rng = sample_token(logits, rng, temperature, topk)
-        if token in [tokenizer.eos_token_id, 0]:
-            break
-        live_seq = live_seq.at[:, i].set(token)
-    return live_seq, i, cache

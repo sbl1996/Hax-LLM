@@ -138,10 +138,13 @@ class Conversation:
                     ret += role + ": " + "<s>"
             return ret
         elif self.sep_style == SeparatorStyle.CHAT_GLM:
-            ret = self.system + '\n'
+            if self.system:
+                ret = self.system + '\n'
+            else:
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i}]\n{role}：{message}"
+                    ret += f"[Round {i // 2}]\n{role}：{message}"
                 else:
                     ret += f"\n{role}："
                     if message:
@@ -250,5 +253,6 @@ register_conv_template(
         offset=0,
         sep_style=SeparatorStyle.CHAT_GLM,
         sep="\n",
+        stop_token_ids=[0],
     )
 )

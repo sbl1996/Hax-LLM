@@ -6,7 +6,7 @@ import jax.numpy as jnp
 
 from haxllm.chat.conversation import get_conv_template
 from haxllm.pipeline.text_generation import TextGenerationPipeline
-from haxllm.model.decode import sample_token
+from haxllm.model.decode import sample_token, split_rng
 
 
 def partial_stop(output, stop_str):
@@ -22,7 +22,7 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
     len_prompt = len(prompt)
     temperature = float(params.get("temperature", 1.0))
     # repetition_penalty = float(params.get("repetition_penalty", 1.0))
-    # top_p = float(params.get("top_p", 1.0))
+    top_p = float(params.get("top_p", 1.0))
     top_k = int(params.get("top_k", -1))  # -1 means disable
     stop_str = params.get("stop", None)
     echo = bool(params.get("echo", True))
@@ -43,10 +43,15 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
     if pipeline._ccache is None or reset_cache:
         cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), pipeline.cache)
         pipeline._ccache = cache
-    pre = int(pipeline._ccache['transformer']['hs']['attn']['cache_index'][0])
+    cache = pipeline._ccache['transformer']
+    if 'hs' in cache:
+        pre = int(cache['hs']['attn']['cache_index'][0])
+    else:
+        pre = int(cache['h_0']['attn']['cache_index'])
+    del cache
     once = once and pre == 0
 
-    if temperature < 1e-5:
+    if temperature < 1e-5 or top_k == 1:
         rng = None
     else:
         pipeline._rng, rng = jax.random.split(pipeline._rng)
@@ -59,7 +64,8 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
             logits = pipeline.stream_forward(
                 jnp.array([[token]], dtype=jnp.int32))
 
-        token, rng = sample_token(logits[0, -1, :], rng, temperature, top_k) 
+        rng, subrng = split_rng(rng)
+        token = sample_token(logits[0, -1, :], subrng, temperature, top_p, top_k) 
         token = int(token)
 
         output_ids.append(token)
@@ -158,9 +164,11 @@ class ChatIO(abc.ABC):
 def chat_loop(
     pipeline: TextGenerationPipeline,
     chatio: ChatIO,
-    temperature: float,
     max_len: int,
     conv_template: str,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
     debug: bool = False,
 ):
     def new_chat():
@@ -196,6 +204,8 @@ def chat_loop(
         gen_params = {
             "prompt": prompt,
             "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
             # "repetition_penalty": repetition_penalty,
             # "max_new_tokens": max_new_tokens,
             "stop": conv.stop_str,

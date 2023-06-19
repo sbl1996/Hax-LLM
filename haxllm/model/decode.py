@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 
@@ -24,31 +26,60 @@ def gather_beams(xs, indices):
 def fix_cache_index(cache, true_index):
     if isinstance(cache, FrozenDict):
         cache = unfreeze(cache)
-    v = cache['transformer']['hs']['attn']['cache_index']
-    cache['transformer']['hs']['attn']['cache_index'] = jnp.full_like(v, true_index)
+    if 'hs' in cache['transformer']:
+        v = cache['transformer']['hs']['attn']['cache_index']
+        cache['transformer']['hs']['attn']['cache_index'] = jnp.full_like(v, true_index)
+    else:
+        keys = [ k for k in cache['transformer'] if k.startswith('h_') ]
+        for key in keys:
+            v = cache['transformer'][key]['attn']['cache_index']
+            cache['transformer'][key]['attn']['cache_index'] = jnp.full_like(v, true_index)
     return cache
 
 
-def sample_token(logits, rng, temperature=1.0, topk=5):
-    if temperature == 0:
-        token = jnp.argmax(logits)
-    elif topk > 1:
-        logits, tokens = jax.lax.top_k(logits, topk)
-        logits = logits / temperature
-        rng, subrng = jax.random.split(rng)
-        index = jax.random.categorical(subrng, logits, axis=-1)
-        token = tokens[index]
+@jax.jit
+def sample_token_top_p(logits, rng, p):
+    sorted_indices = jnp.argsort(logits)[::-1]
+    sorted_logits = logits[sorted_indices]
+    cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits))
+    mask = cumulative_probs > p
+    mask = jnp.concatenate([jnp.zeros((1,), dtype=jnp.bool_), mask[:-1]])
+    sorted_logits = jnp.where(mask, -float('Inf'), sorted_logits)
+    token = jax.random.categorical(rng, sorted_logits)
+    token = sorted_indices[token]
+    return token
+
+
+@partial(jax.jit, static_argnums=(-1,))
+def sample_token_top_k(logits, rng, k):
+    logits, tokens = jax.lax.top_k(logits, k)
+    index = jax.random.categorical(rng, logits)
+    token = tokens[index]
+    return token
+
+
+def sample_token(logits, rng, temperature: float = 1.0, top_p: float = 1.0, top_k: int = -1):
+    if temperature < 1e-5 or top_k == 1:
+        return jnp.argmax(logits)
+    logits = logits / temperature
+    if top_k > 1:
+        return sample_token_top_k(logits, rng, top_k)
+    elif top_p < 1.0:
+        return sample_token_top_p(logits, rng, top_p)
     else:
-        logits = logits / temperature
-        rng, subrng = jax.random.split(rng)
-        token = jax.random.categorical(subrng, logits, axis=-1)
-    return token, rng
+        return jax.random.categorical(rng, logits),
+
+
+def split_rng(rng):
+    if rng is None:
+        return None, None
+    return jax.random.split(rng)
 
 
 def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
-                  temperature=1.0, topk=10, rng=None, two_stage=False, pad_context=None, pad_token_id=None):
-    if temperature != 0:
-        assert rng is not None, "Must provide rng if temperature != 0"
+                  temperature=1.0, top_k=10, top_p=1.0, rng=None, two_stage=False, pad_context=None, pad_token_id=None):
+    if temperature < 1e-5 or top_k != 1:
+        assert rng is not None, "Must provide rng if not using greedy decoding"
     if pad_context is not None:
         assert two_stage, "Must use two_stage if pad_context is not None"
         assert pad_token_id is not None, "Must provide pad_token_id if pad_context is not None"
@@ -72,7 +103,8 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         input_ids = live_seq[:, :first_len]
         cache, logits = apply_fn(params, cache, input_ids)
         logits = logits.astype(jnp.float32)[0, context_length-1]
-        token, rng = sample_token(logits, rng, temperature, topk)
+        rng, subrng = split_rng(rng)
+        token = sample_token(logits, subrng, temperature, top_p, top_k)
         live_seq = live_seq.at[:, context_length].set(token)
         if pad_context is not None:
             cache = fix_cache_index(cache, context_length)
@@ -87,7 +119,8 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         if i < context_length:
             continue
         logits = logits.astype(jnp.float32)[0, 0]
-        token, rng = sample_token(logits, rng, temperature, topk)
+        rng, subrng = split_rng(rng)
+        token = sample_token(logits, subrng, temperature, top_p, top_k)
         live_seq = live_seq.at[:, i].set(token)
         if token in [tokenizer.eos_token_id, 0]:
             break

@@ -165,14 +165,15 @@ def chat_app(cfg: DictConfig) -> None:
     model_config = OmegaConf.to_container(cfg.model, resolve=True)
     random_seed = cfg.seed
     tokenizer_name = model_config.pop("tokenizer")
+    conv_template = model_config.pop("conv_template")
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
         raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
 
-    temperature = cfg.temperature
-    max_len = cfg.max_len
-    conv_template = cfg.model.conv_template
+    temperature = getattr(cfg, "temperature", 1.0)
+    top_p = getattr(cfg, "top_p", 1.0)
+    top_k = getattr(cfg, "top_k", -1)
     debug = cfg.debug
 
     assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
@@ -200,6 +201,7 @@ def chat_app(cfg: DictConfig) -> None:
 
     print("Load config {}".format(time.time() - start))
 
+    max_len = getattr(cfg, "max_len", config.n_positions)
     pipeline = TextGenerationPipeline(
         tokenizer, model, mesh=mesh, max_len=max_len, seed=random_seed)
     pipeline.init(transformer_weight=checkpoint)
@@ -209,6 +211,8 @@ def chat_app(cfg: DictConfig) -> None:
             pipeline,
             chatio,
             temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             max_len=max_len,
             conv_template=conv_template,
             debug=debug,
