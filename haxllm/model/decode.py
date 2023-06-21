@@ -67,7 +67,7 @@ def sample_token(logits, rng, temperature: float = 1.0, top_p: float = 1.0, top_
     elif top_p < 1.0:
         return sample_token_top_p(logits, rng, top_p)
     else:
-        return jax.random.categorical(rng, logits),
+        return jax.random.categorical(rng, logits)
 
 
 def split_rng(rng):

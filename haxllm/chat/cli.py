@@ -165,7 +165,7 @@ def chat_app(cfg: DictConfig) -> None:
     model_config = OmegaConf.to_container(cfg.model, resolve=True)
     random_seed = cfg.seed
     tokenizer_name = model_config.pop("tokenizer")
-    conv_template = model_config.pop("conv_template")
+    conv_template = model_config.pop("conv_template", None)
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:

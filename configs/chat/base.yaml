@@ -15,9 +15,9 @@ param_dtype: bfloat16
 mesh: [1, 8]
 
 max_len: 2048
-temperature: 0.95
+temperature: 0.0
 top_k: -1
-top_p: 0.7
+top_p: 1.0
 
 checkpoint: null
 

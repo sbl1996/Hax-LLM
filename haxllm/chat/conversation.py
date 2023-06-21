@@ -15,6 +15,7 @@ class SeparatorStyle(Enum):
     RWKV = auto()
     PHOENIX = auto()
     CHAT_GLM = auto()
+    NON_CHAT = auto()
 
 
 @dataclasses.dataclass
@@ -150,6 +151,17 @@ class Conversation:
                     if message:
                         ret += message + '\n'
             return ret
+        elif self.sep_style == SeparatorStyle.NON_CHAT:
+            if self.system:
+                ret = self.system + '\n'
+            else:
+                ret = ""
+            if len(self.messages) > 2:
+                print("Warning: more than 2 messages in NON_CHAT mode.")
+            for role, message in self.messages:
+                if message:
+                    ret += message
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -225,6 +237,20 @@ def register_conv_template(template: Conversation, override: bool = False):
 def get_conv_template(name: str) -> Conversation:
     """Get a conversation template."""
     return conv_templates[name].copy()
+
+
+# Non-chat template for models like Llama
+register_conv_template(
+    Conversation(
+        name="non_chat",
+        system="",
+        roles=("USER", "ASSISTANT"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.NON_CHAT,
+        sep=" ",
+    )
+)
 
 
 # Vicuna v1.1 template
