@@ -11,6 +11,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, NamedSharding, Mesh
+from jax.experimental import mesh_utils
 
 from flax import linen as nn
 from flax import traverse_util
@@ -143,6 +144,12 @@ def pad(x, batch_size):
     return x
 
 
+def shard(xs):
+    local_device_count = jax.local_device_count()
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((local_device_count, -1) + x.shape[1:]), xs)
+
+
 def replace_val(p, x):
     if isinstance(p, nn.Partitioned):
         return p.replace_boxed(x)
@@ -150,8 +157,27 @@ def replace_val(p, x):
         return x
  
 
-def get_partition_spec(p: nn.Partitioned):
-    return p.get_partition_spec()
+def inspect_tree(tree):
+    flatten_tree = flatten_dict(tree, sep=".")
+    for k, v in flatten_tree.items():
+        if isinstance(v, nn.Partitioned):
+            val = v.value
+            print(f"{k}: {val.shape} {val.dtype}, {v.mesh}")
+        else:
+            print(f"{k}: {v.shape} {v.dtype}")
+
+
+def _get_sharding(xs, mesh):
+    spec = nn.get_partition_spec(xs)
+    sharding = jax.tree_map(lambda p: NamedSharding(mesh, p), spec)
+    return sharding
+
+
+def get_sharding(mesh, fun, *args, **kwargs):
+    xs = jax.eval_shape(fun, *args, **kwargs)
+    spec = nn.get_partition_spec(xs)
+    sharding = jax.tree_map(lambda p: NamedSharding(mesh, p), spec)
+    return sharding
 
 
 def load_transformer_params(
@@ -280,13 +306,48 @@ def calculate_num_params_from_pytree(params):
     return total_parameters
 
 
-def calculate_training_tflops(num_model_parameters, max_len, per_device_batch_size, config):
+def calculate_training_tflops(num_model_parameters, per_device_batch_size, max_len, hidden_size, n_layers):
     matmul_tflops = 6 * num_model_parameters * max_len * per_device_batch_size / 10**12
-    attention_tflops = 12 * config.hidden_size * config.n_layers * max_len**2 * per_device_batch_size / 10**12
+    attention_tflops = 12 * hidden_size * n_layers * max_len**2 * per_device_batch_size / 10**12
     total_tflops = matmul_tflops + attention_tflops
     print(f'Per train step, total TFLOPs will be {total_tflops:.2f}, split as {100 * matmul_tflops/total_tflops:.2f}% matmul',
         f'and {100 * attention_tflops/total_tflops:.2f}% attention')
     return matmul_tflops + attention_tflops
+
+
+def infer_model_config(params):
+    params = params['transformer']
+    if 'hs' in params:
+        # scan, length=1,2
+        p = params['hs']['ln_1']['scale']
+        hidden_size = p.shape[-1]
+        n_layers = p.shape[0]
+    elif 'hs_0' in params:
+        # scan, length=3
+        p = params['hs_0']['ln_1']['scale']
+        hidden_size = p.shape[-1]
+        n_layers = p.shape[0] * len([k for k in params.keys() if k.startswith('hs_')])
+    else:
+        p = params['h_0']['ln_1']['scale']
+        hidden_size = p.shape[-1]
+        n_layers = len([k for k in params.keys() if k.startswith('h_')])
+    return hidden_size, n_layers
+
+
+def report_params_and_flops(params, max_len, batch_size):
+    n_devices = jax.local_device_count()
+    per_device_batch_size = batch_size // n_devices
+    num_model_parameters = calculate_num_params_from_pytree(params)
+    print(f"number parameters: {num_model_parameters/10**9:.3f} billion")
+    hidden_size, n_layers = infer_model_config(params)
+    per_device_tflops = calculate_training_tflops(num_model_parameters, max_len, per_device_batch_size, hidden_size, n_layers)
+    return per_device_tflops * n_devices
+
+
+def create_mesh(mesh_shape, axis_names=("X", "Y")):
+    device_mesh = mesh_utils.create_device_mesh(mesh_shape, contiguous_submeshes=True)
+    mesh = Mesh(devices=device_mesh, axis_names=axis_names)
+    return mesh
 
 
 class MovingAverage:

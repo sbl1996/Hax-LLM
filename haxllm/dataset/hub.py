@@ -32,7 +32,16 @@ def load_for_sequnece_classification(dataset, preprocess_fn):
     input_ids = tokenized_dataset["input_ids"] # type: ignore
     attention_mask = tokenized_dataset["attention_mask"] # type: ignore
     labels = tokenized_dataset["label"] # type: ignore
-    return input_ids, attention_mask, labels
+    return {"inputs": input_ids, "attn_mask": attention_mask, "labels": labels}
+
+
+def load_for_causal_lm(dataset, preprocess_fn):
+    tokenized_dataset = dataset.map(preprocess_fn, batched=True)
+    columns = ["input_ids", "labels"]
+    tokenized_dataset.set_format(type="numpy", columns=columns) # type: ignore
+    input_ids = tokenized_dataset["input_ids"] # type: ignore
+    labels = tokenized_dataset["labels"] # type: ignore
+    return {"input_ids": input_ids, "labels": labels}
 
 
 def create_dataset(
@@ -43,6 +52,7 @@ def create_dataset(
     batch_size=128,
     seed=42,
     sub_ratio=None,
+    task_type="sequnece_classification",
     loader="tf",
     cache_dir=None,
     num_workers=0,
@@ -73,38 +83,50 @@ def create_dataset(
     else:
         train_sub_ratio = eval_sub_ratio = None
     
+    if task_type == "sequnece_classification":
+        task_load_fn = load_for_sequnece_classification
+    elif task_type == "causal_lm":
+        task_load_fn = load_for_causal_lm
+    else:
+        raise ValueError(f"Unknown task type {task_type}")
+
     preprocess_fn = lambda x: preprocess_fn_(tokenizer, x, max_len, **kwargs)
     ds_train = load_fn(train_split, cache_dir=cache_dir)
-    train_input_ids, train_attention_mask, train_labels = load_for_sequnece_classification(ds_train, preprocess_fn)
+    train_data = task_load_fn(ds_train, preprocess_fn)
+    keys = list(train_data.keys())
+    train_data = tuple(train_data[k] for k in keys)
 
     if eval_split == "validation" and options.get("split_train_for_validation", False):
         test_size = options.get("split_ratio", 0.2)
-        train_input_ids, eval_input_ids, train_attention_mask, eval_attention_mask, train_labels, eval_labels = train_test_split(
-            train_input_ids, train_attention_mask, train_labels, test_size=test_size, random_state=seed)
+        train_and_eval_data = train_test_split(
+            *train_data, test_size=test_size, random_state=seed)
+        train_data = train_and_eval_data[::2]
+        eval_data = train_and_eval_data[1::2]
     else:
         ds_eval = load_fn(eval_split, cache_dir=cache_dir)
-        eval_input_ids, eval_attention_mask, eval_labels = load_for_sequnece_classification(ds_eval, preprocess_fn)
+        eval_data = task_load_fn(ds_eval, preprocess_fn)
+        eval_data = tuple(eval_data[k] for k in keys)
 
     # shuffle train data first
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(train_input_ids))
-    train_input_ids = train_input_ids[perm]
-    train_attention_mask = train_attention_mask[perm]
-    train_labels = train_labels[perm]
+    perm = rng.permutation(len(train_data[0]))
+    train_data = tuple(x[perm] for x in train_data)
 
     if train_sub_ratio is not None:
-        train_input_ids, _, train_attention_mask, _, train_labels, _ = train_test_split(
-            train_input_ids, train_attention_mask, train_labels, test_size=1-train_sub_ratio, random_state=seed)
+        train_data = train_test_split(*train_data, test_size=1-train_sub_ratio, random_state=seed)[::2]
     if eval_sub_ratio is not None:
-        eval_input_ids, _, eval_attention_mask, _, eval_labels, _ = train_test_split(
-            eval_input_ids, eval_attention_mask, eval_labels, eval_size=1-eval_sub_ratio, random_state=seed)
+        eval_data = train_test_split(eval_data, eval_size=1-eval_sub_ratio, random_state=seed)[::2]
 
-    train_data = {"inputs": train_input_ids, "attn_mask": train_attention_mask, "labels": train_labels}
-    eval_data = {"inputs": eval_input_ids, "attn_mask": eval_attention_mask, "labels": eval_labels}
+    train_data = dict(zip(keys, train_data))
+    eval_data = dict(zip(keys, eval_data))
 
     def cast_dtype(x):
-        x["inputs"] = x["inputs"].astype(np.int32)
-        x["attn_mask"] = x["attn_mask"].astype(np.bool_)
+        if "inputs" in x:
+            x["inputs"] = x["inputs"].astype(np.int32)
+        if "input_ids" in x:
+            x["input_ids"] = x["input_ids"].astype(np.int32)
+        if "attn_mask" in x:
+            x["attn_mask"] = x["attn_mask"].astype(np.bool_)
         return x
 
     train_data = cast_dtype(train_data)

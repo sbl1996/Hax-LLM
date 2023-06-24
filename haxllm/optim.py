@@ -1,4 +1,4 @@
-from optax import Schedule, join_schedules, linear_schedule
+from optax import Schedule, join_schedules, linear_schedule, chain, trace, identity, add_decayed_weights, scale, scale_by_schedule
 
 
 def warmup_linear_decay_schedule(
@@ -33,4 +33,27 @@ def warmup_linear_decay_schedule(
     ]
     return join_schedules(schedules, [warmup_steps])
 
-  
+
+# Copy from optax._src.alias
+def _scale_by_learning_rate(learning_rate, flip_sign=True):
+    m = -1 if flip_sign else 1
+    if callable(learning_rate):
+        return scale_by_schedule(lambda count: m * learning_rate(count))
+    return scale(m * learning_rate)
+
+
+# Copy from optax._src.adamw and sgd
+def sgdw(
+    learning_rate,
+    momentum=None,
+    nesterov=False,
+    accumulator_dtype=None,
+    weight_decay=None,
+    mask=None,
+):
+    return chain(
+        (trace(decay=momentum, nesterov=nesterov, accumulator_dtype=accumulator_dtype)
+         if momentum is not None else identity()),
+        (add_decayed_weights(weight_decay, mask) if weight_decay else identity()),
+        _scale_by_learning_rate(learning_rate)
+  )

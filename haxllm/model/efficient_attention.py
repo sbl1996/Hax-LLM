@@ -3,11 +3,34 @@ from jax import lax
 from jax import numpy as jnp
 
 
-def make_casual_mask(row_start, row_size, col_start, col_size):
-    """Create a mask to prevent attention to the future."""
+def make_causal_mask(row_start, row_size, col_start, col_size):
+    r"""
+    Make a mask for a chunk of queries against a chunk of keys.
+
+    Returns
+    -------
+    mask: jnp.ndarray, shape (row_size, 1, col_size)
+    
+    """
     mask = (row_start + jnp.arange(0, row_size)[:, None]) >= \
-        (col_start + jnp.arange(0, col_size))
+        (col_start + jnp.arange(0, col_size)[None, :])
     return jnp.expand_dims(mask, axis=1)
+
+
+def make_padding_mask(row_start, row_size, col_start, col_size, pad_position):
+    pad_position = jnp.where(pad_position == -1, col_size, pad_position)
+    mask = col_start + jnp.arange(0, col_size) < pad_position
+    mask = jnp.expand_dims(mask, axis=(0, 1))
+    return mask
+
+
+def make_bidirectional_mask(row_start, row_size, col_start, col_size, context_length):
+    mask1 = col_start + jnp.arange(0, col_size) < context_length
+    mask2 = (row_start + jnp.arange(0, row_size)[:, None]) >= \
+        (col_start + jnp.arange(0, col_size)[None, :])
+    mask = mask1[None, :] | mask2
+    mask = jnp.expand_dims(mask, axis=1)
+    return mask
 
 
 def _query_chunk_attention(
@@ -15,7 +38,9 @@ def _query_chunk_attention(
     key,
     value,
     query_chunk_idx,
-    causal=True,
+    pad_position=None,
+    context_length=None,
+    mask_mode='causal',
     sparse=False,
     key_chunk_size=4096,
     precision=None,
@@ -33,9 +58,19 @@ def _query_chunk_attention(
         attn_weights = jnp.einsum(
             "qhd,khd->qhk", query, key, precision=precision
         ).astype(dtype)
-        if causal:
-            mask = make_casual_mask(
+        if mask_mode == 'causal':
+            mask = make_causal_mask(
                 query_chunk_idx, query_chunk_size, chunk_idx, key_chunk_size
+            )
+            attn_weights = jnp.where(mask, attn_weights, big_neg)
+        elif mask_mode == 'padding':
+            mask = make_padding_mask(
+                query_chunk_idx, query_chunk_size, chunk_idx, key_chunk_size, pad_position
+            )
+            attn_weights = jnp.where(mask, attn_weights, big_neg)
+        elif mask_mode == 'bidirectional':
+            mask = make_bidirectional_mask(
+                query_chunk_idx, query_chunk_size, chunk_idx, key_chunk_size, context_length
             )
             attn_weights = jnp.where(mask, attn_weights, big_neg)
         max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
@@ -101,7 +136,9 @@ def _mefficient_attention(
     query,
     key,
     value,
-    causal=True,
+    pad_position=None,
+    context_length=None,
+    mask_mode='causal',
     sparse=False,
     query_chunk_size=1024,
     key_chunk_size=4096,
@@ -120,7 +157,8 @@ def _mefficient_attention(
             chunk_idx + query_chunk_size,
             _query_chunk_attention(
                 query_chunk, key, value, chunk_idx,
-                causal=causal, sparse=sparse,
+                pad_position, context_length,
+                mask_mode=mask_mode, sparse=sparse,
                 key_chunk_size=key_chunk_size,
                 precision=precision, dtype=dtype
             ),
@@ -133,18 +171,27 @@ def _mefficient_attention(
 
 
 # TODO: add support for key_padding_mask
-@functools.partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
+@functools.partial(jax.jit, static_argnums=(5, 6, 7, 8, 9, 10))
 def dot_product_attention(
     query,
     key,
     value,
-    causal=True,
+    pad_position=None,
+    context_length=None,
+    mask_mode='causal',
     sparse=False,
     query_chunk_size=1024,
     key_chunk_size=4096,
     precision=None,
     dtype=jnp.float32,
 ):
-    return jax.vmap(_mefficient_attention, in_axes=(0, 0, 0, None, None, None, None, None, None))(
-        query, key, value, causal, sparse, query_chunk_size, key_chunk_size, precision, dtype
-    )
+    assert mask_mode in ['causal', 'padding', 'bidirectional', 'none']
+    if mask_mode == 'padding':
+        assert pad_position is not None
+    elif mask_mode == 'bidirectional':
+        assert context_length is not None
+    fun = functools.partial(
+        _mefficient_attention, mask_mode=mask_mode, sparse=sparse,
+        query_chunk_size=query_chunk_size, key_chunk_size=key_chunk_size,
+        precision=precision, dtype=dtype)
+    return jax.vmap(fun, in_axes=(0, 0, 0, 0, 0))(query, key, value, pad_position, context_length)

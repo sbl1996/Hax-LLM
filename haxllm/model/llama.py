@@ -71,7 +71,7 @@ class TransformerConfig(RematScanConfigMixin):
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     decode: bool = False
-    memory_efficient: bool = False
+    memory_efficient_attention: bool = False
     shard: bool = False
 
 
@@ -83,10 +83,10 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
-        if not config.memory_efficient and not config.decode:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
-        else:
+        if config.memory_efficient_attention or config.decode:
             mask = None
+        else:
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
@@ -98,7 +98,8 @@ class TransformerBlock(nn.Module):
             kernel_init=config.kernel_init,
             use_bias=False,
             decode=config.decode,
-            # memory_efficient=config.memory_efficient,
+            memory_efficient=config.memory_efficient_attention,
+            memory_efficient_mask_mode='causal',
             rope=True,
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),

@@ -43,7 +43,7 @@ if __name__ == "__main__":
             bin_files = sorted(model_dir.glob("model-*.safetensors"))
         if not bin_files:
             raise ValueError("No model files found in {}".format(model_dir))
-        model_name = model_dir.stem
+        model_name = model_dir.name
     
     if bin_files[0].suffix == ".bin":
         file_type = "bin"

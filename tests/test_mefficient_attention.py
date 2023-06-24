@@ -19,7 +19,10 @@ def fresh():
 batch_size = 16
 num_heads = 4
 feature_dims = 128
-causal = True
+mask_mode = 'bidirectional'
+# pad_position = jax.random.randint(fresh(), (batch_size,), 0, 64)
+pad_position = None
+context_length = jax.random.randint(fresh(), (batch_size,), 0, 64)
 
 
 def fresh_qkv(size, dtype=jnp.bfloat16):
@@ -28,7 +31,16 @@ def fresh_qkv(size, dtype=jnp.bfloat16):
 
 
 def fresh_mask(size):
-    return nn.make_causal_mask(jnp.ones((batch_size, size), dtype=jnp.bool_), dtype=jnp.bool_)
+    # broadcasted to (batch_size, num_heads, q_length, kv_length)
+    # mask = jnp.arange(size)[None, :] < pad_position[:, None]
+    # return jnp.broadcast_to(mask[:, None, None, :], (batch_size, 1, size, size))
+    # return nn.make_causal_mask(jnp.ones((batch_size, size), dtype=jnp.bool_), dtype=jnp.bool_)
+    idxs = jnp.arange(size, dtype=jnp.int32)
+    idxs1 = idxs[None, :, None]
+    idxs2 = idxs[None, None, :]
+    mask = (idxs1 >= idxs2) | (idxs2 < context_length[:, None, None])
+    mask = mask[:, None, :, :]  # (batch_size, 1, seq_len, seq_len)
+    return mask
 
 
 def standard_attention(query, key, value, mask=None, dtype=jnp.float32, precision=None):
@@ -69,7 +81,7 @@ for i in range(8, 12, 1):
         fresh_qkv(memsize, input_dtype),
         fresh_qkv(memsize, input_dtype),
     )
-    if causal:
+    if mask_mode:
         mask = fresh_mask(q_size)
     else:
         mask = None
@@ -97,11 +109,11 @@ for i in range(8, 12, 1):
 
     if execute_memory_efficient_att:
         mefficient_attn = functools.partial(
-            mefficient_attention, causal=causal, precision=precision, dtype=dtype
+            mefficient_attention, mask_mode=mask_mode, precision=precision, dtype=dtype
         )
 
         compilation_start = time.time()
-        compilation_res = mefficient_attn(query, key, value)
+        compilation_res = mefficient_attn(query, key, value, pad_position, context_length)
         compilation_res.block_until_ready()
         print(
             "Memory-efficient attention compilation time:",
@@ -111,7 +123,7 @@ for i in range(8, 12, 1):
         total_time_mem = 0.0
         for _ in range(repeats):
             start = time.time()
-            res = mefficient_attn(query, key, value)
+            res = mefficient_attn(query, key, value, pad_position, context_length)
             res.block_until_ready()
             total_time_mem += time.time() - start
         total_time_mem = total_time_mem / repeats
@@ -119,12 +131,12 @@ for i in range(8, 12, 1):
 
     if execute_memory_efficient_att2:
         mefficient_attn2 = functools.partial(
-            mefficient_attention, causal=causal, sparse=True, precision=precision, dtype=dtype,
-            query_chunk_size=1024, key_chunk_size=1024,
+            mefficient_attention, mask_mode=mask_mode,
+            sparse=True, precision=precision, dtype=dtype, query_chunk_size=1024, key_chunk_size=1024,
         )
 
         compilation_start = time.time()
-        compilation_res = mefficient_attn2(query, key, value)
+        compilation_res = mefficient_attn2(query, key, value, pad_position, context_length)
         compilation_res.block_until_ready()
         print(
             "Memory-efficient attention2 compilation time:",
@@ -134,7 +146,7 @@ for i in range(8, 12, 1):
         total_time_mem2 = 0.0
         for _ in range(repeats):
             start = time.time()
-            res2 = mefficient_attn2(query, key, value)
+            res2 = mefficient_attn2(query, key, value, pad_position, context_length)
             res2.block_until_ready()
             total_time_mem2 += time.time() - start
         total_time_mem2 = total_time_mem2 / repeats
@@ -173,12 +185,13 @@ precision = lax.Precision.DEFAULT
 def loss_simp(query, key, value, mask):
     return jnp.sum(standard_attention(query, key, value, mask, precision=precision))
 
-def loss_ckpt(query, key, value):
-    return jnp.sum(mefficient_attention(query, key, value, causal=causal, precision=precision))
+def loss_ckpt(query, key, value, pad_position, context_length):
+    return jnp.sum(mefficient_attention(query, key, value, pad_position, context_length, mask_mode=mask_mode, precision=precision))
 
-def loss_ckpt2(query, key, value):
-    return jnp.sum(mefficient_attention(query, key, value, causal=causal, sparse=True, precision=precision,
-                                        query_chunk_size=1024, key_chunk_size=1024))
+def loss_ckpt2(query, key, value, pad_position, context_length):
+    return jnp.sum(mefficient_attention(
+        query, key, value, pad_position, context_length, mask_mode=mask_mode,
+        sparse=True, precision=precision, query_chunk_size=1024, key_chunk_size=1024))
 
 
 diff_attention_simp = jax.jit(jax.grad(loss_simp, argnums=[0, 1, 2]))
@@ -193,7 +206,10 @@ for i in range(8, 12, 1):
     query = fresh_qkv(q_size, input_dtype)
     key = fresh_qkv(memsize, input_dtype)
     value = fresh_qkv(memsize, input_dtype)
-    mask = fresh_mask(q_size)
+    if mask_mode:
+        mask = fresh_mask(q_size)
+    else:
+        mask = None
 
     if execute_standard_att:
         compilation_start = time.time()
@@ -214,7 +230,7 @@ for i in range(8, 12, 1):
 
     if execute_memory_efficient_att:
         compilation_start = time.time()
-        _comp_res = diff_mefficient_attention(query, key, value)
+        _comp_res = diff_mefficient_attention(query, key, value, pad_position, context_length)
         for t in _comp_res:
             t.block_until_ready()
         print("Diff mem ckpt compilation time:", time.time() - compilation_start)
@@ -222,7 +238,7 @@ for i in range(8, 12, 1):
         total_time_mem = 0.0
         for _ in range(repeats):
             start = time.time()
-            res = diff_mefficient_attention(query, key, value)
+            res = diff_mefficient_attention(query, key, value, pad_position, context_length)
             for t in res:
                 t.block_until_ready()
             total_time_mem += time.time() - start
@@ -231,7 +247,7 @@ for i in range(8, 12, 1):
 
     if execute_memory_efficient_att2:
         compilation_start = time.time()
-        _comp_res = diff_mefficient_attention2(query, key, value)
+        _comp_res = diff_mefficient_attention2(query, key, value, pad_position, context_length)
         for t in _comp_res:
             t.block_until_ready()
         print("Diff mem2 ckpt compilation time:", time.time() - compilation_start)
@@ -239,7 +255,7 @@ for i in range(8, 12, 1):
         total_time_mem2 = 0.0
         for _ in range(repeats):
             start = time.time()
-            res2 = diff_mefficient_attention2(query, key, value)
+            res2 = diff_mefficient_attention2(query, key, value, pad_position, context_length)
             for t in res2:
                 t.block_until_ready()
             total_time_mem2 += time.time() - start

@@ -23,6 +23,7 @@ from flax.linen.attention import (
 
 from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
+from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
 
 
 default_kernel_init = initializers.lecun_normal()
@@ -243,6 +244,8 @@ class SelfAttention(ShardModule):
     use_bias: bool = True
     decode: bool = False
     rope: bool = False
+    memory_efficient: bool = False
+    memory_efficient_mask_mode: str = "causal"
     qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
@@ -387,17 +390,49 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
-        x = dot_product_attention(
-            query,
-            key,
-            value,
-            mask=mask,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.dropout_rate,
-            broadcast_dropout=self.broadcast_dropout,
-            deterministic=deterministic,
-            dtype=self.dtype,
-        )
+        if self.memory_efficient:
+            assert not self.decode, "Memory efficient attention does not support decoding."
+            assert deterministic, "Memory efficient attention does not support dropout."
+        
+            mask_mode = self.memory_efficient_mask_mode
+            context_lengths = None
+            pad_positions = None
+            if mask_mode == "causal":
+                if mask is not None:
+                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='causal'.")
+                mask = None
+            # TODO: implement padding mask
+            elif mask_mode == 'padding':
+                raise NotImplementedError
+            #     if mask is not None:
+            #         print("WARNING: padding mask is needed for memory efficient attention using mask_mode='padding'.")
+            #     mask = mask[:, None, None, :]
+            elif mask_mode == 'bidirectional':
+                if mask is not None:
+                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='bidirectional', we infer it from position_ids.")
+                    mask = None
+                context_lengths = jnp.argmax(position_ids[:, 0, :], axis=1) + 1
+            x = dot_product_attention_m(
+                query,
+                key,
+                value,
+                pad_positions,
+                context_lengths,
+                mask_mode,
+                dtype=self.dtype,
+            )
+        else:                
+            x = dot_product_attention(
+                query,
+                key,
+                value,
+                mask=mask,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.dropout_rate,
+                broadcast_dropout=self.broadcast_dropout,
+                deterministic=deterministic,
+                dtype=self.dtype,
+            )
 
         out = dense_cls[3](
             features=features,

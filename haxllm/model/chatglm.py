@@ -1,6 +1,7 @@
 import functools
 from typing import Any, Callable
 
+import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -13,6 +14,12 @@ from haxllm.config_utils import RematScanConfigMixin
 
 
 config_hub = {
+    "chatglm-t": dict(
+        hidden_size=1024,
+        n_heads=8,
+        n_layers=2,
+        intermediate_size=4096,
+    ),
     "chatglm-6b": dict(
         hidden_size=4096,
         n_heads=32,
@@ -47,10 +54,31 @@ class TransformerConfig(RematScanConfigMixin):
     eos_token_id: int = 130005
     mask_token_id: int = 130000
     gmask_token_id: int = 130001
+    memory_efficient_attention: bool = False
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     decode: bool = False
     shard: bool = False
+
+
+# Example of ChatGLM position_ids and masks
+# sentence = "你好"
+# input_ids:
+# [5, 74874, 130001, 130004]
+# where 130001 is gmask_token_id and 130004 is bos_token_id
+# 
+# position_ids:
+# [[0, 1, 2, 2],
+#  [0, 0, 0, 1]]
+# 
+# attention_mask:
+# [[False, False, False,  True],
+#  [False, False, False,  True],
+#  [False, False, False,  True],
+#  [False, False, False, False]]
+# 
+# From the above example, we define the following:
+#  context_length = 3, mask_position = 2
 
 
 def get_position_ids(input_ids, bos_token_id, mask_token_id, gmask_token_id):
@@ -89,6 +117,20 @@ def get_position_ids(input_ids, bos_token_id, mask_token_id, gmask_token_id):
     return position_ids      
 
 
+def make_bidirectional_mask(context_lengths, seq_len):
+    # Translated from:
+    # attention_mask = np.ones((1, seq_length, seq_length))
+    # attention_mask = np.tril(attention_mask)
+    # attention_mask[:, :, :context_length] = 1
+    # attention_mask = np.bool_(attention_mask < 0.5) 
+    idxs = jnp.arange(seq_len, dtype=jnp.int32)
+    idxs1 = idxs[None, :, None]
+    idxs2 = idxs[None, None, :]
+    mask = (idxs1 >= idxs2) | (idxs2 < context_lengths[:, None, None])
+    mask = mask[:, None, :, :]  # (batch_size, 1, seq_len, seq_len)
+    return mask
+
+
 def get_masks(position_ids):
     # Translated from: THUDM/chatglm-6b, tokenization_chatglm.py
 
@@ -101,20 +143,9 @@ def get_masks(position_ids):
     # ```
     # We don't have input_ids here, so we infer it from position_ids
     # See: position_ids = jnp.where(B < context_lengths, B, mask_position)
-    context_lengths_sub_1 = jnp.argmax(position_ids, axis=1, keepdims=True)
-
-    # Translated from:
-    # attention_mask = np.ones((1, seq_length, seq_length))
-    # attention_mask = np.tril(attention_mask)
-    # attention_mask[:, :, :context_length] = 1
-    # attention_mask = np.bool_(attention_mask < 0.5)
+    context_lengths = jnp.argmax(position_ids[:, 0, :], axis=1) + 1
     seq_len = position_ids.shape[-1]
-    idxs = jnp.arange(seq_len, dtype=jnp.int32)
-    idxs1 = idxs[None, :, None]
-    idxs2 = idxs[None, None, :]
-    mask = (idxs1 >= idxs2) | (idxs2 <= context_lengths_sub_1)
-    mask = mask[:, None, :, :]  # (batch_size, 1, seq_len, seq_len)
-    return mask
+    return make_bidirectional_mask(context_lengths, seq_len)
 
 
 # TODO: skip query_key_layer_scaling_coeff
@@ -129,7 +160,10 @@ class TransformerBlock(nn.Module):
         config = self.config
         x, position_ids = inputs
 
-        mask = get_masks(position_ids) if not config.decode else None
+        if config.decode or config.memory_efficient_attention:
+            mask = None
+        else:
+            mask = get_masks(position_ids)
 
         attn_input = nn.LayerNorm(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1")(x)
@@ -141,6 +175,8 @@ class TransformerBlock(nn.Module):
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             decode=config.decode,
+            memory_efficient=config.memory_efficient_attention,
+            memory_efficient_mask_mode='bidirectional',
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
@@ -253,14 +289,19 @@ class TransformerLMHeadModel(nn.Module):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
             input_ids=input_ids, train=train)
-
+        
+        if config.decode:
+            shard_axes = {"kernel": ("Y", None)}
+        else:
+            # shard output in training to avoid out of memory
+            shard_axes = {'kernel': (None, 'Y')}
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
             param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
-            shard_axes={'kernel': ('Y', None)},
+            shard_axes=shard_axes,
             shard=config.shard,
             name="lm_head",
         )(x)

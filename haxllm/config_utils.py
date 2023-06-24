@@ -30,7 +30,7 @@ def set_extra(extra, cfg, name):
 def get_optimizer(cfg, steps_per_epoch):
     init_lr = cfg.optimizer.warmup_min_lr
     peak_lr = cfg.optimizer.learning_rate
-    total_steps = steps_per_epoch * cfg.epochs
+    total_steps = steps_per_epoch * cfg.train.epochs
     warmup_steps = getattr(cfg.optimizer, "warmup_steps", 0)
     if warmup_steps == 0 and hasattr(cfg.optimizer, "warmup_ratio"):
         warmup_steps = int(total_steps * cfg.optimizer.warmup_ratio)
@@ -64,6 +64,13 @@ def get_optimizer(cfg, steps_per_epoch):
     if opt_name == "adamw":
         set_extra(extras, cfg.optimizer, "eps")
 
-    optimizer.append(getattr(optax, opt_name)(learning_rate=lr_schedule, weight_decay=cfg.optimizer.weight_decay, **extras))
+    if opt_name == 'sgdw':
+        from haxllm.optim import sgdw
+        optimizer.append(sgdw(
+            learning_rate=lr_schedule, momentum=cfg.optimizer.momentum, weight_decay=cfg.optimizer.weight_decay,
+            nesterov=cfg.optimizer.nesterov, accumulator_dtype=cfg.optimizer.accumulator_dtype))
+    else:
+        optimizer.append(getattr(optax, opt_name)(learning_rate=lr_schedule, weight_decay=cfg.optimizer.weight_decay, **extras))
     optimizer = optax.chain(*optimizer)
+    optimizer.trainable_pattern = getattr(cfg.train, "trainable_pattern", None)
     return optimizer
