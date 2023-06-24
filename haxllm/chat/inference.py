@@ -1,4 +1,5 @@
 import abc
+from typing import List, Optional, Tuple, Union
 import time
 
 import jax
@@ -165,13 +166,17 @@ def chat_loop(
     pipeline: TextGenerationPipeline,
     chatio: ChatIO,
     max_len: int,
-    conv_template: str,
+    conv_template: Optional[str] = None,
     temperature: float = 1.0,
     top_k: int = -1,
     top_p: float = 1.0,
     debug: bool = False,
 ):
     def new_chat():
+        if conv_template is None:
+            print("No conversation template provided. Using non_chat, which is a single-turn conversation. "
+                  "Use !!reset to reset history after each turn.")
+            return get_conv_template("non_chat")
         return get_conv_template(conv_template)
 
     conv = new_chat()
@@ -211,7 +216,7 @@ def chat_loop(
             "stop": conv.stop_str,
             "stop_token_ids": conv.stop_token_ids,
             "echo": False,
-            "reset": reset,
+            "reset_cache": reset,
         }
         reset = False
 
