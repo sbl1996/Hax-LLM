@@ -59,6 +59,7 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
 
     for i in range(max_new_tokens):
         if i == 0:
+            print(f"First stage {pre}")
             input_ids = jnp.array([input_ids[pre:]], dtype=jnp.int32)
             logits = pipeline.stream_forward(input_ids, once=once)
         else:

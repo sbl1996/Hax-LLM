@@ -1,0 +1,5 @@
+family: chatglm2
+name: chatglm2-6b
+tokenizer: THUDM/chatglm2-6b
+scan: True
+conv_template: chatglm2-6b

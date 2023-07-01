@@ -147,14 +147,15 @@ class TransformerModel(nn.Module):
             if is_initialized:
                 batch_size, seq_len = input_ids.shape[:2]
                 if seq_len != 1:
-                    # First stage of decoding
+                    start = cache_position_ids.value
                     offset = jnp.argmax(input_ids[0] == config.pad_token_id)
                     offset = jnp.where(offset == 0, seq_len, offset)
-                    position_ids = jnp.arange(seq_len, dtype=jnp.int32)
+                    position_ids = jnp.arange(seq_len, dtype=jnp.int32) + start
                 else:
+                    start = cache_position_ids.value
                     offset = 1
                     position_ids = cache_position_ids.value[None]
-                cache_position_ids.value = cache_position_ids.value + offset
+                cache_position_ids.value = start + offset
                 position_ids = jnp.broadcast_to(position_ids, (batch_size, seq_len))
 
         inputs_embeds = embed_layer(num_embeddings=config.vocab_size, name="wte")(input_ids)

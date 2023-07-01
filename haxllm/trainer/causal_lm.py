@@ -204,7 +204,7 @@ class DPTrainer(Trainer):
         if checkpoint is not None:
             params = unfreeze(flatten_dict(params, sep="."))
             params = load_transformer_params(
-                params, checkpoint, device="cpu")
+                params, checkpoint, device="cpu", lm_head=True)
             params = freeze(unflatten_dict(params, sep="."))
 
         params, opt_state, global_step = jax.device_put_replicated(
@@ -288,7 +288,7 @@ class MPTrainer(Trainer):
         if checkpoint is not None:
             params = unfreeze(flatten_dict(params, sep="."))
             params = load_transformer_params(
-                params, checkpoint, device=self.mesh)
+                params, checkpoint, device=self.mesh, lm_head=True)
             params = freeze(unflatten_dict(params, sep="."))
         
         self._params = params

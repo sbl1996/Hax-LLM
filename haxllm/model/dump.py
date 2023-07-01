@@ -5,6 +5,8 @@ from pathlib import Path
 
 from safetensors import safe_open
 from safetensors.numpy import save_file
+
+import jax.numpy as jnp
 from flax.traverse_util import flatten_dict
 
 
@@ -67,8 +69,12 @@ if __name__ == "__main__":
             for k in list(d.keys()):
                 if k in tensors:
                     raise ValueError("Duplicate key: {}".format(k))
-                tensors[k] = d[k].numpy()
-                del d[k]
+                v = d[k]
+                if v.dtype == torch.bfloat16:
+                    tensors[k] = v.float().numpy().astype(jnp.bfloat16)
+                else:
+                    tensors[k] = v.numpy()
+                del d[k], v
 
     tensors = mod.remap_state_dict(tensors)
     tensors = flatten_dict(tensors, sep=".")

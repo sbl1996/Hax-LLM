@@ -45,7 +45,20 @@ class TransformerBlock(nn.Module):
         config = self.config
         x, position_ids = inputs
 
-        mask = get_masks(position_ids) if not config.decode else None
+        prefix_key_value = PrefixEmbed(
+            seq_len=config.pre_seq_len,
+            projection=config.prefix_projection,
+            prefix_features=config.prefix_hidden_size,
+            features=(config.n_heads, config.hidden_size // config.n_heads),
+            dtype=config.dtype,
+            name="prefix",
+        )(x)
+
+        if config.memory_efficient_attention or config.decode:
+            raise NotImplementedError
+        mask = get_masks(position_ids)
+        prefix_len = config.pre_seq_len
+        mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (prefix_len, 0)), constant_values=True)
 
         attn_input = nn.LayerNorm(
             epsilon=config.layer_norm_epsilon, dtype=config.dtype, name="ln_1")(x)
@@ -57,10 +70,11 @@ class TransformerBlock(nn.Module):
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             decode=config.decode,
+            zero_init=config.zero_init_prefix_attn,
             qkv_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn")(attn_input, mask=mask, position_ids=position_ids)
+            name="attn")(attn_input, mask=mask, position_ids=position_ids, prefix_key_value=prefix_key_value)
 
         alpha = (2 * config.n_layers) ** 0.5
         x = attn_input * alpha + attn_output
@@ -126,7 +140,6 @@ class TransformerModel(nn.Module):
 
         x = embed_layer(num_embeddings=config.vocab_size, name="wte")(input_ids)
 
-
         block_fn = self.block_cls
         x = make_block_stack(block_fn, config.n_layers, config)((x, position_ids), train)[0]
 
@@ -171,13 +184,18 @@ class TransformerLMHeadModel(nn.Module):
         x = TransformerModel(config=config, name="transformer")(
             input_ids=input_ids, train=train)
 
+        if config.decode:
+            shard_axes = {"kernel": ("Y", None)}
+        else:
+            # shard output in training to avoid out of memory
+            shard_axes = {'kernel': (None, 'Y')}
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
             param_dtype=jnp.float32,
             kernel_init=config.kernel_init,
-            shard_axes={'kernel': ('Y', None)},
+            shard_axes=shard_axes,
             shard=config.shard,
             name="lm_head",
         )(x)

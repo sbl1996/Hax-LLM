@@ -139,17 +139,18 @@ class Conversation:
                     ret += role + ": " + "<s>"
             return ret
         elif self.sep_style == SeparatorStyle.CHAT_GLM:
+            sep = self.sep
             if self.system:
-                ret = self.system + '\n'
+                ret = self.system + sep
             else:
                 ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i // 2}]\n{role}：{message}"
+                    ret += f"[Round {i // 2}]{sep}{role}：{message}"
                 else:
-                    ret += f"\n{role}："
+                    ret += f"{sep}{role}："
                     if message:
-                        ret += message + '\n'
+                        ret += message + sep
             return ret
         elif self.sep_style == SeparatorStyle.NON_CHAT:
             if self.system:
@@ -279,6 +280,21 @@ register_conv_template(
         offset=0,
         sep_style=SeparatorStyle.CHAT_GLM,
         sep="\n",
+        stop_token_ids=[0],
+    )
+)
+
+
+# ChatGLM2-6B template
+register_conv_template(
+    Conversation(
+        name="chatglm2-6b",
+        system="",
+        roles=("问", "答"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.CHAT_GLM,
+        sep="\n\n",
         stop_token_ids=[0],
     )
 )

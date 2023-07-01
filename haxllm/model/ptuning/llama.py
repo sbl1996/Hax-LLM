@@ -48,7 +48,9 @@ class TransformerBlock(nn.Module):
             name="prefix",
         )(inputs)
 
-        if not config.memory_efficient:
+        if config.memory_efficient:
+            raise NotImplementedError
+        else:
             prefix_len = config.pre_seq_len
             kv_len = config.pre_seq_len + inputs.shape[1]
             idxs = jnp.arange(kv_len, dtype=jnp.int32)
@@ -56,8 +58,6 @@ class TransformerBlock(nn.Module):
             mask = jnp.broadcast_to(
                 mask, (inputs.shape[0], 1, kv_len - prefix_len, kv_len)
             )
-        else:
-            raise NotImplementedError
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)

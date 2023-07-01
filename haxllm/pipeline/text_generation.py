@@ -22,8 +22,29 @@ def find_pad_context_length(seq_len, multiple=64):
 
 
 class TextGenerationPipeline:
-    
-    def __init__(self, tokenizer, model, mesh=None, max_len=512, seed=0, two_stage=False, pad_context=None, pad_multiple=64):
+
+    def __init__(self, tokenizer, model, mesh=None, max_len=512, seed=0, two_stage=False, pad_multiple=64):
+        r"""
+        Initialize the TextGenerationPipeline with given tokenizer, model, and other optional parameters.
+
+        Parameters
+        ----------
+        tokenizer:
+            Tokenizer object that handles text encoding and decoding.
+        model:
+            Pre-trained model for text generation.
+        mesh: jax.sharding.Mesh, default None
+            a Mesh object for parallel processing.
+            If None, use single device and init the model on CPU.
+        max_len: int, default 512
+            maximum length of the generated text.
+        seed: int, default 0
+            random seed for reproducible results.
+        two_stage: bool, default False
+            flag to enable two-stage decoding.
+        pad_multiple: int, default 64
+            multiple of padding length for two-stage decoding (to avoid jit recompilation)
+        """
         self.seed = seed
 
         tokenizer.decode(tokenizer("init")['input_ids'])
@@ -33,9 +54,7 @@ class TextGenerationPipeline:
         self.mesh = mesh
         self.max_len = max_len
         self.two_stage = two_stage
-        if two_stage:
-            pad_context = True
-        self.pad_context = pad_context
+        self.pad_context = two_stage
         self.pad_multiple = pad_multiple
 
         self._rng = random.PRNGKey(self.seed)

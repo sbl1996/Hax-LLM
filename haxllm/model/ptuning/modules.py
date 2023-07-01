@@ -20,6 +20,7 @@ from haxllm.model.parallel import (
     ShardAxis,
     precompute_freqs_cis,
     apply_rotary_pos_emb,
+    apply_glm_rotary_pos_emb,
 )
 
 
@@ -208,6 +209,7 @@ class SelfAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
         prefix_key_value: Optional[Tuple[Array]] = None,
     ):
         features = x.shape[-1]
@@ -215,6 +217,10 @@ class SelfAttention(ShardModule):
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
         head_dim = features // self.num_heads
+
+        if position_ids is not None:
+            assert position_ids.ndim == 3, "Only ChatGLM style 2D position_ids can be used."
+
         dense = functools.partial(
             DenseGeneral,
             axis=-1,
@@ -238,15 +244,23 @@ class SelfAttention(ShardModule):
             qkv_constraint(dense(name="value")(x)),
         )
 
+        # ChatGLM style 2d position encoding
+        position_encoding_2d = position_ids is not None
+
         if self.rope:
+            pe_dim = head_dim // 2 if position_encoding_2d else head_dim
             cos, sin = precompute_freqs_cis(
-                dim=head_dim, end=self.max_len, dtype=self.dtype
-            )
+                dim=pe_dim, end=self.max_len, dtype=self.dtype)
 
         if not self.decode:
             if self.rope:
-                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                if position_encoding_2d:
+                    # 2D position_ids is (batch_size, 2, seq_len)
+                    query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
+                else:
+                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
         else:
+            raise NotImplementedError("Decode not implemented.")
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
             if self.shard:

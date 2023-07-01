@@ -152,7 +152,6 @@ def get_masks(position_ids):
 # no difference in inference (forward), but may be in training (backward)
 class TransformerBlock(nn.Module):
     config: TransformerConfig
-    deterministic: bool
     scan: bool = False
 
     @nn.compact
@@ -246,7 +245,7 @@ class TransformerModel(nn.Module):
 
         x = embed_layer(num_embeddings=config.vocab_size, name="wte")(input_ids)
 
-        block_fn = functools.partial(self.block_cls, deterministic=not train)
+        block_fn = self.block_cls
         x = make_block_stack(block_fn, config.n_layers, config)((x, position_ids), train)[0]
 
         norm_layer = nn.remat(nn.LayerNorm) if remat else nn.LayerNorm
@@ -289,7 +288,7 @@ class TransformerLMHeadModel(nn.Module):
         config = self.config
         x = TransformerModel(config=config, name="transformer")(
             input_ids=input_ids, train=train)
-        
+
         if config.decode:
             shard_axes = {"kernel": ("Y", None)}
         else:
