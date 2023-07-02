@@ -163,23 +163,22 @@ class TextGenerationPipeline:
             inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
             n_beams=beam_size, **kwargs)
 
-    def stream_forward(self, input_ids, once=False):
+    def stream_forward(self, input_ids):
         self.check_init()
         assert self._ccache is not None
         cache = self._ccache
         assert input_ids.ndim == 2 and input_ids.shape[0] == 1
         seq_len = input_ids.shape[1]
-        if once:
+        if seq_len > 1:
             pad_context = find_pad_context_length(seq_len, self.pad_multiple)
             pad_token_id = self.tokenizer.pad_token_id
             inputs = jnp.full((1, pad_context), pad_token_id, dtype=jnp.int32)
             inputs = inputs.at[:, :seq_len].set(input_ids)
             cache, logits = self._apply_fn(self.params, cache, inputs)
             logits = logits[:, :seq_len]
-            cache = fix_cache_index(cache, seq_len)
+            cache = fix_cache_index(cache, pad_context - seq_len)
         else:
-            for i in range(seq_len):
-                cache, logits = self._apply_fn(self.params, cache, input_ids[:, [i]])
+            cache, logits = self._apply_fn(self.params, cache, input_ids[:, [0]])
         logits = logits.astype(jnp.float32)
         self._ccache = cache
         return logits

@@ -7,7 +7,7 @@ import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, MultiQueryAttention
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.utils import load_config as _load_config
 from haxllm.config_utils import RematScanConfigMixin
 
@@ -71,6 +71,11 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, inputs):
+        if isinstance(inputs, tuple):
+            inputs, padding_mask = inputs
+        else:
+            padding_mask = None
+
         config = self.config
         # jax.debug.print("inputs {}", inputs[0, :, :10])
 
@@ -81,20 +86,22 @@ class TransformerBlock(nn.Module):
 
         x = RMSNorm(epsilon=config.layer_norm_epsilon,
                     dtype=config.dtype, name="ln_1")(inputs)
-        x = MultiQueryAttention(
+        x = SelfAttention(
             num_heads=config.n_heads,
-            num_groups=config.num_groups,
+            multi_query_groups=config.num_groups,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            use_bias=True,
+            qkv_bias=True,
+            out_bias=False,
             decode=config.decode,
             rope=True,
-            # qkv_shard_axes=("X", "Y", None),
+            query_shard_axes=("X", "Y", None),
+            kv_shard_axes=("X", None, "Y"),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn")(x, mask)
+            name="attn")(x, mask, padding_mask)
 
         x = x + inputs
 
@@ -111,6 +118,9 @@ class TransformerBlock(nn.Module):
             name="mlp")(y)
 
         y = x + y
+
+        if padding_mask is not None:
+            y = (y, padding_mask)
         if self.scan:
             return y, None
         else:
@@ -136,8 +146,13 @@ class TransformerModel(nn.Module):
             shard=config.shard,
             name="wte")(inputs)
 
-        x = make_block_stack(
-            self.block_cls, config.n_layers, config)(x, train)
+        if config.decode and inputs.shape[1] > 1:
+            padding_mask = jnp.equal(inputs, config.pad_token_id)
+            x = make_block_stack(
+                self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
+        else:
+            x = make_block_stack(
+                self.block_cls, config.n_layers, config)(x, train)
 
         norm_layer = RMSNorm if remat else RMSNorm
         x = norm_layer(epsilon=config.layer_norm_epsilon,

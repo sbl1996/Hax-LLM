@@ -135,17 +135,17 @@ class ShardMixIn:
         if self.shard and self.shard_axes and (name in self.shard_axes.keys()):
             axes = self.shard_axes[name]
             init_fn = nn.with_partitioning(init_fn, axes)
-            param = super().param(name, init_fn, *init_args)
+            param = super().param(name, init_fn, *init_args) # type: ignore
 
             # Sow this, to have the AxisMetadata available at initialization.
-            self.sow(
+            self.sow( # type: ignore
                 "params_axes",
                 f"{name}_axes",
                 nn_partitioning.AxisMetadata(axes),
                 reduce_fn=nn_partitioning._param_with_axes_sow_reduce_fn,
             )
         else:
-            param = super().param(name, init_fn, *init_args)
+            param = super().param(name, init_fn, *init_args) # type: ignore
         return param
 
 
@@ -161,7 +161,7 @@ ShardAxis = Optional[str]
 
 
 def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32
+    dim: int, end: int, theta = 10000.0, dtype = jnp.float32
 ):
     # returns:
     #   cos, sin: (end, dim)
@@ -218,7 +218,7 @@ def apply_rotary_pos_emb_index(q, k, cos, sin, position_id):
 # from chatglm2, different from original rope
 
 def precompute_freqs_cis2(
-    dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32
+    dim: int, end: int, theta: float = 10000.0, dtype = jnp.float32
 ):
     # returns:
     #   cos, sin: (end, dim)
@@ -292,10 +292,10 @@ def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
 ModuleClass = Callable[..., nn.Module]
 
 
-class MultiQueryAttention(ShardModule):
+class SelfAttention(ShardModule):
     num_heads: int
-    num_groups: int
     max_len: int
+    multi_query_groups: Optional[int] = None
     dtype: Optional[Dtype] = None
     param_dtype: Optional[Dtype] = jnp.float32
     broadcast_dropout: bool = False
@@ -303,11 +303,14 @@ class MultiQueryAttention(ShardModule):
     deterministic: Optional[bool] = None
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-    use_bias: bool = True
+    qkv_bias: bool = True
+    out_bias: bool = True
     decode: bool = False
     rope: bool = False
     memory_efficient: bool = False
-    # qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
+    memory_efficient_mask_mode: str = "causal"
+    query_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
+    kv_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis]] = None
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
@@ -317,7 +320,10 @@ class MultiQueryAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
+        padding_mask: Optional[Array] = None,
     ):
+        multi_query = self.multi_query_groups is not None
+        kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
@@ -336,23 +342,27 @@ class MultiQueryAttention(ShardModule):
             param_dtype=self.param_dtype,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init,
-            use_bias=self.use_bias,
-            shard_axes={"kernel": ("X", "Y", None)},
+            use_bias=self.qkv_bias,
+            shard_axes={"kernel": self.query_shard_axes},
             shard=self.shard,
             axis=-1,
             name="query",
         )(x)
 
+        kv_num_heads = self.num_heads
+        if multi_query:
+            kv_num_heads = self.multi_query_groups
+
         kv_dense = [
             functools.partial(
                 cls,
-                features=(self.num_groups, head_dim),
+                features=(kv_num_heads, head_dim),
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
-                use_bias=self.use_bias,
-                shard_axes={"kernel": ("X", None, "Y")},
+                use_bias=self.qkv_bias,
+                shard_axes={"kernel": kv_shard_axes},
                 shard=self.shard,
                 axis=-1,
             ) for cls in dense_cls[1:3]
@@ -361,27 +371,32 @@ class MultiQueryAttention(ShardModule):
         key = kv_dense[0](name="key")(x)
         value = kv_dense[1](name="value")(x)
 
-        key = jnp.expand_dims(key, axis=-2)
-        key = jnp.tile(key, (1, 1, 1, self.num_heads // self.num_groups, 1))
-        key = jnp.reshape(key, (*key.shape[:2], self.num_heads, head_dim))
-        # key = self.with_sharding_constraint(key, axes=("X", None, "Y", None))
+        if multi_query:
+            key = jnp.expand_dims(key, axis=-2)
+            key = jnp.tile(key, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
+            key = jnp.reshape(key, (*key.shape[:2], self.num_heads, head_dim))
+            # key = self.with_sharding_constraint(key, axes=("X", None, "Y", None))
 
-        value = jnp.expand_dims(value, axis=-2)
-        value = jnp.tile(value, (1, 1, 1, self.num_heads // self.num_groups, 1))
-        value = jnp.reshape(value, (*value.shape[:2], self.num_heads, head_dim))
-        # value = self.with_sharding_constraint(value, axes=("X", None, "Y", None))
-
-        # jax.debug.print("query {}", query[0, :, 0, :10])
-        # jax.debug.print("key {}", key[0, :, 0, :10])
-        # jax.debug.print("value {}", value[0, :, 0, :10])
+            value = jnp.expand_dims(value, axis=-2)
+            value = jnp.tile(value, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
+            value = jnp.reshape(value, (*value.shape[:2], self.num_heads, head_dim))
 
         if self.rope:
-            cos, sin = precompute_freqs_cis2(
-                dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
+            if multi_query:
+                cos, sin = precompute_freqs_cis2(
+                    dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
+                add_pos = lambda q, k: apply_rotary_pos_emb2(q, k, cos, sin)
+                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
+            else:
+                cos, sin = precompute_freqs_cis(
+                    dim=head_dim, end=self.max_len, dtype=self.dtype)
+                add_pos = lambda q, k: apply_rotary_pos_emb(q, k, cos, sin)
+                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+        else:
+            add_pos = lambda q, k: (q, k)
 
         if not self.decode:
-            if self.rope:
-                query, key = apply_rotary_pos_emb2(query, key, cos, sin)
+            query, key = add_pos(query, key)
         else:
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
@@ -397,262 +412,36 @@ class MultiQueryAttention(ShardModule):
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
             if not is_initialized:
-                if self.rope:
-                    query, key = apply_rotary_pos_emb2(query, key, cos, sin)
+                query, key = add_pos(query, key)
             else:
+
                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                # shape check of cached keys against query input
-                # expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
-                # if expected_shape != query.shape:
-                #     raise ValueError(
-                #         "Autoregressive cache shape error, "
-                #         "expected query shape %s instead got %s."
-                #         % (expected_shape, query.shape)
-                #     )
                 # update key, value caches with our new 1d spatial slices
                 num_queries = query.shape[-3]
                 cur_index = cache_index.value
                 if self.rope:
                     position_ids = jnp.arange(num_queries) + cur_index
                     position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                    query, key = apply_rotary_pos_emb_index2(query, key, cos, sin, position_ids)
+                    query, key = add_pos_i(query, key, position_ids)
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 cached_key.value = key
                 cached_value.value = value
-                if num_queries > 1:
-                    idx = jnp.arange(max_length)
-                    mask = idx <= jnp.arange(num_queries)[:, None]
-                    cache_index.value = cache_index.value + num_queries
-                    mask = jnp.broadcast_to(
-                        mask, tuple(batch_dims) + (1, num_queries, max_length),
-                    )
+
+                # for pad_context
+                if padding_mask is not None:
+                    offset = jnp.argmax(padding_mask[0])
+                    offset = jnp.where(offset == 0, num_queries, offset)
                 else:
-                    cache_index.value = cache_index.value + 1
-                    mask = combine_masks(
-                        mask,
-                        jnp.broadcast_to(
-                            jnp.arange(max_length) <= cur_index,
-                            tuple(batch_dims) + (1, 1, max_length),
-                        ),
-                    )
+                    offset = num_queries
+                cache_index.value = cache_index.value + offset
 
-        dropout_rng = None
-        if self.dropout_rate > 0 and not self.deterministic:
-            dropout_rng = self.make_rng("dropout")
-            deterministic = False
-        else:
-            deterministic = True
-
-        if self.memory_efficient:
-            raise NotImplementedError
-            assert not self.decode, "Memory efficient attention does not support decoding."
-            assert deterministic, "Memory efficient attention does not support dropout."
-        
-            mask_mode = self.memory_efficient_mask_mode
-            context_lengths = None
-            pad_positions = None
-            if mask_mode == "causal":
-                if mask is not None:
-                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='causal'.")
-                mask = None
-            else:
-                raise NotImplementedError
-            x = dot_product_attention_m(
-                query,
-                key,
-                value,
-                pad_positions,
-                context_lengths,
-                mask_mode,
-                dtype=self.dtype,
-            )
-        else:                
-            # jax.debug.print("query +p {}", query[0, :, 0, :10])
-            # jax.debug.print("key +p {}", key[0, :, 0, :10])
-            x = dot_product_attention(
-                query,
-                key,
-                value,
-                mask=mask,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.dropout_rate,
-                broadcast_dropout=self.broadcast_dropout,
-                deterministic=deterministic,
-                dtype=self.dtype,
-            )
-
-        # jax.debug.print("dota {}", x[0, :, 0, :10])
-        out = dense_cls[3](
-            features=features,
-            axis=(-2, -1),
-            use_bias=False,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            shard_axes={"kernel": self.out_shard_axes},
-            shard=self.shard,
-            name="out",
-        )(x)
-
-        # out = self.with_sharding_constraint(
-        #     out, ("X", None, "Y"))
-        return out
-
-
-class SelfAttention(ShardModule):
-    num_heads: int
-    max_len: int
-    dtype: Optional[Dtype] = None
-    param_dtype: Optional[Dtype] = jnp.float32
-    broadcast_dropout: bool = False
-    dropout_rate: float = 0.0
-    deterministic: Optional[bool] = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-    use_bias: bool = True
-    decode: bool = False
-    rope: bool = False
-    memory_efficient: bool = False
-    memory_efficient_mask_mode: str = "causal"
-    qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
-    out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
-    shard: bool = True
-    dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
-
-    @nn.compact
-    def __call__(
-        self,
-        x: Array,
-        mask: Optional[Array] = None,
-        position_ids: Optional[Array] = None,
-    ):
-        features = x.shape[-1]
-        assert (
-            features % self.num_heads == 0
-        ), "Memory dimension must be divisible by number of heads."
-        head_dim = features // self.num_heads
-
-        if position_ids is not None:
-            assert position_ids.ndim == 3, "Only ChatGLM style 2D position_ids can be used."
-
-        if not isinstance(self.dense_cls, Sequence):
-            dense_cls = [self.dense_cls for _ in range(4)]
-        else:
-            assert len(self.dense_cls) == 4, "dense_cls must be a sequence of length 4 for query, key, value, and out."
-            dense_cls = self.dense_cls
-
-        qkv_dense = [
-            functools.partial(
-                cls,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                features=(self.num_heads, head_dim),
-                kernel_init=self.kernel_init,
-                bias_init=self.bias_init,
-                use_bias=self.use_bias,
-                shard_axes={"kernel": self.qkv_shard_axes},
-                shard=self.shard,
-                axis=-1,
-            ) for cls in dense_cls[:3]
-        ]
-
-        qkv_constraint = lambda x: x
-        # qkv_constraint = functools.partial(
-        #     self.with_sharding_constraint, axes=("X", None, "Y", None))
-
-        query, key, value = (
-            qkv_constraint(qkv_dense[0](name="query")(x)),
-            qkv_constraint(qkv_dense[1](name="key")(x)),
-            qkv_constraint(qkv_dense[2](name="value")(x)),
-        )
-
-        # ChatGLM style 2d position encoding
-        position_encoding_2d = position_ids is not None
-
-        if self.rope:
-            pe_dim = head_dim // 2 if position_encoding_2d else head_dim
-            cos, sin = precompute_freqs_cis(
-                dim=pe_dim, end=self.max_len, dtype=self.dtype)
-
-        if not self.decode:
-            if self.rope:
-                if position_encoding_2d:
-                    # 2D position_ids is (batch_size, 2, seq_len)
-                    query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
-                else:
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        else:
-            is_initialized = self.has_variable("cache", "cached_key")
-            init_fn = jnp.zeros
-            # if self.shard:
-            #     init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
-            cached_key = self.variable(
-                "cache", "cached_key", init_fn, key.shape, key.dtype
-            )
-            cached_value = self.variable(
-                "cache", "cached_value", init_fn, value.shape, value.dtype
-            )
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
-            )
-            if not is_initialized:
-                if self.rope:
-                    if position_encoding_2d:
-                        # 2D position_ids is (batch_size, 2, seq_len)
-                        query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
-                    else:
-                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
-            else:
-                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                # shape check of cached keys against query input
-                # expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
-                # if expected_shape != query.shape:
-                #     raise ValueError(
-                #         "Autoregressive cache shape error, "
-                #         "expected query shape %s instead got %s."
-                #         % (expected_shape, query.shape)
-                #     )
-                # update key, value caches with our new 1d spatial slices
-                num_queries = query.shape[-3]
-                cur_index = cache_index.value
-                if self.rope:
-                    if position_encoding_2d:
-                        query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
-                    else:
-                        position_ids = jnp.arange(num_queries) + cur_index
-                        position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                        query, key = apply_rotary_pos_emb_index(query, key, cos, sin, position_ids)
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
-                cached_key.value = key
-                cached_value.value = value
-                if num_queries > 1:
-                    idx = jnp.arange(max_length)
-                    mask = idx <= jnp.arange(num_queries)[:, None]
-                    if position_encoding_2d:
-                        # First stage of decoding of ChatGLM
-                        context_length_1 = position_ids[0, 0, -1]
-                        mask = mask | (idx <= context_length_1)
-                        offset = context_length_1 + 2
-                    else:
-                        offset = num_queries
-                    cache_index.value = cache_index.value + offset
-                    mask = jnp.broadcast_to(
-                        mask, tuple(batch_dims) + (1, num_queries, max_length),
-                    )
-                else:
-                    cache_index.value = cache_index.value + 1
-                    mask = combine_masks(
-                        mask,
-                        jnp.broadcast_to(
-                            jnp.arange(max_length) <= cur_index,
-                            tuple(batch_dims) + (1, 1, max_length),
-                        ),
-                    )
+                idx = jnp.arange(num_queries) + cur_index
+                mask = jnp.arange(max_length)[None, :] <= idx[:, None]
+                mask = jnp.broadcast_to(
+                    mask, tuple(batch_dims) + (1, num_queries, max_length),
+                )
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:
@@ -708,7 +497,7 @@ class SelfAttention(ShardModule):
         out = dense_cls[3](
             features=features,
             axis=(-2, -1),
-            use_bias=self.use_bias,
+            use_bias=self.out_bias,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init,
             dtype=self.dtype,
@@ -717,10 +506,191 @@ class SelfAttention(ShardModule):
             shard=self.shard,
             name="out",
         )(x)
-
-        # out = self.with_sharding_constraint(
-        #     out, ("X", None, "Y"))
         return out
+        
+
+# class SelfAttention(ShardModule):
+#     num_heads: int
+#     max_len: int
+#     dtype: Optional[Dtype] = None
+#     param_dtype: Optional[Dtype] = jnp.float32
+#     broadcast_dropout: bool = False
+#     dropout_rate: float = 0.0
+#     deterministic: Optional[bool] = None
+#     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+#     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+#     use_bias: bool = True
+#     decode: bool = False
+#     rope: bool = False
+#     memory_efficient: bool = False
+#     memory_efficient_mask_mode: str = "causal"
+#     qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
+#     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
+#     shard: bool = True
+#     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
+
+#     @nn.compact
+#     def __call__(
+#         self,
+#         x: Array,
+#         mask: Optional[Array] = None,
+#     ):
+#         features = x.shape[-1]
+#         assert (
+#             features % self.num_heads == 0
+#         ), "Memory dimension must be divisible by number of heads."
+#         head_dim = features // self.num_heads
+
+#         if not isinstance(self.dense_cls, Sequence):
+#             dense_cls = [self.dense_cls for _ in range(4)]
+#         else:
+#             assert len(self.dense_cls) == 4, "dense_cls must be a sequence of length 4 for query, key, value, and out."
+#             dense_cls = self.dense_cls
+
+#         qkv_dense = [
+#             functools.partial(
+#                 cls,
+#                 dtype=self.dtype,
+#                 param_dtype=self.param_dtype,
+#                 features=(self.num_heads, head_dim),
+#                 kernel_init=self.kernel_init,
+#                 bias_init=self.bias_init,
+#                 use_bias=self.use_bias,
+#                 shard_axes={"kernel": self.qkv_shard_axes},
+#                 shard=self.shard,
+#                 axis=-1,
+#             ) for cls in dense_cls[:3]
+#         ]
+
+#         qkv_constraint = lambda x: x
+#         # qkv_constraint = functools.partial(
+#         #     self.with_sharding_constraint, axes=("X", None, "Y", None))
+
+#         query, key, value = (
+#             qkv_constraint(qkv_dense[0](name="query")(x)),
+#             qkv_constraint(qkv_dense[1](name="key")(x)),
+#             qkv_constraint(qkv_dense[2](name="value")(x)),
+#         )
+
+#         if self.rope:
+#             cos, sin = precompute_freqs_cis(
+#                 dim=head_dim, end=self.max_len, dtype=self.dtype)
+
+#         if not self.decode:
+#             if self.rope:
+#                 query, key = apply_rotary_pos_emb(query, key, cos, sin)
+#         else:
+#             is_initialized = self.has_variable("cache", "cached_key")
+#             init_fn = jnp.zeros
+#             # if self.shard:
+#             #     init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
+#             cached_key = self.variable(
+#                 "cache", "cached_key", init_fn, key.shape, key.dtype
+#             )
+#             cached_value = self.variable(
+#                 "cache", "cached_value", init_fn, value.shape, value.dtype
+#             )
+#             cache_index = self.variable(
+#                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+#             )
+#             if not is_initialized:
+#                 if self.rope:
+#                     query, key = apply_rotary_pos_emb(query, key, cos, sin)
+#             else:
+#                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+#                 # shape check of cached keys against query input
+#                 # expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
+#                 # if expected_shape != query.shape:
+#                 #     raise ValueError(
+#                 #         "Autoregressive cache shape error, "
+#                 #         "expected query shape %s instead got %s."
+#                 #         % (expected_shape, query.shape)
+#                 #     )
+#                 # update key, value caches with our new 1d spatial slices
+#                 num_queries = query.shape[-3]
+#                 cur_index = cache_index.value
+#                 if self.rope:
+#                     position_ids = jnp.arange(num_queries) + cur_index
+#                     position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
+#                     query, key = apply_rotary_pos_emb_index(query, key, cos, sin, position_ids)
+#                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+#                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
+#                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
+#                 cached_key.value = key
+#                 cached_value.value = value
+#                 cache_index.value = cache_index.value + num_queries
+
+#                 idx = jnp.arange(num_queries) + cur_index
+#                 mask = jnp.arange(max_length)[None, :] <= idx[:, None]
+#                 mask = jnp.broadcast_to(
+#                     mask, tuple(batch_dims) + (1, num_queries, max_length),
+#                 )
+
+
+#         dropout_rng = None
+#         if self.dropout_rate > 0 and not self.deterministic:
+#             dropout_rng = self.make_rng("dropout")
+#             deterministic = False
+#         else:
+#             deterministic = True
+
+#         if self.memory_efficient:
+#             assert not self.decode, "Memory efficient attention does not support decoding."
+#             assert deterministic, "Memory efficient attention does not support dropout."
+        
+#             mask_mode = self.memory_efficient_mask_mode
+#             context_lengths = None
+#             pad_positions = None
+#             if mask_mode == "causal":
+#                 if mask is not None:
+#                     print("WARNING: mask is not needed for memory efficient attention using mask_mode='causal'.")
+#                 mask = None
+#             # TODO: implement padding mask
+#             elif mask_mode == 'padding':
+#                 raise NotImplementedError
+#             #     if mask is not None:
+#             #         print("WARNING: padding mask is needed for memory efficient attention using mask_mode='padding'.")
+#             #     mask = mask[:, None, None, :]
+#             elif mask_mode == 'bidirectional':
+#                 if mask is not None:
+#                     print("WARNING: mask is not needed for memory efficient attention using mask_mode='bidirectional', we infer it from position_ids.")
+#                     mask = None
+#                 context_lengths = jnp.argmax(position_ids[:, 0, :], axis=1) + 1
+#             x = dot_product_attention_m(
+#                 query,
+#                 key,
+#                 value,
+#                 pad_positions,
+#                 context_lengths,
+#                 mask_mode,
+#                 dtype=self.dtype,
+#             )
+#         else:                
+#             x = dot_product_attention(
+#                 query,
+#                 key,
+#                 value,
+#                 mask=mask,
+#                 dropout_rng=dropout_rng,
+#                 dropout_rate=self.dropout_rate,
+#                 broadcast_dropout=self.broadcast_dropout,
+#                 deterministic=deterministic,
+#                 dtype=self.dtype,
+#             )
+
+#         out = dense_cls[3](
+#             features=features,
+#             axis=(-2, -1),
+#             use_bias=self.use_bias,
+#             kernel_init=self.kernel_init,
+#             bias_init=self.bias_init,
+#             dtype=self.dtype,
+#             param_dtype=self.param_dtype,
+#             shard_axes={"kernel": self.out_shard_axes},
+#             shard=self.shard,
+#             name="out",
+#         )(x)
+#         return out
 
 
 class MlpBlock(ShardModule):

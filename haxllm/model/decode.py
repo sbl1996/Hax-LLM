@@ -23,17 +23,17 @@ def gather_beams(xs, indices):
     return jax.tree_map(gather_fn, xs)
 
 
-def fix_cache_index(cache, true_index):
+def fix_cache_index(cache, offset):
     if isinstance(cache, FrozenDict):
         cache = unfreeze(cache)
     if 'hs' in cache['transformer']:
         v = cache['transformer']['hs']['attn']['cache_index']
-        cache['transformer']['hs']['attn']['cache_index'] = jnp.full_like(v, true_index)
+        cache['transformer']['hs']['attn']['cache_index'] = v - offset
     else:
         keys = [ k for k in cache['transformer'] if k.startswith('h_') ]
         for key in keys:
             v = cache['transformer'][key]['attn']['cache_index']
-            cache['transformer'][key]['attn']['cache_index'] = jnp.full_like(v, true_index)
+            cache['transformer'][key]['attn']['cache_index'] = v - offset
     return cache
 
 
@@ -107,7 +107,7 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         token = sample_token(logits, subrng, temperature, top_p, top_k)
         live_seq = live_seq.at[:, context_length].set(token)
         if pad_context is not None:
-            cache = fix_cache_index(cache, context_length)
+            cache = fix_cache_index(cache, pad_context - context_length)
         i = context_length
     else:
         i = 0
@@ -152,7 +152,7 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
         input_ids = live_seqs[:, :first_len]
         cache, logits = apply_fn(params, cache, input_ids)
         if pad_context is not None:
-            cache = fix_cache_index(cache, context_length)
+            cache = fix_cache_index(cache, pad_context - context_length)
     else:
         for i in range(context_length):
             input_ids = live_seqs[:, [i]]

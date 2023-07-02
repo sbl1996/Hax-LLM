@@ -17,7 +17,7 @@ def partial_stop(output, stop_str):
     return False
 
 
-def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, stream_interval=2, once=False):
+def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, stream_interval=2):
     tokenizer = pipeline.tokenizer
     prompt = params["prompt"]
     len_prompt = len(prompt)
@@ -50,7 +50,6 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
     else:
         pre = int(cache['h_0']['attn']['cache_index'])
     del cache
-    once = once and pre == 0
 
     if temperature < 1e-5 or top_k == 1:
         rng = None
@@ -59,9 +58,8 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
 
     for i in range(max_new_tokens):
         if i == 0:
-            print(f"First stage {pre}")
             input_ids = jnp.array([input_ids[pre:]], dtype=jnp.int32)
-            logits = pipeline.stream_forward(input_ids, once=once)
+            logits = pipeline.stream_forward(input_ids)
         else:
             logits = pipeline.stream_forward(
                 jnp.array([[token]], dtype=jnp.int32))
@@ -183,9 +181,6 @@ def chat_loop(
     conv = new_chat()
     reset = True
 
-    is_chatglm = "chatglm" in conv.name.lower()
-    once = is_chatglm
-
     while True:
         try:
             inp = chatio.prompt_for_input(conv.roles[0])
@@ -222,7 +217,7 @@ def chat_loop(
         reset = False
 
         chatio.prompt_for_output(conv.roles[1])
-        output_stream = generate_stream(pipeline, gen_params, context_len=max_len, once=once)
+        output_stream = generate_stream(pipeline, gen_params, context_len=max_len)
         t = time.time()
         outputs = chatio.stream_output(output_stream)
         duration = time.time() - t

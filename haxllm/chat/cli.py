@@ -169,7 +169,8 @@ def chat_app(cfg: DictConfig) -> None:
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
-        raise RuntimeError("Please specify a checkpoint to load using checkpoint==/path/to/ckpt_file")
+        checkpoint = model_config['name'] + "_np.safetensors"
+        print(f"Checkpoint not specified, using {checkpoint}")
 
     temperature = getattr(cfg, "temperature", 1.0)
     top_p = getattr(cfg, "top_p", 1.0)
