@@ -1,5 +1,4 @@
 from functools import partial
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -163,9 +162,49 @@ class TextGenerationPipeline:
             inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
             n_beams=beam_size, **kwargs)
 
+
+class ChatPipeline(TextGenerationPipeline):
+
+    def __init__(self, tokenizer, model, mesh=None, max_len=512, seed=0, pad_multiple=64):
+        r"""
+        Initialize the ChatPipeline with given tokenizer, model, and other optional parameters.
+
+        Parameters
+        ----------
+        tokenizer:
+            Tokenizer object that handles text encoding and decoding.
+        model:
+            Pre-trained model for text generation.
+        mesh: jax.sharding.Mesh, default None
+            a Mesh object for parallel processing.
+            If None, use single device and init the model on CPU.
+        max_len: int, default 512
+            maximum length of the generated text.
+        seed: int, default 0
+            random seed for reproducible results.
+        pad_multiple: int, default 64
+            multiple of padding length for two-stage decoding (to avoid jit recompilation)
+        """
+        super().__init__(tokenizer, model, mesh, max_len, seed, True, pad_multiple)
+        self.reset_chat_state()
+    
+    def reset_chat_state(self):
+        self._ccache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), self.cache)
+    
+    def get_cache_index(self):
+        cache = self._ccache['transformer']
+        if 'hs' in cache:
+            cache_index = int(cache['hs']['attn']['cache_index'][0])
+        else:
+            cache_index = int(cache['h_0']['attn']['cache_index'])
+        return cache_index
+    
+    def get_next_rng(self):
+        self._rng, rng = random.split(self._rng)
+        return rng
+
     def stream_forward(self, input_ids):
         self.check_init()
-        assert self._ccache is not None
         cache = self._ccache
         assert input_ids.ndim == 2 and input_ids.shape[0] == 1
         seq_len = input_ids.shape[1]
@@ -178,7 +217,7 @@ class TextGenerationPipeline:
             logits = logits[:, :seq_len]
             cache = fix_cache_index(cache, pad_context - seq_len)
         else:
-            cache, logits = self._apply_fn(self.params, cache, input_ids[:, [0]])
+            cache, logits = self._apply_fn(self.params, cache, input_ids)
         logits = logits.astype(jnp.float32)
         self._ccache = cache
         return logits

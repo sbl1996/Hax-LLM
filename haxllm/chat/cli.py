@@ -169,8 +169,11 @@ def chat_app(cfg: DictConfig) -> None:
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
-        checkpoint = model_config['name'] + "_np.safetensors"
-        print(f"Checkpoint not specified, using {checkpoint}")
+        from hydra.core.hydra_config import HydraConfig
+        hydra_cfg = HydraConfig.get()
+        model_config_name = hydra_cfg.runtime.choices.model
+        checkpoint = model_config_name + "_np.safetensors"
+        print(f"Checkpoint not specified, follow model config, using {checkpoint}")
 
     temperature = getattr(cfg, "temperature", 1.0)
     top_p = getattr(cfg, "top_p", 1.0)

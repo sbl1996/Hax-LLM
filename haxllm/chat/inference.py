@@ -1,12 +1,11 @@
 import abc
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 import time
 
-import jax
 import jax.numpy as jnp
 
 from haxllm.chat.conversation import get_conv_template
-from haxllm.pipeline.text_generation import TextGenerationPipeline
+from haxllm.pipeline.text_generation import ChatPipeline
 from haxllm.model.decode import sample_token, split_rng
 
 
@@ -17,7 +16,7 @@ def partial_stop(output, stop_str):
     return False
 
 
-def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, stream_interval=2):
+def generate_stream(pipeline: ChatPipeline, params, context_len=2048, stream_interval=2):
     tokenizer = pipeline.tokenizer
     prompt = params["prompt"]
     len_prompt = len(prompt)
@@ -29,7 +28,6 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
     echo = bool(params.get("echo", True))
     stop_token_ids = params.get("stop_token_ids", None) or []
     stop_token_ids.append(tokenizer.eos_token_id)
-    reset_cache = bool(params.get("reset_cache", False))
 
     input_ids = tokenizer(prompt).input_ids
     input_echo_len = len(input_ids)
@@ -41,20 +39,12 @@ def generate_stream(pipeline: TextGenerationPipeline, params, context_len=2048, 
 
     input_ids = input_ids[-max_src_len:]
 
-    if pipeline._ccache is None or reset_cache:
-        cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), pipeline.cache)
-        pipeline._ccache = cache
-    cache = pipeline._ccache['transformer']
-    if 'hs' in cache:
-        pre = int(cache['hs']['attn']['cache_index'][0])
-    else:
-        pre = int(cache['h_0']['attn']['cache_index'])
-    del cache
+    pre = pipeline.get_cache_index()
 
     if temperature < 1e-5 or top_k == 1:
         rng = None
     else:
-        pipeline._rng, rng = jax.random.split(pipeline._rng)
+        rng = pipeline.get_next_rng()
 
     for i in range(max_new_tokens):
         if i == 0:
@@ -162,7 +152,7 @@ class ChatIO(abc.ABC):
 
 
 def chat_loop(
-    pipeline: TextGenerationPipeline,
+    pipeline: ChatPipeline,
     chatio: ChatIO,
     max_len: int,
     conv_template: Optional[str] = None,
@@ -179,7 +169,7 @@ def chat_loop(
         return get_conv_template(conv_template)
 
     conv = new_chat()
-    reset = True
+    pipeline.reset_chat_state()
 
     while True:
         try:
@@ -194,7 +184,7 @@ def chat_loop(
         if inp == "!!reset":
             print("resetting...")
             conv = new_chat()
-            reset = True
+            pipeline.reset_chat_state()
             continue
         
         conv.append_message(conv.roles[0], inp)
@@ -212,9 +202,7 @@ def chat_loop(
             "stop": conv.stop_str,
             "stop_token_ids": conv.stop_token_ids,
             "echo": False,
-            "reset_cache": reset,
         }
-        reset = False
 
         chatio.prompt_for_output(conv.roles[1])
         output_stream = generate_stream(pipeline, gen_params, context_len=max_len)
