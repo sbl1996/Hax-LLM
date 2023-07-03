@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 import jax.numpy as jnp
 from haxllm.chat.inference import ChatIO, generate_stream, chat_loop
 from haxllm.chat.conversation import get_conv_template
-from haxllm.pipeline.text_generation import TextGenerationPipeline
+from haxllm.pipeline.text_generation import ChatPipeline
 
 
 class SimpleChatIO(ChatIO):
@@ -206,7 +206,7 @@ def chat_app(cfg: DictConfig) -> None:
     print("Load config {}".format(time.time() - start))
 
     max_len = getattr(cfg, "max_len", config.n_positions)
-    pipeline = TextGenerationPipeline(
+    pipeline = ChatPipeline(
         tokenizer, model, mesh=mesh, max_len=max_len, seed=random_seed)
     pipeline.init(transformer_weight=checkpoint)
 
