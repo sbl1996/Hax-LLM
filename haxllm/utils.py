@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timedelta
 import collections
 import itertools
+from tqdm import tqdm
+
 from safetensors.numpy import load_file
 
 import numpy as np
@@ -224,14 +226,14 @@ def load_transformer_params(params, path: str, device, lm_head=False):
     all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
     if lm_head:
         all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
-    for key in all_keys:
+    for key in tqdm(all_keys):
         if key not in new_transformer_params:
             print(f"Key {key} not found in transformer params")
             continue
         
         full_key = key if key.startswith("lm_head") else prefix + key
         p = params[full_key]
-        print(f"Loading param {key}")
+        # print(f"Loading param {key}")
         x = new_transformer_params[key]
         if isinstance(p, nn.Partitioned):
             dtype = p.value.dtype
@@ -247,21 +249,12 @@ def load_transformer_params(params, path: str, device, lm_head=False):
                 spec = p.get_partition_spec()
             else:
                 spec = p.sharding.spec
-            #     print("Before p", p.value.sharding)
-            #     print(p.names)
-            # else:
-            #     print("Before", p.sharding)
             with mesh:
                 x = jax.device_put(x, NamedSharding(mesh, spec))
         if isinstance(p, nn.Partitioned):
             params[full_key] = p.replace_boxed(x)
         else:
             params[full_key] = x
-        # if isinstance(p, nn.Partitioned):
-        #     print("After p", params[full_key].value.sharding)
-        #     print(params[full_key].names)
-        # else:
-        #     print("After", params[full_key].sharding)
         del p, x
     return params
 
