@@ -197,6 +197,7 @@ def load_transformer_params(params, path: str, device, lm_head=False):
     # detect scan or remat_scan
     hs_keys = [k for k in params.keys() if k.startswith("transformer.hs")]
     if hs_keys:
+        print("Converting scan params...")
         src_keys = [k for k in transformer_params if k.startswith("h_")]
         h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
         sample_key = next(iter(h_params.keys()))
@@ -226,6 +227,7 @@ def load_transformer_params(params, path: str, device, lm_head=False):
     all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
     if lm_head:
         all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
+    print("Loading param on device...")
     for key in tqdm(all_keys):
         if key not in new_transformer_params:
             print(f"Key {key} not found in transformer params")

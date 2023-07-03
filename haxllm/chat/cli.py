@@ -203,13 +203,16 @@ def chat_app(cfg: DictConfig) -> None:
 
     model = getattr(mod, "TransformerLMHeadModel")(config)
 
-    print("Load config {}".format(time.time() - start))
-
     max_len = getattr(cfg, "max_len", config.n_positions)
     pipeline = ChatPipeline(
         tokenizer, model, mesh=mesh, max_len=max_len, seed=random_seed)
     pipeline.init(transformer_weight=checkpoint)
 
+    print("Conversation setting:")
+    print(f"  temperature: {temperature}")
+    print(f"  top_p: {top_p}")
+    print(f"  top_k: {top_k}")
+    print(f"  max_len: {max_len}")
     try:
         chat_loop(
             pipeline,
