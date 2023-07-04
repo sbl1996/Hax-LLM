@@ -6,7 +6,7 @@ from flax import struct
 from haxllm.model.modules import RMSNorm
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral
 from haxllm.model.utils import load_config as _load_config
-from haxllm.model.llama import (
+from haxllm.model.chatglm2 import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
@@ -19,7 +19,7 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        raise ValueError(f"Unknown chatglm2 model {name}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 
@@ -37,6 +37,11 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, inputs):
+        if isinstance(inputs, tuple):
+            inputs, padding_mask = inputs
+        else:
+            padding_mask = None
+
         config = self.config
 
         prefix_key_value = PrefixEmbed(
@@ -57,21 +62,21 @@ class TransformerBlock(nn.Module):
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
+            multi_query_groups=config.num_groups,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            qkv_bias=False,
+            qkv_bias=True,
             out_bias=False,
             decode=config.decode,
-            memory_efficient=config.memory_efficient_attention,
-            memory_efficient_mask_mode='causal',
             rope=True,
             query_shard_axes=("X", "Y", None),
+            kv_shard_axes=("X", None, "Y"),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             zero_init=config.zero_init_prefix_attn,
-            name="attn")(x, mask=mask, prefix_key_value=prefix_key_value)
+            name="attn")(x, mask, padding_mask, prefix_key_value=prefix_key_value)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps,
@@ -85,10 +90,15 @@ class TransformerBlock(nn.Module):
             shard_axes2=("Y", "X"),
             shard=config.shard,
             name="mlp")(y)
+        y = x + y
+
+        if padding_mask is not None:
+            y = (y, padding_mask)
         if self.scan:
-            return x + y, None
+            return y, None
         else:
-            return x + y
+            return y
+
 
 
 class TransformerSequenceClassifier(nn.Module):

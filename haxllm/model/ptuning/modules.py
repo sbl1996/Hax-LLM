@@ -20,7 +20,11 @@ from haxllm.model.parallel import (
     ShardAxis,
     precompute_freqs_cis,
     apply_rotary_pos_emb,
-    apply_glm_rotary_pos_emb,
+    apply_rotary_pos_emb_index,
+    precompute_freqs_cis2,
+    apply_rotary_pos_emb2,
+    apply_rotary_pos_emb_index2,
+    ModuleClass,
 )
 
 
@@ -87,10 +91,10 @@ class PrefixEmbed(nn.Module):
 def dot_product_attention_weights(
     query: Array,
     key: Array,
+    prefix_len: int,
     gate: Optional[Array] = None,
     bias: Optional[Array] = None,
     mask: Optional[Array] = None,
-    prefix_len: Optional[int] = None,
     broadcast_dropout: bool = True,
     dropout_rng: Optional[PRNGKey] = None,
     dropout_rate: float = 0.0,
@@ -118,14 +122,9 @@ def dot_product_attention_weights(
     if gate is None:
         attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
     else:
-        if prefix_len is None:
-            q_len, k_len = attn_weights.shape[-2:]
-            prefix_len = k_len - q_len
         attn_weights1 = jax.nn.softmax(attn_weights[..., :prefix_len]) * gate
         attn_weights2 = jax.nn.softmax(attn_weights[..., prefix_len:])
-        attn_weights = jnp.concatenate([attn_weights1, attn_weights2], axis=-1).astype(
-            dtype
-        )
+        attn_weights = jnp.concatenate([attn_weights1, attn_weights2], axis=-1).astype(dtype)
 
     if not deterministic and dropout_rate > 0.0:
         keep_prob = 1.0 - dropout_rate
@@ -145,10 +144,10 @@ def dot_product_attention(
     query: Array,
     key: Array,
     value: Array,
+    prefix_len: int,
     prefix_gate: Optional[Array] = None,
     bias: Optional[Array] = None,
     mask: Optional[Array] = None,
-    prefix_len: Optional[int] = None,
     broadcast_dropout: bool = True,
     dropout_rng: Optional[PRNGKey] = None,
     dropout_rate: float = 0.0,
@@ -170,10 +169,10 @@ def dot_product_attention(
     attn_weights = dot_product_attention_weights(
         query,
         key,
+        prefix_len,
         prefix_gate,
         bias,
         mask,
-        prefix_len,
         broadcast_dropout,
         dropout_rng,
         dropout_rate,
@@ -189,6 +188,7 @@ def dot_product_attention(
 class SelfAttention(ShardModule):
     num_heads: int
     max_len: int
+    multi_query_groups: Optional[int] = None
     dtype: Optional[Dtype] = None
     param_dtype: Optional[Dtype] = jnp.float32
     broadcast_dropout: bool = False
@@ -196,75 +196,108 @@ class SelfAttention(ShardModule):
     deterministic: Optional[bool] = None
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-    use_bias: bool = True
+    qkv_bias: bool = True
+    out_bias: bool = True
     decode: bool = False
-    zero_init: bool = False
     rope: bool = False
-    qkv_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
+    zero_init: bool = True
+    memory_efficient: bool = False
+    memory_efficient_mask_mode: str = "causal"
+    query_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
+    kv_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis]] = None
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
+    dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
     def __call__(
         self,
         x: Array,
         mask: Optional[Array] = None,
-        position_ids: Optional[Array] = None,
+        padding_mask: Optional[Array] = None,
         prefix_key_value: Optional[Tuple[Array]] = None,
     ):
+        assert prefix_key_value is not None
+        multi_query = self.multi_query_groups is not None
+        kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
         head_dim = features // self.num_heads
 
-        if position_ids is not None:
-            assert position_ids.ndim == 3, "Only ChatGLM style 2D position_ids can be used."
+        if not isinstance(self.dense_cls, Sequence):
+            dense_cls = [self.dense_cls for _ in range(4)]
+        else:
+            assert len(self.dense_cls) == 4, "dense_cls must be a sequence of length 4 for query, key, value, and out."
+            dense_cls = self.dense_cls
 
-        dense = functools.partial(
-            DenseGeneral,
-            axis=-1,
+        query = dense_cls[0](
+            features=(self.num_heads, head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            features=(self.num_heads, head_dim),
             kernel_init=self.kernel_init,
             bias_init=self.bias_init,
-            use_bias=self.use_bias,
-            shard_axes={"kernel": self.qkv_shard_axes},
+            use_bias=self.qkv_bias,
+            shard_axes={"kernel": self.query_shard_axes},
             shard=self.shard,
-        )
+            axis=-1,
+            name="query",
+        )(x)
 
-        qkv_constraint = lambda x: x
-        # qkv_constraint = functools.partial(
-        #     self.with_sharding_constraint, axes=("X", None, "Y", None))
+        kv_num_heads = self.num_heads
+        if multi_query:
+            kv_num_heads = self.multi_query_groups
 
-        query, key, value = (
-            qkv_constraint(dense(name="query")(x)),
-            qkv_constraint(dense(name="key")(x)),
-            qkv_constraint(dense(name="value")(x)),
-        )
+        kv_dense = [
+            functools.partial(
+                cls,
+                features=(kv_num_heads, head_dim),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                use_bias=self.qkv_bias,
+                shard_axes={"kernel": kv_shard_axes},
+                shard=self.shard,
+                axis=-1,
+            ) for cls in dense_cls[1:3]
+        ]
 
-        # ChatGLM style 2d position encoding
-        position_encoding_2d = position_ids is not None
+        key = kv_dense[0](name="key")(x)
+        value = kv_dense[1](name="value")(x)
+
+        if multi_query:
+            key = jnp.expand_dims(key, axis=-2)
+            key = jnp.tile(key, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
+            key = jnp.reshape(key, (*key.shape[:2], self.num_heads, head_dim))
+            # key = self.with_sharding_constraint(key, axes=("X", None, "Y", None))
+
+            value = jnp.expand_dims(value, axis=-2)
+            value = jnp.tile(value, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
+            value = jnp.reshape(value, (*value.shape[:2], self.num_heads, head_dim))
 
         if self.rope:
-            pe_dim = head_dim // 2 if position_encoding_2d else head_dim
-            cos, sin = precompute_freqs_cis(
-                dim=pe_dim, end=self.max_len, dtype=self.dtype)
+            if multi_query:
+                cos, sin = precompute_freqs_cis2(
+                    dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
+                add_pos = lambda q, k: apply_rotary_pos_emb2(q, k, cos, sin)
+                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
+            else:
+                cos, sin = precompute_freqs_cis(
+                    dim=head_dim, end=self.max_len, dtype=self.dtype)
+                add_pos = lambda q, k: apply_rotary_pos_emb(q, k, cos, sin)
+                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+        else:
+            add_pos = lambda q, k: (q, k)
 
         if not self.decode:
-            if self.rope:
-                if position_encoding_2d:
-                    # 2D position_ids is (batch_size, 2, seq_len)
-                    query, key = apply_glm_rotary_pos_emb(query, key, cos, sin, position_ids)
-                else:
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            query, key = add_pos(query, key)
         else:
-            raise NotImplementedError("Decode not implemented.")
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
-            if self.shard:
-                init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
+            # if self.shard:
+            #     init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
             cached_key = self.variable(
                 "cache", "cached_key", init_fn, key.shape, key.dtype
             )
@@ -275,41 +308,35 @@ class SelfAttention(ShardModule):
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
             if not is_initialized:
-                if self.rope:
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                query, key = add_pos(query, key)
             else:
-                (
-                    *batch_dims,
-                    max_length,
-                    num_heads,
-                    depth_per_head,
-                ) = cached_key.value.shape
-                # shape check of cached keys against query input
-                expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
-                if expected_shape != query.shape:
-                    raise ValueError(
-                        "Autoregressive cache shape error, "
-                        "expected query shape %s instead got %s."
-                        % (expected_shape, query.shape)
-                    )
+
+                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
                 # update key, value caches with our new 1d spatial slices
+                num_queries = query.shape[-3]
                 cur_index = cache_index.value
                 if self.rope:
-                    pos_index = jnp.array([cur_index], dtype=jnp.int32)
-                    cos, sin = cos[pos_index], sin[pos_index]
-                    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                    position_ids = jnp.arange(num_queries) + cur_index
+                    position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
+                    query, key = add_pos_i(query, key, position_ids)
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 cached_key.value = key
                 cached_value.value = value
-                cache_index.value = cache_index.value + 1
-                mask = combine_masks(
-                    mask,
-                    jnp.broadcast_to(
-                        jnp.arange(max_length) <= cur_index,
-                        tuple(batch_dims) + (1, 1, max_length),
-                    ),
+
+                # for pad_context
+                if padding_mask is not None:
+                    offset = jnp.argmax(padding_mask[0])
+                    offset = jnp.where(offset == 0, num_queries, offset)
+                else:
+                    offset = num_queries
+                cache_index.value = cache_index.value + offset
+
+                idx = jnp.arange(num_queries) + cur_index
+                mask = jnp.arange(max_length)[None, :] <= idx[:, None]
+                mask = jnp.broadcast_to(
+                    mask, tuple(batch_dims) + (1, num_queries, max_length),
                 )
 
         dropout_rng = None
@@ -319,39 +346,72 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
-        if prefix_key_value is not None:
+        if self.memory_efficient:
+            raise NotImplementedError
+            assert not self.decode, "Memory efficient attention does not support decoding."
+            assert deterministic, "Memory efficient attention does not support dropout."
+        
+            mask_mode = self.memory_efficient_mask_mode
+            context_lengths = None
+            pad_positions = None
+            if mask_mode == "causal":
+                if mask is not None:
+                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='causal'.")
+                mask = None
+            # TODO: implement padding mask
+            elif mask_mode == 'padding':
+                raise NotImplementedError
+            #     if mask is not None:
+            #         print("WARNING: padding mask is needed for memory efficient attention using mask_mode='padding'.")
+            #     mask = mask[:, None, None, :]
+            elif mask_mode == 'bidirectional':
+                if mask is not None:
+                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='bidirectional', we infer it from position_ids.")
+                    mask = None
+                context_lengths = jnp.argmax(position_ids[:, 0, :], axis=1) + 1
+            x = dot_product_attention_m(
+                query,
+                key,
+                value,
+                pad_positions,
+                context_lengths,
+                mask_mode,
+                dtype=self.dtype,
+            )
+        else:     
             key = jnp.concatenate([prefix_key_value[0], key], axis=1)
             value = jnp.concatenate([prefix_key_value[1], value], axis=1)
             prefix_len = prefix_key_value[0].shape[1]
-        else:
-            prefix_len = None
+            if mask is not None:
+                prefix_mask = jnp.ones(mask.shape[:-1] + (prefix_len,), dtype=mask.dtype)
+                mask = jnp.concatenate([prefix_mask, mask], axis=-1)
 
-        if self.zero_init:
-            prefix_gate = self.param(
-                "prefix_gate", initializers.zeros, (self.num_heads,), jnp.float32,
+            if self.zero_init:
+                prefix_gate = self.param(
+                    "prefix_gate", initializers.zeros, (self.num_heads,), jnp.float32,
+                )
+                prefix_gate = prefix_gate[None, :, None, None]
+            else:
+                prefix_gate = None
+
+            x = dot_product_attention(
+                query,
+                key,
+                value,
+                prefix_len=prefix_len,
+                prefix_gate=prefix_gate,
+                mask=mask,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.dropout_rate,
+                broadcast_dropout=self.broadcast_dropout,
+                deterministic=deterministic,
+                dtype=self.dtype,
             )
-            prefix_gate = prefix_gate[None, :, None, None]
-        else:
-            prefix_gate = None
 
-        x = dot_product_attention(
-            query,
-            key,
-            value,
-            prefix_gate=prefix_gate,
-            mask=mask,
-            prefix_len=prefix_len,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.dropout_rate,
-            broadcast_dropout=self.broadcast_dropout,
-            deterministic=deterministic,
-            dtype=self.dtype,
-        )
-
-        out = DenseGeneral(
+        out = dense_cls[3](
             features=features,
             axis=(-2, -1),
-            use_bias=self.use_bias,
+            use_bias=self.out_bias,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init,
             dtype=self.dtype,
@@ -359,9 +419,5 @@ class SelfAttention(ShardModule):
             shard_axes={"kernel": self.out_shard_axes},
             shard=self.shard,
             name="out",
-        )(
-            x
-        )  # type: ignore
-        # out = self.with_sharding_constraint(
-        #     out, ("X", None, "Y"))
+        )(x)
         return out

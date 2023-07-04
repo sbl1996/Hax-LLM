@@ -77,7 +77,6 @@ class TransformerBlock(nn.Module):
             padding_mask = None
 
         config = self.config
-        # jax.debug.print("inputs {}", inputs[0, :, :10])
 
         if config.memory_efficient_attention or config.decode:
             mask = None
