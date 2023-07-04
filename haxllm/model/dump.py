@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 
 import importlib
@@ -46,6 +47,24 @@ def load_from_safetensors_files(files):
     return tensors
 
 
+def check_torch_ckpt(model_dir):
+    torch_index = model_dir / "pytorch_model.bin.index.json"
+    if not torch_index.exists():
+        return False
+    with open(torch_index) as f:
+        ckpt_files = list(set(json.load(f)['weight_map'].values()))
+    return all((model_dir / f).exists() for f in ckpt_files)
+
+
+def check_safetensors_ckpt(model_dir):
+    safetensors_index = model_dir / "model.safetensors.index.json"
+    if not safetensors_index.exists():
+        return False
+    with open(safetensors_index) as f:
+        ckpt_files = list(json.load(f).values())
+    return all((model_dir / f).exists() for f in ckpt_files)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model-family", type=str, required=True,
@@ -61,39 +80,45 @@ if __name__ == "__main__":
     mod = importlib.import_module(mod_name)
 
     bin_files = None
-    tensors = None
+    model_name = None
 
-    if os.path.exists(os.path.expanduser(args.source)):
-        source = Path(args.source).expanduser().absolute()
-        if source.is_dir():
-            model_dir = Path(args.base_model_dir).expanduser().absolute()
-            bin_files = sorted(model_dir.glob("pytorch_model-*.bin"))
-            if not bin_files:
-                bin_files = sorted(model_dir.glob("model-*.safetensors"))
-            if not bin_files:
-                raise ValueError("No model files found in {}".format(model_dir))
-            model_name = model_dir.name    
-        else:
-            ckpt_path = source
-            suffix = ckpt_path.suffix
-            assert suffix in [".bin", ".safetensors"], "Unknown file type: {}, must be .bin or .safetensors".format(suffix)
-            bin_files = [ckpt_path]
-            model_name = ckpt_path.stem
-    else:
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained(args.source, trust_remote_code=True)
-        tensors = model.state_dict()
-        del model
-        keys = list(tensors.keys())
-        for k in keys:
-            tensors[k] = tensor_to_numpy(tensors[k])
+    source = args.source
+    if not os.path.exists(os.path.expanduser(source)):
+        print("Not a local path, try to load from huggingface hub")
+        from transformers import AutoModelForCausalLM, AutoConfig
+        from transformers.utils.hub import cached_file
+        config = AutoConfig.from_pretrained(source, trust_remote_code=True)
+        config_file = cached_file(args.source, "config.json")
+        model_dir = Path(config_file).parent
+
+        ckpt_exists = check_torch_ckpt(model_dir) or check_safetensors_ckpt(model_dir)
+        if not ckpt_exists:
+            model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
+            del model
+        
+        source = os.path.dirname(config_file)
         model_name = args.source.split("/")[-1]
 
-    if tensors is None:
-        if bin_files[0].suffix == ".bin":
-            tensors = load_from_torch_bin_files(bin_files)
-        else:
-            tensors = load_from_safetensors_files(bin_files)
+    source = Path(source).expanduser().absolute()
+    if source.is_dir():
+        model_dir = source
+        bin_files = sorted(model_dir.glob("pytorch_model-*.bin"))
+        if not bin_files:
+            bin_files = sorted(model_dir.glob("model-*.safetensors"))
+        if not bin_files:
+            raise ValueError("No model files found in {}".format(model_dir))
+        model_name = model_name or model_dir.name    
+    else:
+        ckpt_path = source
+        suffix = ckpt_path.suffix
+        assert suffix in [".bin", ".safetensors"], "Unknown file type: {}, must be .bin or .safetensors".format(suffix)
+        bin_files = [ckpt_path]
+        model_name = model_name or ckpt_path.stem
+
+    if bin_files[0].suffix == ".bin":
+        tensors = load_from_torch_bin_files(bin_files)
+    else:
+        tensors = load_from_safetensors_files(bin_files)
 
     target = Path(args.target).expanduser().absolute()
     if target.is_dir():
