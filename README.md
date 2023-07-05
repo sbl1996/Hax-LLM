@@ -8,8 +8,9 @@
 ## Models
 - GPT-2
 - BERT (RoBERTa)
-- LLaMA (Vicuna)
-- ChatGLM (v2 in process)
+- LLaMA
+- Vicuna
+- ChatGLM2
 
 
 ## Parameter-Efficient Fine-Tuning (PEFT)
@@ -55,7 +56,7 @@ python3 -m haxllm.model.dump -m llama -s lmsys/vicuna-7b-v1.3
 
 Then, we can chat with the model.
 ```bash
-python3 -m haxllm.chat.cli model=vicuna-7b checkpoint=vicuna-7b-v1.3_np.safetensors
+python3 -m haxllm.chat.cli model=vicuna-7b checkpoint=vicuna-7b-v1.3_np.safetensors temperature=0.7
 ```
 You may refer `configs/chat/base.yaml` for more settings like max length, temperature, top-k, top-p.
 

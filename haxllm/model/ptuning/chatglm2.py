@@ -58,7 +58,7 @@ class TransformerBlock(nn.Module):
         else:
             mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
 
-        x = RMSNorm(epsilon=config.rms_norm_eps,
+        x = RMSNorm(epsilon=config.layer_norm_epsilon,
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
@@ -79,7 +79,7 @@ class TransformerBlock(nn.Module):
             name="attn")(x, mask, padding_mask, prefix_key_value=prefix_key_value)
         x = x + inputs
 
-        y = RMSNorm(epsilon=config.rms_norm_eps,
+        y = RMSNorm(epsilon=config.layer_norm_epsilon,
                     dtype=config.dtype, name="ln_2")(x)
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,

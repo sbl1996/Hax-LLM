@@ -85,7 +85,7 @@ if __name__ == "__main__":
     source = args.source
     if not os.path.exists(os.path.expanduser(source)):
         print("Not a local path, try to load from huggingface hub")
-        from transformers import AutoModelForCausalLM, AutoConfig
+        from transformers import AutoModelForCausalLM, AutoConfig, AutoModel
         from transformers.utils.hub import cached_file
         config = AutoConfig.from_pretrained(source, trust_remote_code=True)
         config_file = cached_file(args.source, "config.json")
@@ -93,7 +93,10 @@ if __name__ == "__main__":
 
         ckpt_exists = check_torch_ckpt(model_dir) or check_safetensors_ckpt(model_dir)
         if not ckpt_exists:
-            model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
+            try:
+                model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
+            except ValueError:
+                model = AutoModel.from_pretrained(source, trust_remote_code=True)
             del model
         
         source = os.path.dirname(config_file)
