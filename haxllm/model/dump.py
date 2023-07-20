@@ -46,23 +46,38 @@ def load_from_safetensors_files(files):
                 tensors[k] = f.get_tensor(k)
     return tensors
 
+SAFE_TENSORS_INDEX = "model.safetensors.index.json"
+TORCH_INDEX = "pytorch_model.bin.index.json"
 
-def check_torch_ckpt(model_dir):
-    torch_index = model_dir / "pytorch_model.bin.index.json"
-    if not torch_index.exists():
+
+def get_ckpt_files_from_index(index_file):
+    with open(index_file) as f:
+        d = json.load(f)
+        if "weight_map" in d:
+            d = d["weight_map"]
+        ckpt_files = list(set(d.values()))
+    return ckpt_files
+
+
+def check_ckpt(model_dir, ckpt_type):
+    if ckpt_type == "bin":
+        index_file = model_dir / TORCH_INDEX
+    elif ckpt_type == "safetensors":
+        index_file = model_dir / SAFE_TENSORS_INDEX
+    else:
+        raise ValueError("Unknown ckpt type: {}".format(ckpt_type))
+    if not index_file.exists():
         return False
-    with open(torch_index) as f:
-        ckpt_files = list(set(json.load(f)['weight_map'].values()))
+    ckpt_files = get_ckpt_files_from_index(index_file)
     return all((model_dir / f).exists() for f in ckpt_files)
 
 
 def check_safetensors_ckpt(model_dir):
-    safetensors_index = model_dir / "model.safetensors.index.json"
-    if not safetensors_index.exists():
-        return False
-    with open(safetensors_index) as f:
-        ckpt_files = list(json.load(f).values())
-    return all((model_dir / f).exists() for f in ckpt_files)
+    return check_ckpt(model_dir, "safetensors")
+
+
+def check_torch_ckpt(model_dir):
+    return check_ckpt(model_dir, "bin")
 
 
 if __name__ == "__main__":
@@ -71,8 +86,11 @@ if __name__ == "__main__":
                         help="Model family available in haxllm.model")
     parser.add_argument("-s", "--source", type=str, required=True,
                         help="Path to the model checkpoint file or directory, can be remote huggingface hub")
-    parser.add_argument("-t", "--target", type=str, default=".",
-                        help="Target path to save the dumped model")
+    parser.add_argument("-o", "--output", type=str, default=".",
+                        help="Output path to save the dumped model")
+    parser.add_argument("-t", "--type", type=str, default=None,
+                        help="Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension")
+
 
     args = parser.parse_args()
     mod_name = "haxllm.model.{}".format(args.model_family)
@@ -88,17 +106,26 @@ if __name__ == "__main__":
         from transformers import AutoModelForCausalLM, AutoConfig, AutoModel
         from transformers.utils.hub import cached_file
         config = AutoConfig.from_pretrained(source, trust_remote_code=True)
-        config_file = cached_file(args.source, "config.json")
+        config_file = cached_file(source, "config.json")
         model_dir = Path(config_file).parent
 
-        ckpt_exists = check_torch_ckpt(model_dir) or check_safetensors_ckpt(model_dir)
-        if not ckpt_exists:
-            try:
-                model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
-            except ValueError:
-                model = AutoModel.from_pretrained(source, trust_remote_code=True)
-            del model
-        
+        if args.type is None:
+            ckpt_exists = check_torch_ckpt(model_dir) or check_safetensors_ckpt(model_dir)
+            if not ckpt_exists:
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
+                except ValueError:
+                    model = AutoModel.from_pretrained(source, trust_remote_code=True)
+                del model
+        else:
+            ckpt_exists = check_ckpt(model_dir, args.type)
+            if not ckpt_exists:
+                from huggingface_hub import hf_hub_download
+                ckpt_index = hf_hub_download(repo_id=source, filename=SAFE_TENSORS_INDEX)
+                ckpt_files = get_ckpt_files_from_index(ckpt_index)
+                for f in ckpt_files:
+                    hf_hub_download(repo_id=source, filename=f)
+
         source = os.path.dirname(config_file)
         model_name = args.source.split("/")[-1]
 
@@ -123,7 +150,7 @@ if __name__ == "__main__":
     else:
         tensors = load_from_safetensors_files(bin_files)
 
-    target = Path(args.target).expanduser().absolute()
+    target = Path(args.output).expanduser().absolute()
     if target.is_dir():
         save_path = target / "{}_np.safetensors".format(model_name)
     else:

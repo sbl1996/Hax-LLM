@@ -2,9 +2,12 @@
 
 import time
 import os
+import glob
 import re
 import sys
 import importlib
+
+import difflib
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -162,17 +165,35 @@ def chat_app(cfg: DictConfig) -> None:
     start = time.time()
     # jax_smi.initialise_tracking()
 
-    model_config = OmegaConf.to_container(cfg.model, resolve=True)
+    model_name = getattr(cfg, "model", None)
+    if model_name is None:
+        raise ValueError("Model name not specified")
+
+    template = cfg.template
+    # TODO: infer template from model name
+    # template = getattr(cfg, "template", None)
+    # if template is None:
+    #     print("Template not specified, infer from model name...")
+    #     from hydra.core.hydra_config import HydraConfig
+    #     hydra_cfg = HydraConfig.get()
+    #     main_path = [ s['path'] for s in hydra_cfg.runtime['config_sources'] if s['provider'] == 'main' ][0]
+    #     all_templates = [
+    #         os.path.basename(p).replace(".yaml", "")
+    #         for p in glob.glob(os.path.join(main_path, "template", "*.yaml"))
+    #     ]
+    #     template_names = difflib.get_close_matches(model_name, all_templates, n=1, cutoff=0.5)
+    #     if len(template_names) == 0:
+    #         raise ValueError(f"Cannot infer template from model name {model_name}")
+    #     template = template_names[0]
+
+    template_config = OmegaConf.to_container(template, resolve=True)
     random_seed = cfg.seed
-    tokenizer_name = model_config.pop("tokenizer")
-    conv_template = model_config.pop("conv_template", None)
+    tokenizer_name = template_config.pop("tokenizer")
+    conv_template = template_config.pop("conv_template", None)
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
-        from hydra.core.hydra_config import HydraConfig
-        hydra_cfg = HydraConfig.get()
-        model_config_name = hydra_cfg.runtime.choices.model
-        checkpoint = model_config_name + "_np.safetensors"
+        checkpoint = model_name + "_np.safetensors"
         print(f"Checkpoint not specified, follow model config, using {checkpoint}")
 
     temperature = getattr(cfg, "temperature", 1.0)
@@ -189,24 +210,31 @@ def chat_app(cfg: DictConfig) -> None:
 
     mesh = getattr(cfg, "mesh", None)
     parallel = mesh is not None
-    mod = importlib.import_module("haxllm.model." + model_config.pop("family"))
 
+    module = "haxllm.model"
+    peft = getattr(cfg, "peft", None)
+    if peft is not None:
+        module = module + "." + peft
+    mod = importlib.import_module(module + "." + template_config.pop("family"))
+
+    model_config = {"name": model_name, **template_config}
     config = getattr(mod, "load_config")(
         dtype=jnp.dtype(cfg.dtype),
         param_dtype=jnp.dtype(cfg.param_dtype),
         **model_config,
         decode=True,
         shard=parallel,
+        shard_cache=parallel,
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = config.pad_token_id
 
     model = getattr(mod, "TransformerLMHeadModel")(config)
 
-    max_len = getattr(cfg, "max_len", config.n_positions)
+    max_len = getattr(cfg, "max_len", None) or config.n_positions
     pipeline = ChatPipeline(
-        tokenizer, model, mesh=mesh, max_len=max_len, seed=random_seed)
-    pipeline.init(transformer_weight=checkpoint)
+        tokenizer, model, max_len=max_len, seed=random_seed)
+    pipeline.init(transformer_weight=checkpoint, mesh=mesh)
 
     print("Conversation setting:")
     print(f"  temperature: {temperature}")

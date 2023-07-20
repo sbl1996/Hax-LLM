@@ -14,6 +14,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from haxllm.utils import load_transformer_params, get_metrics, report_params_and_flops, get_sharding, create_mesh, \
     freeze_params_optimizer
+from haxllm.pipeline.text_generation import TextGenerationPipeline
 
 
 Array = Any
@@ -180,6 +181,14 @@ class Trainer:
             abs_params = jax.eval_shape(self.model.init, rng, input_ids=input_ids)['params']
             self.tx = freeze_params_optimizer(tx, abs_params, tx.trainable_pattern)
 
+    def set_pipeline(self, tokenizer, max_len, temperature: float = 1.0, top_k: int = -1, top_p: float = 1):
+        model = self.model
+        model = model.clone(config=model.config.replace(decode=True, shard_cache=True))
+        pipeline = TextGenerationPipeline(
+            tokenizer, model, max_len, rng=self._rng, temperature=temperature, top_k=top_k, top_p=top_p)
+        pipeline.init_without_params(getattr(self, "mesh", None))
+        self.pipeline = pipeline
+
 
 class DPTrainer(Trainer):
 
@@ -256,9 +265,6 @@ class DPTrainer(Trainer):
     def report_params_and_flops(self, max_len, batch_size):
         return super().report_params_and_flops(max_len, batch_size) // jax.local_device_count()
 
-    def freeze(self, pattern):
-        self._params = freeze(self._params, pattern=pattern)
-
 
 class MPTrainer(Trainer):
 
@@ -318,3 +324,7 @@ class MPTrainer(Trainer):
     
     def get_metrics(self, metrics_list):
         return get_metrics(metrics_list, pmap=False)
+
+    def predict_step(self, batch):
+        output_ids = self.pipeline.greedy_search(batch["input_ids"])
+        return output_ids

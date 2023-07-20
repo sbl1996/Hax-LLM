@@ -1,4 +1,3 @@
 family: gpt2
-name: gpt2-large
 tokenizer: gpt2
 scan: True

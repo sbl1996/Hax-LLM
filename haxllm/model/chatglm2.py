@@ -51,8 +51,7 @@ class TransformerConfig(RematScanConfigMixin):
     num_groups: int = 2
     layer_norm_epsilon: float = 1e-5
     n_positions: int = 32768
-    pad_token_id: int = 2
-    bos_token_id: int = 1
+    pad_token_id: int = 0
     eos_token_id: int = 2
     mask_token_id: int = 64789
     gmask_token_id: int = 64790
@@ -61,6 +60,7 @@ class TransformerConfig(RematScanConfigMixin):
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     decode: bool = False
     shard: bool = False
+    shard_cache: bool = False
 
 
 # TODO: skip apply_query_key_layer_scaling, same as query_key_layer_scaling_coeff in chatglm
@@ -71,11 +71,6 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, inputs):
-        if isinstance(inputs, tuple):
-            inputs, padding_mask = inputs
-        else:
-            padding_mask = None
-
         config = self.config
 
         if config.memory_efficient_attention or config.decode:
@@ -100,7 +95,8 @@ class TransformerBlock(nn.Module):
             kv_shard_axes=("X", None, "Y"),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
-            name="attn")(x, mask, padding_mask)
+            shard_cache=config.shard_cache,
+            name="attn")(x, mask)
 
         x = x + inputs
 
@@ -118,8 +114,6 @@ class TransformerBlock(nn.Module):
 
         y = x + y
 
-        if padding_mask is not None:
-            y = (y, padding_mask)
         if self.scan:
             return y, None
         else:
@@ -145,13 +139,8 @@ class TransformerModel(nn.Module):
             shard=config.shard,
             name="wte")(inputs)
 
-        if config.decode and inputs.shape[1] > 1:
-            padding_mask = jnp.equal(inputs, config.pad_token_id)
-            x = make_block_stack(
-                self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
-        else:
-            x = make_block_stack(
-                self.block_cls, config.n_layers, config)(x, train)
+        x = make_block_stack(
+            self.block_cls, config.n_layers, config)(x, train)
 
         norm_layer = RMSNorm if remat else RMSNorm
         x = norm_layer(epsilon=config.layer_norm_epsilon,
@@ -190,13 +179,18 @@ class TransformerLMHeadModel(nn.Module):
         x = TransformerModel(
             config=config, name="transformer")(inputs=input_ids, train=train)
 
+        if config.decode:
+            shard_axes = {"kernel": ("Y", None)}
+        else:
+            # shard output in training to avoid out of memory
+            shard_axes = {'kernel': (None, 'Y')}
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
-            param_dtype=jnp.float32,
+            param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            shard_axes={'kernel': ('Y', None)},
+            shard_axes=shard_axes,
             shard=config.shard,
             name="lm_head")(x)
         return x

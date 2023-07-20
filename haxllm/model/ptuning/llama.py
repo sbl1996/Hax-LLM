@@ -10,7 +10,7 @@ from haxllm.model.llama import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
-    TransformerModel
+    TransformerModel,
 )
 from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
 
@@ -120,15 +120,22 @@ class TransformerLMHeadModel(nn.Module):
     def __call__(self, *, input_ids, train=False):
         config = self.config
         x = TransformerModel(
-            config=config, block_cls=TransformerBlock, name="transformer")(inputs=input_ids, train=train)
+            config=config, block_cls=TransformerBlock, name="transformer")(
+            inputs=input_ids, train=train)
+
+        if config.decode:
+            shard_axes = {"kernel": ("Y", None)}
+        else:
+            # shard output in training to avoid out of memory
+            shard_axes = {'kernel': (None, 'Y')}
 
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
-            param_dtype=jnp.float32,
+            param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            shard_axes={'kernel': ('Y', None)},
+            shard_axes=shard_axes,
             shard=config.shard,
             name="lm_head")(x)
         return x

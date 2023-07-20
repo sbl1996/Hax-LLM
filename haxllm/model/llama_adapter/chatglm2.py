@@ -12,7 +12,7 @@ from haxllm.model.chatglm2 import (
     TransformerConfig as BaseTransformerConfig,
     TransformerModel
 )
-from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
+from haxllm.model.llama_adapter.modules import PrefixEmbed, SelfAttention
 
 
 def load_config(name, **kwargs):
@@ -43,7 +43,7 @@ class TransformerBlock(nn.Module):
             seq_len=config.pre_seq_len,
             projection=config.prefix_projection,
             prefix_features=config.prefix_hidden_size,
-            features=(config.n_heads, config.hidden_size // config.n_heads),
+            features=config.hidden_size,
             dtype=config.dtype,
             name="prefix",
         )(inputs)
@@ -58,6 +58,7 @@ class TransformerBlock(nn.Module):
         x = SelfAttention(
             num_heads=config.n_heads,
             multi_query_groups=config.num_groups,
+            prefix_len=config.pre_seq_len,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,

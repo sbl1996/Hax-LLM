@@ -7,7 +7,7 @@ def load_fn(split, cache_dir=None):
     return load_dataset("boolq", split=split, cache_dir=cache_dir)
 
 
-def preprocess_fn(tokenizer, example, max_len, passage=True):
+def preprocess_fn(tokenizer, example, max_len, passage=True, train=True):
     if passage:
         sentences = list(zip(example["passage"], example["question"]))
     else:

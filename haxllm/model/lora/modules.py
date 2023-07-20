@@ -85,7 +85,6 @@ class DenseGeneralBase(nn.Module):
         contract_ind = tuple(range(0, n_axis))
 
         if self.use_bias:
-
             def bias_init_wrap(rng, shape, dtype=jnp.float32):
                 flat_shape = (math.prod(shape[-n_features:]),)
                 bias = self.bias_init(rng, flat_shape, dtype)

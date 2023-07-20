@@ -58,7 +58,7 @@ def create_dataset(
     num_workers=0,
     **kwargs,
 ):
-    load_fn, preprocess_fn_, ds_splits, options = get_registered_dataset(name)
+    load_fn, preprocess_fn, ds_splits, options = get_registered_dataset(name)
     for split in splits:
         if split not in ds_splits:
             raise ValueError(f"Dataset {name} does not have split {split}.")
@@ -90,32 +90,23 @@ def create_dataset(
     else:
         raise ValueError(f"Unknown task type {task_type}")
 
-    preprocess_fn = lambda x: preprocess_fn_(tokenizer, x, max_len, **kwargs)
     ds_train = load_fn(train_split, cache_dir=cache_dir)
-    train_data = task_load_fn(ds_train, preprocess_fn)
+    ds_train = ds_train.shuffle(seed=seed)
+    if train_sub_ratio is not None:
+        n_sub = int(len(ds_train) * train_sub_ratio)
+        ds_train = ds_train.select(range(n_sub))
+    preprocess_fn_train = lambda x: preprocess_fn(tokenizer, x, max_len, train=True, **kwargs)
+    train_data = task_load_fn(ds_train, preprocess_fn_train)
     keys = list(train_data.keys())
     train_data = tuple(train_data[k] for k in keys)
 
-    if eval_split == "validation" and options.get("split_train_for_validation", False):
-        test_size = options.get("split_ratio", 0.2)
-        train_and_eval_data = train_test_split(
-            *train_data, test_size=test_size, random_state=seed)
-        train_data = train_and_eval_data[::2]
-        eval_data = train_and_eval_data[1::2]
-    else:
-        ds_eval = load_fn(eval_split, cache_dir=cache_dir)
-        eval_data = task_load_fn(ds_eval, preprocess_fn)
-        eval_data = tuple(eval_data[k] for k in keys)
-
-    # shuffle train data first
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(train_data[0]))
-    train_data = tuple(x[perm] for x in train_data)
-
-    if train_sub_ratio is not None:
-        train_data = train_test_split(*train_data, test_size=1-train_sub_ratio, random_state=seed)[::2]
+    ds_eval = load_fn(eval_split, cache_dir=cache_dir)
     if eval_sub_ratio is not None:
-        eval_data = train_test_split(eval_data, eval_size=1-eval_sub_ratio, random_state=seed)[::2]
+        n_sub = int(len(ds_eval) * eval_sub_ratio)
+        ds_eval = ds_eval.shuffle(seed=seed).select(range(n_sub))
+    preprocess_fn_eval = lambda x: preprocess_fn(tokenizer, x, max_len, train=False, **kwargs)
+    eval_data = task_load_fn(ds_eval, preprocess_fn_eval)
+    eval_data = tuple(eval_data[k] for k in keys)
 
     train_data = dict(zip(keys, train_data))
     eval_data = dict(zip(keys, eval_data))

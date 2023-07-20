@@ -49,14 +49,14 @@ Check the experiments and training scripts on this [repo](https://github.com/sbl
 
 First, we should download the model and convert the checkpoints to JAX format.
 ```bash
-python3 -m haxllm.model.dump -m llama -s lmsys/vicuna-7b-v1.3
+python -m haxllm.model.dump -m llama -s lmsys/vicuna-7b-v1.3
 ```
 `llama` is the model family, currently supports `gpt2`, `llama` and `chatglm2`.
 `lmsys/vicuna-7b-v1.3` is the model name, can be huggingface model name, local directory or checkpoint file (pytorch-model-*.bin or model.safetensors).
 
 Then, we can chat with the model.
 ```bash
-python3 -m haxllm.chat.cli model=vicuna-7b checkpoint=vicuna-7b-v1.3_np.safetensors temperature=0.7
+python -m haxllm.chat.cli template=llama model=vicuna-7b checkpoint=vicuna-7b-v1.3_np.safetensors temperature=0.7
 ```
 You may refer `configs/chat/base.yaml` for more settings like max length, temperature, top-k, top-p.
 
@@ -64,6 +64,19 @@ You may refer `configs/chat/base.yaml` for more settings like max length, temper
 rm -rf ~/.cache/huggingface/hub/models--lmsys--vicuna-7b-v1.3
 ```
 You can remove the cache to save disk space.
+
+### LLaMA-2
+
+First, we should download the model and convert the checkpoints to JAX format.
+```bash
+python -m haxllm.model.dump -m llama -s meta-llama/Llama-2-7b-chat-hf -t safetensors
+```
+We want to download the safetensors checkpoints only to save disk space.
+
+Good to go!
+```bash
+python -m haxllm.chat.cli template=llama2 model=llama2-7b checkpoint=Llama-2-7b-chat-hf_np.safetensors
+```
 
 
 ## Sponsors

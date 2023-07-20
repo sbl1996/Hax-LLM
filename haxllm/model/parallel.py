@@ -200,18 +200,27 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q, k
 
 
-def apply_rotary_pos_emb_index(q, k, cos, sin, position_id):
+def apply_rotary_pos_emb_index(q, k, cos, sin, position_id=None):
     # inputs:
     #   x: (batch_size, seq_len, num_heads, head_dim)
     #   cos, sin: (seq_len, head_dim)
     #   position_id: (batch_size, seq_len)
     # returns:
     #   x: (batch_size, seq_len, num_heads, head_dim)
-    cos = jnp.take(cos, position_id, axis=0)[:, :, None, :]
-    sin = jnp.take(sin, position_id, axis=0)[:, :, None, :]
+    if position_id is None:
+        q_pos = jnp.arange(q.shape[1])[None, :]
+        k_pos = jnp.arange(k.shape[1])[None, :]
+    else:
+        q_pos = position_id
+        k_pos = position_id
 
-    q = (q * cos) + (rotate_half(q) * sin)
-    k = (k * cos) + (rotate_half(k) * sin)
+    cos_q = jnp.take(cos, q_pos, axis=0)[:, :, None, :]
+    sin_q = jnp.take(sin, q_pos, axis=0)[:, :, None, :]
+    q = (q * cos_q) + (rotate_half(q) * sin_q)
+
+    cos_k = jnp.take(cos, k_pos, axis=0)[:, :, None, :]
+    sin_k = jnp.take(sin, k_pos, axis=0)[:, :, None, :]
+    k = (k * cos_k) + (rotate_half(k) * sin_k)
     return q, k
 
 
@@ -248,7 +257,6 @@ def apply_rotary_pos_emb2(q, k, cos, sin):
     #   q, k: (batch_size, seq_len, num_heads, head_dim)
     q_len = q.shape[1]
     kv_len = k.shape[1]
-    dim = q.shape[-1]
     prefix_len = kv_len - q_len
 
     cos_k = cos[None, :kv_len, None, :]
@@ -262,18 +270,27 @@ def apply_rotary_pos_emb2(q, k, cos, sin):
     return q, k
 
 
-def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id):
+def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id=None):
     # inputs:
     #   x: (batch_size, seq_len, num_heads, head_dim)
     #   cos, sin: (seq_len, head_dim)
     #   position_id: (batch_size, seq_len)
     # returns:
     #   x: (batch_size, seq_len, num_heads, head_dim)
-    cos = jnp.take(cos, position_id, axis=0)[:, :, None, :]
-    sin = jnp.take(sin, position_id, axis=0)[:, :, None, :]
+    if position_id is None:
+        q_pos = jnp.arange(q.shape[1])[None, :]
+        k_pos = jnp.arange(k.shape[1])[None, :]
+    else:
+        q_pos = position_id
+        k_pos = position_id
+    
+    cos_q = jnp.take(cos, q_pos, axis=0)[:, :, None, :]
+    sin_q = jnp.take(sin, q_pos, axis=0)[:, :, None, :]
+    q = apply_cos_sin(q, cos_q, sin_q)
 
-    q = apply_cos_sin(q, cos, sin)
-    k = apply_cos_sin(k, cos, sin)
+    cos_k = jnp.take(cos, k_pos, axis=0)[:, :, None, :]
+    sin_k = jnp.take(sin, k_pos, axis=0)[:, :, None, :]
+    k = apply_cos_sin(k, cos_k, sin_k)
     return q, k
 
 
@@ -287,6 +304,14 @@ def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
     q = jnp.concatenate([q1, q2], axis=-1)
     k = jnp.concatenate([k1, k2], axis=-1)
     return q, k
+
+
+def replicate_for_multi_query(x, num_heads):
+    src_num_heads, head_dim = x.shape[-2:]
+    x = jnp.expand_dims(x, axis=-2)
+    x = jnp.tile(x, (1, 1, 1, num_heads // src_num_heads, 1))
+    x = jnp.reshape(x, (*x.shape[:2], num_heads, head_dim))
+    return x
 
 
 ModuleClass = Callable[..., nn.Module]
@@ -313,6 +338,7 @@ class SelfAttention(ShardModule):
     kv_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis]] = None
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
+    shard_cache: bool = False
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
@@ -320,8 +346,24 @@ class SelfAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
-        padding_mask: Optional[Array] = None,
     ):
+        r"""
+        Parameters
+        ----------
+        x: Array, shape [batch, q_len, features]
+            Input features.
+        mask: Optional[Array], shape [batch, 1, q_len, kv_len]
+            Mask to apply to attention scores.
+            In training and eval mode, either causal mask or padding mask is needed.
+            In decode, only causal mask is supported and we infer it from cache.
+            Therefor, mask is not needed for decoding.
+        
+        Returns
+        -------
+        out: Array, shape [batch, q_len, features]
+            Output features.
+
+        """
         multi_query = self.multi_query_groups is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
         features = x.shape[-1]
@@ -371,37 +413,31 @@ class SelfAttention(ShardModule):
         key = kv_dense[0](name="key")(x)
         value = kv_dense[1](name="value")(x)
 
+        # TODO: we can cache untiled key and value for memory efficiency
         if multi_query:
-            key = jnp.expand_dims(key, axis=-2)
-            key = jnp.tile(key, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
-            key = jnp.reshape(key, (*key.shape[:2], self.num_heads, head_dim))
-            # key = self.with_sharding_constraint(key, axes=("X", None, "Y", None))
-
-            value = jnp.expand_dims(value, axis=-2)
-            value = jnp.tile(value, (1, 1, 1, self.num_heads // self.multi_query_groups, 1))
-            value = jnp.reshape(value, (*value.shape[:2], self.num_heads, head_dim))
+            key = replicate_for_multi_query(key, self.num_heads)
+            value = replicate_for_multi_query(value, self.num_heads)
 
         if self.rope:
             if multi_query:
                 cos, sin = precompute_freqs_cis2(
                     dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k: apply_rotary_pos_emb2(q, k, cos, sin)
-                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
+                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
             else:
                 cos, sin = precompute_freqs_cis(
                     dim=head_dim, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k: apply_rotary_pos_emb(q, k, cos, sin)
-                add_pos_i = lambda q, k, p: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
         else:
-            add_pos = lambda q, k: (q, k)
+            add_pos = lambda q, k, p=None: (q, k)
 
         if not self.decode:
             query, key = add_pos(query, key)
         else:
+            assert mask is None, "Mask is not needed for decoding, we infer it from cache."
             is_initialized = self.has_variable("cache", "cached_key")
             init_fn = jnp.zeros
-            # if self.shard:
-            #     init_fn = nn.with_partitioning(init_fn, self.qkv_shard_axes)
+            if self.shard and self.shard_cache:
+                init_fn = nn.with_partitioning(init_fn, kv_shard_axes)
             cached_key = self.variable(
                 "cache", "cached_key", init_fn, key.shape, key.dtype
             )
@@ -414,28 +450,21 @@ class SelfAttention(ShardModule):
             if not is_initialized:
                 query, key = add_pos(query, key)
             else:
-
                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                # update key, value caches with our new 1d spatial slices
                 num_queries = query.shape[-3]
                 cur_index = cache_index.value
-                if self.rope:
-                    position_ids = jnp.arange(num_queries) + cur_index
-                    position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                    query, key = add_pos_i(query, key, position_ids)
+
+                position_ids = jnp.arange(num_queries) + cur_index
+                position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
+                query, key = add_pos(query, key, position_ids)
+
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 cached_key.value = key
                 cached_value.value = value
 
-                # for pad_context
-                if padding_mask is not None:
-                    offset = jnp.argmax(padding_mask[0])
-                    offset = jnp.where(offset == 0, num_queries, offset)
-                else:
-                    offset = num_queries
-                cache_index.value = cache_index.value + offset
+                cache_index.value = cache_index.value + num_queries
 
                 idx = jnp.arange(num_queries) + cur_index
                 mask = jnp.arange(max_length)[None, :] <= idx[:, None]
@@ -481,7 +510,7 @@ class SelfAttention(ShardModule):
                 mask_mode,
                 dtype=self.dtype,
             )
-        else:                
+        else:
             x = dot_product_attention(
                 query,
                 key,

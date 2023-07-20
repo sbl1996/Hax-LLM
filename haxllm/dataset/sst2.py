@@ -6,7 +6,7 @@ def load_fn(split, cache_dir=None):
     return load_dataset("glue", "sst2", split=split, cache_dir=cache_dir)
 
 
-def preprocess_fn(tokenizer, example, max_len):
+def preprocess_fn(tokenizer, example, max_len, train=True):
     return tokenizer(
         example["sentence"],
         truncation=True,

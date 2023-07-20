@@ -6,7 +6,7 @@ import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, SelfAttention, Embed
 from haxllm.model.utils import load_config as _load_config
 from haxllm.config_utils import RematScanConfigMixin
 
@@ -42,6 +42,14 @@ config_hub = {
         n_heads=64,
         n_layers=80,
     ),
+    "llama2-7b": dict(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+        rms_norm_eps=1e-5,
+        n_positions=4096,
+    ),
 }
 
 
@@ -49,7 +57,8 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown llama model {name}")
+        available = ", ".join(config_hub.keys())
+        raise ValueError(f"Unknown llama model {name}, available: {available}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 
@@ -184,14 +193,19 @@ class TransformerLMHeadModel(nn.Module):
         config = self.config
         x = TransformerModel(
             config=config, name="transformer")(inputs=input_ids, train=train)
+        if config.decode:
+            shard_axes = {"kernel": ("Y", None)}
+        else:
+            # shard output in training to avoid out of memory
+            shard_axes = {'kernel': (None, 'Y')}
 
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
             dtype=config.dtype,
-            param_dtype=jnp.float32,
+            param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            shard_axes={'kernel': ('Y', None)},
+            shard_axes=shard_axes,
             shard=config.shard,
             name="lm_head")(x)
         return x

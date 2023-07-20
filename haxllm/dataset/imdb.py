@@ -6,7 +6,7 @@ def load_fn(split, cache_dir):
     return load_dataset("imdb", split=split, cache_dir=cache_dir)
 
 
-def preprocess_fn(tokenizer, example, max_len):
+def preprocess_fn(tokenizer, example, max_len, train=True):
     return tokenizer(
         example["text"],
         truncation=True,

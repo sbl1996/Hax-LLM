@@ -1,5 +1,5 @@
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, ReadInstruction
 from haxllm.dataset.hub import register_dataset
 
 
@@ -7,34 +7,71 @@ def load_fn(split, cache_dir=None):
     return load_dataset("HasturOfficial/adgen", split=split, cache_dir=cache_dir)
 
 
-def preprocess_fn(tokenizer, example, max_len, max_source_length):
-    max_target_length = max_len - max_source_length
+def find_prompt_prefix_suffix(examples, tokenizer):
+    examples = [tokenizer.build_prompt(e) for e in examples]
+    input_ids = [tokenizer.encode(e, add_special_tokens=True) for e in examples]
+    l = 0
+    while True:
+        if len(set(input[l] for input in input_ids)) != 1:
+            break
+        l += 1
+    r = 0
+    while True:
+        if len(set(input[-r-1] for input in input_ids)) != 1:
+            break
+        r += 1
+    return input_ids[0][:l], input_ids[0][-r:]
+
+
+# ChatGLM2 style dataset, modified from https://github.com/THUDM/ChatGLM2-6B/blob/main/ptuning/main.py#L158-L213
+def preprocess_fn(tokenizer, example, max_len, max_source_length, train=True):
     prompt_column = "content"
     response_column = "summary"
     n = len(example[prompt_column])
-    inputs = np.full((n, max_len), tokenizer.pad_token_id, dtype=np.int32)
-    labels = np.full((n, max_len), -100, dtype=np.int32)
-    for i in range(n):
-        prompt = example[prompt_column][i]
-        answer = example[response_column][i]
 
-        a_ids = tokenizer.encode(text=prompt, add_special_tokens=False)
-        b_ids = tokenizer.encode(text=answer, add_special_tokens=False)
+    prompt_prefix, prompt_suffix = find_prompt_prefix_suffix(["你好", "晚上吃什么", "请问你是谁"], tokenizer)
 
-        if len(a_ids) > max_source_length - 1:
-            a_ids = a_ids[:max_source_length - 1]
+    if train:
+        max_target_length = max_len - max_source_length - 1
+        inputs = np.full((n, max_len), tokenizer.pad_token_id, dtype=np.int32)
+        labels = np.full((n, max_len), -100, dtype=np.int32)
 
-        if len(b_ids) > max_target_length - 2:
-            b_ids = b_ids[:max_target_length - 2]
+        query = example[prompt_column]
+        answer = example[response_column]
+        prompt = [tokenizer.build_prompt(q) for q in query]
 
-        input_ids = tokenizer.build_inputs_with_special_tokens(a_ids, b_ids)
-        l = len(input_ids)
-        inputs[i, :l] = input_ids
+        for i in range(n):
+            a_ids = tokenizer.encode(text=prompt[i], add_special_tokens=True, truncation=True, max_length=max_source_length)
+            b_ids = tokenizer.encode(text=answer[i], add_special_tokens=False, truncation=True, max_length=max_target_length)
 
-        context_length = input_ids.index(tokenizer.bos_token_id)
-        # shift left and pad the end with -100
-        labels[i, context_length-1:l-2] = input_ids[context_length:-1]
-    return {"input_ids": inputs, "labels": labels}
-    
+            a_ids[-len(prompt_suffix):] = prompt_suffix
+            context_length = len(a_ids)
+            input_ids = a_ids + b_ids + [tokenizer.eos_token_id]
+
+            l = len(input_ids)
+            inputs[i, :l] = input_ids
+            
+            # shift left and pad the end with -100
+            labels[i, context_length-1:l-1] = input_ids[context_length:]
+        return {"input_ids": inputs, "labels": labels}
+    else:
+        max_target_length = max_len - max_source_length
+        inputs = np.full((n, max_source_length), tokenizer.pad_token_id, dtype=np.int32)
+        labels = np.full((n, max_target_length), -100, dtype=np.int32)
+
+        query = example[prompt_column]
+        answer = example[response_column]
+        prompt = [tokenizer.build_prompt(q) for q in query]
+
+        encode_inputs = tokenizer(prompt, max_length=max_source_length, truncation=True)['input_ids']
+        encode_labels = tokenizer(text_target=answer, add_special_tokens=False, max_length=max_target_length, truncation=True)['input_ids']
+
+        for i in range(n):
+            encode_input = encode_inputs[i]
+            encode_label = encode_labels[i]
+            encode_input[-len(prompt_suffix):] = prompt_suffix
+            inputs[i, :len(encode_input)] = encode_input
+            labels[i, :len(encode_label)] = encode_label
+        return {"input_ids": inputs, "labels": labels}
 
 register_dataset("adgen", load_fn, preprocess_fn, ("train", "validation"))

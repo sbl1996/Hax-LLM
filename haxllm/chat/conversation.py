@@ -1,6 +1,6 @@
 import dataclasses
 from enum import auto, Enum
-from typing import List, Any, Dict
+from typing import Sequence, Optional, Dict
 
 
 class SeparatorStyle(Enum):
@@ -16,6 +16,7 @@ class SeparatorStyle(Enum):
     PHOENIX = auto()
     CHAT_GLM = auto()
     NON_CHAT = auto()
+    LLAMA2 = auto()
 
 
 @dataclasses.dataclass
@@ -27,19 +28,21 @@ class Conversation:
     # The system prompt
     system: str
     # Two roles
-    roles: List[str]
+    roles: Sequence[str]
     # All messages. Each item is (role, message).
-    messages: List[List[str]]
+    messages: Sequence[Sequence[str]]
     # The number of few shot examples
     offset: int
     # Separators
     sep_style: SeparatorStyle
     sep: str
-    sep2: str = None
+    sep2: Optional[str] = None
     # Stop criteria (the default one is EOS token)
-    stop_str: str = None
+    stop_str: Optional[str] = None
     # Stops generation if meeting any token in this list
-    stop_token_ids: List[int] = None
+    stop_token_ids: Optional[Sequence[int]] = None
+    bos_token: Optional[str] = None
+    eos_token: Optional[str] = None
 
     # def get_next_input(self) -> str:
     #     """Get the next input for the model."""
@@ -151,6 +154,57 @@ class Conversation:
                     ret += f"{sep}{role}："
                     if message:
                         ret += message + sep
+            return ret
+        elif self.sep_style == SeparatorStyle.LLAMA2:
+            # TODO: add support for custom system prompt
+            BOS = self.bos_token
+            EOS = self.eos_token
+            dialog = [
+                {"role": role, "content": message}
+                for role, message in self.messages
+            ]
+            if len(dialog) % 2 == 0:
+                assert dialog[-1]["content"] is None
+                dialog = dialog[:-1]
+                append = True
+            else:
+                append = False
+            if dialog[0]["role"] != "system":
+                dialog = [
+                    {
+                        "role": "system",
+                        "content": DEFAULT_SYSTEM_PROMPT,
+                    }
+                ] + dialog
+            dialog = [
+                {
+                    "role": dialog[1]["role"],
+                    "content": B_SYS
+                    + dialog[0]["content"]
+                    + E_SYS
+                    + dialog[1]["content"],
+                }
+            ] + dialog[2:]
+            assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
+                [msg["role"] == "assistant" for msg in dialog[1::2]]
+            ), (
+                "model only supports 'system', 'user' and 'assistant' roles, "
+                "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
+            )
+            ret = "".join(
+                [
+                    f"{BOS}{B_INST} {(prompt['content']).strip()} {E_INST} {(answer['content']).strip()} {EOS}"
+                    for prompt, answer in zip(
+                        dialog[::2],
+                        dialog[1::2],
+                    )
+                ]
+            )
+            assert (
+                dialog[-1]["role"] == "user"
+            ), f"Last message must be from user, got {dialog[-1]['role']}"
+            if append:
+                ret += f"{BOS}{B_INST} {(dialog[-1]['content']).strip()} {E_INST}"
             return ret
         elif self.sep_style == SeparatorStyle.NON_CHAT:
             if self.system:
@@ -296,5 +350,28 @@ register_conv_template(
         sep_style=SeparatorStyle.CHAT_GLM,
         sep="\n\n",
         stop_token_ids=[0],
+    )
+)
+
+
+B_INST, E_INST = "[INST]", "[/INST]"
+B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+DEFAULT_SYSTEM_PROMPT = """\
+You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
+
+If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
+
+# Llama-2 chat template
+register_conv_template(
+    Conversation(
+        name="llama2-chat",
+        system=DEFAULT_SYSTEM_PROMPT,
+        roles=("user", "assistant"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        bos_token="<s>",
+        eos_token="</s>",
     )
 )

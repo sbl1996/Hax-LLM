@@ -1,5 +1,5 @@
 defaults:
-  - model: vicuna-7b
+  - template: required
   - _self_
   - override hydra/hydra_logging: disabled  
   - override hydra/job_logging: disabled  
@@ -14,11 +14,13 @@ dtype: bfloat16
 param_dtype: bfloat16
 mesh: [1, 8]
 
-max_len: 2048
+max_len: null
 temperature: 0.0
 top_k: -1
 top_p: 1.0
 
+peft: null
+model: null
 checkpoint: null
 
 debug: False

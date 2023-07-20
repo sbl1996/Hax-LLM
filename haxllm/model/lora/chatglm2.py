@@ -9,7 +9,7 @@ from flax import struct
 from haxllm.model.modules import RMSNorm
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, SelfAttention
 from haxllm.model.utils import load_config as _load_config
-from haxllm.model.llama import (
+from haxllm.model.chatglm2 import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
@@ -22,7 +22,7 @@ def load_config(name, **kwargs):
     if name in config_hub:
         config = config_hub[name]
     else:
-        raise ValueError(f"Unknown lora llama model {name}")
+        raise ValueError(f"Unknown lora chatglm2 model {name}")
 
     d = {**kwargs}
     if "attn_lora_r" in d and d["attn_lora_r"] is not None:
@@ -42,12 +42,16 @@ class TransformerConfig(BaseTransformerConfig):
     lora_alpha: int = 1
 
 
+
+# TODO: skip apply_query_key_layer_scaling, same as query_key_layer_scaling_coeff in chatglm
+# no difference in inference (forward), but may be in training (backward)
 class TransformerBlock(nn.Module):
     config: TransformerConfig
     scan: bool = False
 
     @nn.compact
     def __call__(self, inputs):
+
         config = self.config
 
         if config.memory_efficient_attention or config.decode:
@@ -62,23 +66,24 @@ class TransformerBlock(nn.Module):
             for r in config.attn_lora_r
         ]
 
-        x = RMSNorm(epsilon=config.rms_norm_eps,
+        x = RMSNorm(epsilon=config.layer_norm_epsilon,
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
+            multi_query_groups=config.num_groups,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            qkv_bias=False,
+            qkv_bias=True,
             out_bias=False,
             decode=config.decode,
-            memory_efficient=config.memory_efficient_attention,
-            memory_efficient_mask_mode='causal',
             rope=True,
             query_shard_axes=("X", "Y", None),
+            kv_shard_axes=("X", None, "Y"),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
+            shard_cache=config.shard_cache,
             dense_cls=attn_dense,
             name="attn")(x, mask)
 
@@ -91,7 +96,7 @@ class TransformerBlock(nn.Module):
             for r in config.ffn_lora_r
         ]
 
-        y = RMSNorm(epsilon=config.rms_norm_eps,
+        y = RMSNorm(epsilon=config.layer_norm_epsilon,
                     dtype=config.dtype, name="ln_2")(x)
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,
@@ -103,10 +108,13 @@ class TransformerBlock(nn.Module):
             shard=config.shard,
             dense_cls=mlp_dense,
             name="mlp")(y)
+
+        y = x + y
+
         if self.scan:
-            return x + y, None
+            return y, None
         else:
-            return x + y
+            return y
 
 
 class TransformerSequenceClassifier(nn.Module):

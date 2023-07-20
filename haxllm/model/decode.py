@@ -6,11 +6,12 @@ import jax.numpy as jnp
 from flax.core.frozen_dict import unfreeze, FrozenDict
 
 
-def add_beam_dim(x, n_beams):
+def add_batch_dim(x, batch_size):
     if x.ndim <= 2:
+        # cache_index and cache_position_ids
         return jnp.tile(x, [1] * x.ndim)
     reps = [1] * x.ndim
-    reps[-4] = n_beams
+    reps[-4] = batch_size
     return jnp.tile(x, reps)
 
 
@@ -38,7 +39,7 @@ def fix_cache_index(cache, offset):
 
 
 @jax.jit
-def sample_token_top_p(logits, rng, p):
+def sample_token_top_p_single(logits, rng, p):
     sorted_indices = jnp.argsort(logits)[::-1]
     sorted_logits = logits[sorted_indices]
     cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits))
@@ -50,24 +51,59 @@ def sample_token_top_p(logits, rng, p):
     return token
 
 
-@partial(jax.jit, static_argnums=(-1,))
-def sample_token_top_k(logits, rng, k):
+@jax.jit
+def sample_token_top_p(logits, rng, p):
+    if logits.ndim == 1:
+        return sample_token_top_p_single(logits, rng, p)
+    elif logits.ndim == 2:
+        if rng.ndim == 2:
+            assert logits.shape[0] == rng.shape[0]
+            return jax.vmap(sample_token_top_p_single, in_axes=(0, 0, None))(logits, rng, p)
+        else:
+            return jax.vmap(sample_token_top_p_single, in_axes=(0, None, None))(logits, rng, p)
+    else:
+        raise NotImplementedError
+
+
+@partial(jax.jit, static_argnums=(2,))
+def sample_token_top_k_single(logits, rng, k):
     logits, tokens = jax.lax.top_k(logits, k)
     index = jax.random.categorical(rng, logits)
     token = tokens[index]
     return token
 
 
+@partial(jax.jit, static_argnums=(2,))
+def sample_token_top_k(logits, rng, k):
+    if logits.ndim == 1:
+        return sample_token_top_k_single(logits, rng, k)
+    elif logits.ndim == 2:
+        if rng.ndim == 2:
+            assert logits.shape[0] == rng.shape[0]
+            return jax.vmap(sample_token_top_k_single, in_axes=(0, 0, None))(logits, rng, k)
+        else:
+            return jax.vmap(sample_token_top_k_single, in_axes=(0, None, None))(logits, rng, k)
+    else:
+        raise NotImplementedError
+
+
 def sample_token(logits, rng, temperature: float = 1.0, top_p: float = 1.0, top_k: int = -1):
     if temperature < 1e-5 or top_k == 1:
-        return jnp.argmax(logits)
+        return jnp.argmax(logits, axis=-1)
     logits = logits / temperature
     if top_k > 1:
         return sample_token_top_k(logits, rng, top_k)
     elif top_p < 1.0:
         return sample_token_top_p(logits, rng, top_p)
     else:
-        return jax.random.categorical(rng, logits)
+        if logits.ndim == 2:
+            if rng.ndim == 2:
+                assert logits.shape[0] == rng.shape[0]
+                return jax.vmap(jax.random.categorical, in_axes=(0, 0))(rng, logits)
+            else:
+                return jax.random.categorical(rng, logits, axis=-1)
+        else:
+            return jax.random.categorical(rng, logits, axis=-1)
 
 
 def split_rng(rng):
@@ -77,8 +113,11 @@ def split_rng(rng):
 
 
 def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
-                  temperature=1.0, top_k=10, top_p=1.0, rng=None, two_stage=False, pad_context=None, pad_token_id=None):
-    if temperature < 1e-5 or top_k != 1:
+                  temperature=1.0, top_k=5, top_p=1.0, rng=None, two_stage=False, pad_context=None,
+                  pad_token_id=None, decode=True):
+    if temperature < 1e-5:
+        top_k = 1
+    if temperature > 1e-5 or top_k != 1:
         assert rng is not None, "Must provide rng if not using greedy decoding"
     if pad_context is not None:
         assert two_stage, "Must use two_stage if pad_context is not None"
@@ -125,7 +164,59 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         if token in [tokenizer.eos_token_id, 0]:
             break
     live_seq = jax.device_get(live_seq[0, :i])
-    return tokenizer.decode(live_seq)
+    if decode:
+        return tokenizer.decode(live_seq)
+    else:
+        return live_seq
+
+
+def batch_random_sample(
+    input_ids, apply_fn, params, cache, max_len, temperature=1.0, top_k=5, top_p=1.0,
+    rng=None, pad_token_id=None, eos_token_id=None):
+    if temperature < 1e-5:
+        top_k = 1
+    if temperature >= 1e-5 or top_k != 1:
+        assert rng is not None, "Must provide rng if not using greedy decoding"
+    assert pad_token_id is not None and eos_token_id is not None, "Must provide pad_token_id and eos_token_id" 
+    # (batch_size, max_source_length)
+    batch_size, max_source_length = input_ids.shape
+    context_length = jnp.argmax(input_ids == pad_token_id, axis=1)
+    context_length = jnp.where(context_length == 0, max_source_length, context_length)
+
+    cache = jax.tree_map(lambda x: add_batch_dim(x, batch_size), cache)
+
+    live_seqs = jnp.full((batch_size, max_len), pad_token_id, dtype=jnp.int32)
+    live_seqs = live_seqs.at[:, :max_source_length].set(input_ids)
+
+    i = 0
+    end_index = jnp.zeros((batch_size,), dtype=jnp.int32)
+    is_end = jnp.zeros((batch_size,), dtype=jnp.bool_)
+    while i < max_len:
+        input_ids = live_seqs[:, [i]]
+        cache, logits = apply_fn(params, cache, input_ids)
+        i += 1
+        logits = logits.astype(jnp.float32)[:, 0]
+        if rng is None:
+            subrngs = None
+        else:
+            rngs = jax.random.split(rng, batch_size + 1)
+            rng, subrngs = rngs[0], rngs[1:]
+        tokens = sample_token(logits, subrngs, temperature, top_p, top_k)
+        is_context = i < context_length
+        tokens = jnp.where(
+            is_end | is_context, live_seqs[:, i], tokens)
+        live_seqs = live_seqs.at[:, i].set(tokens)
+
+        is_stop_token = (tokens == eos_token_id) | (tokens == 0)
+        is_end = is_end | (~is_context & is_stop_token)
+        end_index = jnp.where(
+            is_end & (end_index == 0),
+            jnp.full_like(end_index, i),
+            end_index,
+        )
+        if jnp.all(is_end):
+            break
+    return jax.device_get(live_seqs[:, :i])
 
 
 def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
@@ -140,7 +231,7 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
     context_length = len(tokens)
     assert context_length < max_len, "Context length must be less than max_len"
 
-    cache = jax.tree_map(lambda x: add_beam_dim(x, n_beams), cache)
+    cache = jax.tree_map(lambda x: add_batch_dim(x, n_beams), cache)
 
     if pad_context is None:
         live_seqs = jnp.zeros((n_beams, max_len), dtype=jnp.int32)
@@ -181,6 +272,7 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
         cache = gather_beams(cache, indices)
         tokens = topk_indices % vocab_size
         live_seqs = live_seqs.at[:, i].set(tokens)
+
         is_end = is_end | (tokens == tokenizer.eos_token_id)
         end_index = jnp.where(
             is_end & (end_index == 0),
@@ -193,110 +285,3 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
     live_seqs_t = jax.device_get(live_seqs)
     end_index = jax.device_get(end_index)
     return [tokenizer.decode(seq[:end_index[i]]) for i, seq in enumerate(live_seqs_t)]
-
-
-# def chat(conv: Conversation, chatio, tokenizer, apply_fn, params, init_cache, max_len, temperature=1.0, topk=10, rng=None):
-#     if temperature != 0:
-#         assert rng is not None, "Must provide rng if temperature != 0"
-
-#     init_conv = conv
-#     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-#     conv = init_conv.copy()
-#     live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-#     now = 0
-
-#     while True:
-#         try:
-#             inp = chatio.prompt_for_input(conv.roles[0])
-#         except EOFError:
-#             inp = ""
-
-#         if inp == "!!exit" or not inp:
-#             print("exit...")
-#             break
-
-#         if inp == "!!reset":
-#             print("resetting...")
-#             cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-#             conv = init_conv.copy()
-#             live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-#             now = 0
-#             continue
-
-#         conv.append_message(conv.roles[0], inp)
-#         conv.append_message(conv.roles[1], None)
-
-#         chatio.prompt_for_output(conv.roles[1])
-
-#         inp = conv.get_next_input()
-#         pre = now
-#         tokens = tokenizer(inp, add_special_tokens=pre == 0)['input_ids']
-#         live_seq, now, cache = chat_round(
-#             tokens, tokenizer, apply_fn, params, live_seq, pre, cache, max_len, temperature, topk, rng)
-#         outputs = jax.device_get(live_seq[0, pre+len(tokens):now])
-#         outputs = tokenizer.decode(outputs).strip()
-#         print(f"{conv.roles[1]}: {outputs}")
-#         print(f"Used: {now}/{max_len}")
-
-#         conv.update_last_message(outputs)
-
-
-# def simple_chat(conv: Conversation, tokenizer, apply_fn, params, init_cache, max_len, temperature=1.0, topk=10, rng=None):
-#     if temperature != 0:
-#         assert rng is not None, "Must provide rng if temperature != 0"
-
-#     init_conv = conv
-#     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-#     conv = init_conv.copy()
-#     live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-#     now = 0
-
-#     while True:
-#         try:
-#             inp = input(f"{conv.roles[0]}: ")
-#         except EOFError:
-#             inp = ""
-
-#         if inp == "!!exit" or not inp:
-#             print("exit...")
-#             break
-
-#         if inp == "!!reset":
-#             print("resetting...")
-#             cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), init_cache)
-#             conv = init_conv.copy()
-#             live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-#             now = 0
-#             continue
-
-#         conv.append_message(conv.roles[0], inp)
-#         conv.append_message(conv.roles[1], None)
-
-#         inp = conv.get_next_input()
-#         pre = now
-#         tokens = tokenizer(inp, add_special_tokens=pre == 0)['input_ids']
-#         live_seq, now, cache = chat_round(
-#             tokens, tokenizer, apply_fn, params, live_seq, pre, cache, max_len, temperature, topk, rng)
-#         outputs = jax.device_get(live_seq[0, pre+len(tokens):now])
-#         outputs = tokenizer.decode(outputs).strip()
-#         print(f"{conv.roles[1]}: {outputs}")
-#         print(f"Used: {now}/{max_len}")
-
-#         conv.update_last_message(outputs)
-
-
-# def chat_round(tokens, tokenizer, apply_fn, params, live_seq, i, cache, max_len, temperature=1.0, topk=10, rng=None):
-#     live_seq = live_seq.at[:, i:i+len(tokens)].set(tokens)
-#     context_length = i + len(tokens)
-#     while i < max_len:
-#         input_ids = live_seq[:, [i]]
-#         cache, logits = apply_fn(params, cache, input_ids)
-#         i += 1
-#         if i < context_length:
-#             continue
-#         logits = logits.astype(jnp.float32)[0, 0]
-#         token, rng = sample_token(logits, rng, temperature, topk)
-#         if token in [tokenizer.eos_token_id, 0]:
-#             break
-#         live_seq = live_seq.at[:, i].set(token)
-#     return live_seq, i, cache
