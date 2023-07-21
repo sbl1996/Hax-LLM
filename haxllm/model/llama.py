@@ -50,6 +50,14 @@ config_hub = {
         rms_norm_eps=1e-5,
         n_positions=4096,
     ),
+    "llama2-13b": dict(
+        hidden_size=5120,
+        intermediate_size=13824,
+        n_heads=40,
+        n_layers=40,
+        rms_norm_eps=1e-5,
+        n_positions=4096,
+    ),
 }
 
 
@@ -82,6 +90,7 @@ class TransformerConfig(RematScanConfigMixin):
     decode: bool = False
     memory_efficient_attention: bool = False
     shard: bool = False
+    shard_cache: bool = False
 
 
 class TransformerBlock(nn.Module):
@@ -114,6 +123,7 @@ class TransformerBlock(nn.Module):
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
+            shard_cache=config.shard_cache,
             name="attn")(x, mask)
 
         x = x + inputs

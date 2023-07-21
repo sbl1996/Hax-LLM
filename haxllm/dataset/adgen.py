@@ -1,5 +1,5 @@
 import numpy as np
-from datasets import load_dataset, ReadInstruction
+from datasets import load_dataset
 from haxllm.dataset.hub import register_dataset
 
 

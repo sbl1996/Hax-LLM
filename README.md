@@ -71,7 +71,7 @@ First, we should download the model and convert the checkpoints to JAX format.
 ```bash
 python -m haxllm.model.dump -m llama -s meta-llama/Llama-2-7b-chat-hf -t safetensors
 ```
-We want to download the safetensors checkpoints only to save disk space.
+LLaMA-2 has both `safetensors` and `bin` checkpoints.  We want to download the `safetensors` only to save disk space.
 
 Good to go!
 ```bash
