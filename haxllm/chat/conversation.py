@@ -44,28 +44,6 @@ class Conversation:
     bos_token: Optional[str] = None
     eos_token: Optional[str] = None
 
-    # def get_next_input(self) -> str:
-    #     """Get the next input for the model."""
-    #     if self.sep_style == SeparatorStyle.ADD_COLON_TWO:
-    #         seps = [self.sep, self.sep2]
-    #         if len(self.messages) == 2:
-    #             ret = self.system + self.sep
-    #             messages = self.messages
-    #         elif len(self.messages) > 2:
-    #             assert len(self.messages) % 2 == 0 and self.messages[-1][1] is None
-    #             ret = seps[1]
-    #             messages = self.messages[-2:]
-    #         else:
-    #             raise ValueError(f"Invalid number of messages: {len(self.messages)}")
-    #         for i, (role, message) in enumerate(messages):
-    #             if message:
-    #                 ret += role + ": " + message + seps[i % 2]
-    #             else:
-    #                 ret += role + ":"
-    #         return ret
-    #     else:
-    #         raise ValueError(f"Invalid style: {self.sep_style}")
-
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
@@ -266,6 +244,8 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             stop_token_ids=self.stop_token_ids,
+            bos_token=self.bos_token,
+            eos_token=self.eos_token,
         )
 
     def dict(self):

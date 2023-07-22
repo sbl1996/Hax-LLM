@@ -2,12 +2,9 @@
 
 import time
 import os
-import glob
 import re
 import sys
 import importlib
-
-import difflib
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -23,8 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import AutoTokenizer
 
 import jax.numpy as jnp
-from haxllm.chat.inference import ChatIO, generate_stream, chat_loop
-from haxllm.chat.conversation import get_conv_template
+from haxllm.chat.inference import ChatIO, chat_loop
 from haxllm.pipeline.text_generation import ChatPipeline
 
 
