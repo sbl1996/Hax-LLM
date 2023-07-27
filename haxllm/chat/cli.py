@@ -10,6 +10,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -19,14 +20,29 @@ from omegaconf import DictConfig, OmegaConf
 
 from transformers import AutoTokenizer
 
+import jax
 import jax.numpy as jnp
 from haxllm.chat.inference import ChatIO, chat_loop
 from haxllm.pipeline.text_generation import ChatPipeline
 
 
 class SimpleChatIO(ChatIO):
+    def __init__(self, multiline: bool = False):
+        self._multiline = multiline
+
     def prompt_for_input(self, role) -> str:
-        return input(f"{role}: ")
+        if not self._multiline:
+            return input(f"{role}: ")
+
+        prompt_data = []
+        line = input(f"{role} [ctrl-d/z on empty line to end]: ")
+        while True:
+            prompt_data.append(line.strip())
+            try:
+                line = input()
+            except EOFError as e:
+                break
+        return "\n".join(prompt_data)
 
     def prompt_for_output(self, role: str):
         print(f"{role}: ", end="", flush=True)
@@ -45,12 +61,20 @@ class SimpleChatIO(ChatIO):
 
 
 class RichChatIO(ChatIO):
-    def __init__(self):
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")
+    def _(event):
+        event.app.current_buffer.newline()
+
+    def __init__(self, multiline: bool = False, mouse: bool = False):
         self._prompt_session = PromptSession(history=InMemoryHistory())
         self._completer = WordCompleter(
             words=["!!exit", "!!reset"], pattern=re.compile("$")
         )
         self._console = Console()
+        self._multiline = multiline
+        self._mouse = mouse
 
     def prompt_for_input(self, role) -> str:
         self._console.print(f"[bold]{role}:")
@@ -58,8 +82,9 @@ class RichChatIO(ChatIO):
         prompt_input = self._prompt_session.prompt(
             completer=self._completer,
             multiline=False,
+            mouse_support=self._mouse,
             auto_suggest=AutoSuggestFromHistory(),
-            key_bindings=None,
+            key_bindings=self.bindings if self._multiline else None,
         )
         self._console.print()
         return prompt_input
@@ -108,15 +133,14 @@ class RichChatIO(ChatIO):
 
 class ProgrammaticChatIO(ChatIO):
     def prompt_for_input(self, role) -> str:
-        print(f"[!OP:{role}]: ", end="", flush=True)
         contents = ""
-        # `end_sequence` is a randomly-generated, 16-digit number
-        #  that signals the end of a message. It is unlikely to occur in
+        # `end_sequence` signals the end of a message. It is unlikely to occur in
         #  message content.
-        end_sequence = "9745805894023423"
+        end_sequence = " __END_OF_A_MESSAGE_47582648__\n"
+        len_end = len(end_sequence)
         while True:
-            if len(contents) >= 16:
-                last_chars = contents[-16:]
+            if len(contents) >= len_end:
+                last_chars = contents[-len_end:]
                 if last_chars == end_sequence:
                     break
             try:
@@ -124,7 +148,9 @@ class ProgrammaticChatIO(ChatIO):
                 contents = contents + char
             except EOFError:
                 continue
-        return contents[:-16]
+        contents = contents[:-len_end]
+        print(f"[!OP:{role}]: {contents}", flush=True)
+        return contents
 
     def prompt_for_output(self, role: str):
         print(f"[!OP:{role}]: ", end="", flush=True)
@@ -199,12 +225,28 @@ def chat_app(cfg: DictConfig) -> None:
 
     assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
 
+    # support for both cpu, gpu and tpu
+    
+    platform = jax.default_backend()
+
+    mesh = getattr(cfg, "mesh", None)
+    if mesh == 'auto':
+        mesh = None if platform == 'cpu' else [1, jax.local_device_count()]
+
+    dtype = cfg.dtype
+    if dtype == 'auto':
+        dtype = jnp.bfloat16 if platform == 'tpu' else jnp.float16
+
+    param_dtype = cfg.param_dtype
+    if param_dtype == 'auto':
+        param_dtype = jnp.bfloat16 if platform == 'tpu' else jnp.float16
+
+
     print(f"Loading tokenizer from {tokenizer_name}...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
     tokenizer.decode(tokenizer("init")['input_ids'])
     print("Load tokenizer {}".format(time.time() - start))
 
-    mesh = getattr(cfg, "mesh", None)
     parallel = mesh is not None
 
     module = "haxllm.model"
@@ -215,8 +257,8 @@ def chat_app(cfg: DictConfig) -> None:
 
     model_config = {"name": model_name, **template_config}
     config = getattr(mod, "load_config")(
-        dtype=jnp.dtype(cfg.dtype),
-        param_dtype=jnp.dtype(cfg.param_dtype),
+        dtype=jnp.dtype(dtype),
+        param_dtype=jnp.dtype(param_dtype),
         **model_config,
         decode=True,
         shard=parallel,

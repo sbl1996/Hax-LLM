@@ -1,0 +1,4 @@
+family: internlm
+tokenizer: internlm/internlm-7b
+scan: True
+conv_template: internlm

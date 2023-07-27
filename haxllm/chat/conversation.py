@@ -17,6 +17,7 @@ class SeparatorStyle(Enum):
     CHAT_GLM = auto()
     NON_CHAT = auto()
     LLAMA2 = auto()
+    INTERN_LM = auto()
 
 
 @dataclasses.dataclass
@@ -127,11 +128,51 @@ class Conversation:
                 ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i // 2}]{sep}{role}：{message}"
+                    ret += role + ": " + "<s>" + message + "</s>"
                 else:
                     ret += f"{sep}{role}："
                     if message:
                         ret += message + sep
+            return ret
+        elif self.sep_style == SeparatorStyle.INTERN_LM:
+            r'''
+            prompt = ""
+            for record in history:
+                prompt += f"""<s><|User|>:{record[0]}<eoh>\n<|Bot|>:{record[1]}<eoa>\n"""
+            if len(prompt) == 0:
+                prompt += "<s>"
+            prompt += f"""<|User|>:{query}<eoh>\n<|Bot|>:"""            
+            '''
+            sep = self.sep
+            sep2 = self.sep2
+            assert sep is not None
+            assert sep2 is not None
+
+            ret = ""
+            m = self.messages
+            n = len(m)
+            n = n - 2 if n % 2 == 0 else n - 1
+            for i in range(0, n, 2):
+                role1, message1 = m[i]
+                role2, message2 = m[i+1]
+                ret += f"""<s>{role1}:{message1}{sep}{role2}:{message2}{sep2}"""
+            if len(ret) == 0:
+                assert len(m) - n == 2
+                role1, message1 = m[-2]
+                role2, message2 = m[-1]
+                ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+                if message2:
+                    ret += message2 + sep2
+            else:
+                if len(m) - n == 1:
+                    role, message = m[-1]
+                    ret += f"""<s>{role}:{message}{sep2}"""
+                else:
+                    role1, message1 = m[-2]
+                    role2, message2 = m[-1]
+                    ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+                    if message2:
+                        ret += message2 + sep2
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             # TODO: add support for custom system prompt
@@ -353,5 +394,21 @@ register_conv_template(
         sep=" ",
         bos_token="<s>",
         eos_token="</s>",
+    )
+)
+
+
+# InternLM template
+register_conv_template(
+    Conversation(
+        name="internlm",
+        system="",
+        roles=("<|User|>", "<|Bot|>"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.INTERN_LM,
+        sep="<eoh>\n",
+        sep2="<eoa>\n",
+        stop_token_ids=[103028], # <eoa>
     )
 )

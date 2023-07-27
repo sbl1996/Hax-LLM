@@ -10,9 +10,9 @@ hydra:
     dir: .
 
 seed: 0
-dtype: bfloat16
-param_dtype: bfloat16
-mesh: [1, 8]
+dtype: auto
+param_dtype: auto
+mesh: auto
 
 max_len: null
 temperature: 0.0

@@ -12,51 +12,11 @@ from haxllm.config_utils import RematScanConfigMixin
 
 
 config_hub = {
-    "llama-t": dict(
-        hidden_size=1024,
-        intermediate_size=2816,
-        n_heads=8,
-        n_layers=2,
-    ),
-    "llama-7b": dict(
+    "internlm-7b": dict(
         hidden_size=4096,
         intermediate_size=11008,
         n_heads=32,
         n_layers=32,
-    ),
-    "llama-13b": dict(
-        hidden_size=5120,
-        intermediate_size=13824,
-        n_heads=40,
-        n_layers=40,
-    ),
-    "llama-30b": dict(
-        hidden_size=6656,
-        intermediate_size=17920,
-        n_heads=52,
-        n_layers=60,
-    ),
-    "llama-65b": dict(
-        hidden_size=8192,
-        intermediate_size=22016,
-        n_heads=64,
-        n_layers=80,
-    ),
-    "llama2-7b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_layers=32,
-        rms_norm_eps=1e-5,
-        n_positions=4096,
-    ),
-    "llama2-13b": dict(
-        hidden_size=5120,
-        intermediate_size=13824,
-        n_heads=40,
-        n_layers=40,
-        rms_norm_eps=1e-5,
-        n_positions=4096,
     ),
 }
 
@@ -66,13 +26,14 @@ def load_config(name, **kwargs):
         config = config_hub[name]
     else:
         available = ", ".join(config_hub.keys())
-        raise ValueError(f"Unknown llama model {name}, available: {available}")
+        module_name = __name__.split(".")[-1]
+        raise ValueError(f"Unknown {module_name} model {name}, available: {available}")
     return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass
 class TransformerConfig(RematScanConfigMixin):
-    vocab_size: int = 32000
+    vocab_size: int = 103168
     num_labels: int = 2
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
@@ -114,8 +75,8 @@ class TransformerBlock(nn.Module):
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            qkv_bias=False,
-            out_bias=False,
+            qkv_bias=True,
+            out_bias=True,
             decode=config.decode,
             memory_efficient=config.memory_efficient_attention,
             memory_efficient_mask_mode='causal',
@@ -237,15 +198,19 @@ def remap_state_dict(state_dict):
         block_d["attn"] = {
             "query": {
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.q_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
+                "bias": state_dict.pop(f"model.layers.{d}.self_attn.q_proj.bias").reshape(n_heads, head_dim),
             },
             "key": {
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
+                "bias": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.bias").reshape(n_heads, head_dim),
             },
             "value": {
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
+                "bias": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.bias").reshape(n_heads, head_dim),
             },
             "out": {
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.o_proj.weight").T.reshape(n_heads, head_dim, hidden_size),
+                "bias": state_dict.pop(f"model.layers.{d}.self_attn.o_proj.bias"),
             },
         }
         block_d["ln_2"] = {"scale": state_dict.pop(
