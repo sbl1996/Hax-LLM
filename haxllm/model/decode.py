@@ -114,7 +114,11 @@ def split_rng(rng):
 
 def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
                   temperature=1.0, top_k=5, top_p=1.0, rng=None, two_stage=False, pad_context=None,
-                  pad_token_id=None, decode=True):
+                  pad_token_id=None, decode=True, stop_token_ids=None):
+    if stop_token_ids is None:
+        stop_token_ids = [tokenizer.eos_token_id]
+    if tokenizer.eos_token_id not in stop_token_ids:
+        stop_token_ids.append(tokenizer.eos_token_id)
     if temperature < 1e-5:
         top_k = 1
     if temperature > 1e-5 or top_k != 1:
@@ -161,7 +165,7 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         rng, subrng = split_rng(rng)
         token = sample_token(logits, subrng, temperature, top_p, top_k)
         live_seq = live_seq.at[:, i].set(token)
-        if token in [tokenizer.eos_token_id, 0]:
+        if token in stop_token_ids:
             break
     live_seq = jax.device_get(live_seq[0, :i])
     if decode:
@@ -172,7 +176,11 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
 
 def batch_random_sample(
     input_ids, apply_fn, params, cache, max_len, temperature=1.0, top_k=5, top_p=1.0,
-    rng=None, pad_token_id=None, eos_token_id=None):
+    rng=None, pad_token_id=None, eos_token_id=None, stop_token_ids=None):
+    if stop_token_ids is None:
+        stop_token_ids = [eos_token_id]
+    if eos_token_id not in stop_token_ids:
+        stop_token_ids.append(eos_token_id)
     if temperature < 1e-5:
         top_k = 1
     if temperature >= 1e-5 or top_k != 1:
@@ -207,7 +215,9 @@ def batch_random_sample(
             is_end | is_context, live_seqs[:, i], tokens)
         live_seqs = live_seqs.at[:, i].set(tokens)
 
-        is_stop_token = (tokens == eos_token_id) | (tokens == 0)
+        is_stop_token = tokens == stop_token_ids[0]
+        for stop_token_id in stop_token_ids[1:]:
+            is_stop_token = is_stop_token | (tokens == stop_token_id)
         is_end = is_end | (~is_context & is_stop_token)
         end_index = jnp.where(
             is_end & (end_index == 0),

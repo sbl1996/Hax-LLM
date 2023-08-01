@@ -1,9 +1,10 @@
 # pyright: reportUnboundVariable=false
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P, NamedSharding, Mesh
 from jax.experimental.pjit import pjit
 
 import optax
@@ -11,6 +12,7 @@ import optax
 import flax.linen as nn
 from flax.core.frozen_dict import unfreeze, freeze
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.training import dynamic_scale as dynamic_scale_lib
 
 from haxllm.utils import load_transformer_params, get_metrics, report_params_and_flops, get_sharding, create_mesh, \
     freeze_params_optimizer
@@ -18,6 +20,7 @@ from haxllm.pipeline.text_generation import TextGenerationPipeline
 
 
 Array = Any
+DType = Any
 PyTree = Any
 
 
@@ -32,9 +35,9 @@ def compute_metrics(pred_labels, labels, per_example_loss, mask):
     return metrics
 
 
-def cast_bf16(p):
+def cast_half(p, dtype):
     if p.dtype == jnp.float32:
-        return p.astype(jnp.bfloat16)
+        return p.astype(dtype)
     return p
 
 
@@ -79,7 +82,7 @@ def causal_lm_accuracy(preds, labels, ignore_index=-100):
 
 
 def train_step(params, opt_state, step, batch, dropout_rng,
-               model, tx, cast=False, axis_name=None):
+               model, tx, cast=None, axis_name=None):
     labels = batch["labels"]
     mask = batch["mask"]
 
@@ -100,7 +103,7 @@ def train_step(params, opt_state, step, batch, dropout_rng,
 
     if cast:
         params_dtype = jax.tree_map(lambda x: x.dtype, params)
-        params = jax.tree_map(cast_bf16, params)
+        params = jax.tree_map(lambda p: cast_half(p, cast), params)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (_, (pred_labels, per_example_loss)), grads = grad_fn(params)
@@ -118,6 +121,59 @@ def train_step(params, opt_state, step, batch, dropout_rng,
     if axis_name is not None:
         metrics = jax.lax.psum(metrics, axis_name)
     return params, opt_state, step + 1, metrics
+
+
+def train_step_dynamic_scale(
+        params, opt_state, step, dynamic_scale, batch, dropout_rng,
+        model, tx, cast=None, axis_name=None):
+    labels = batch["labels"]
+    mask = batch["mask"]
+
+    dropout_rng = jax.random.fold_in(dropout_rng, step)
+
+    def loss_fn(params):
+        logits = model.apply(
+            {"params": params},
+            input_ids=batch["input_ids"],
+            train=True,
+            rngs={"dropout": dropout_rng},
+        )
+        per_example_loss = causal_lm_loss(logits=logits, labels=labels)
+        loss = per_example_loss.mean()
+        pred_labels = jnp.argmax(logits, axis=-1)
+        return loss, (pred_labels, per_example_loss)
+
+    if cast:
+        params_dtype = jax.tree_map(lambda x: x.dtype, params)
+        params = jax.tree_map(lambda p: cast_half(p, cast), params)
+
+    grad_fn = dynamic_scale.value_and_grad(loss_fn, has_aux=True, axis_name=axis_name)
+    dynamic_scale, is_fin, (_, (pred_labels, per_example_loss)), grads = grad_fn(params)
+    
+    # TODO: not sure if this is necessary
+    # if cast:
+    #     grads = jax.tree_map(lambda g: g.astype(cast), grads)
+
+    def update_fn(grads, params, opt_state):
+        updates, opt_state = tx.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state
+
+    # Note: no need to use jax.lax.cond here, jit will optimize it.
+    new_params, new_opt_state = update_fn(grads, params, opt_state)
+    params = jax.tree_util.tree_map(
+        partial(jnp.where, is_fin), new_params, params)
+    opt_state = jax.tree_util.tree_map(
+        partial(jnp.where, is_fin), new_opt_state, opt_state)
+
+    if cast:
+        params = jax.tree_map(lambda p, d: p.astype(d), params, params_dtype)
+
+    metrics = compute_metrics(pred_labels, labels, per_example_loss, mask)
+    metrics["total"] = mask.sum()
+    if axis_name is not None:
+        metrics = jax.lax.psum(metrics, axis_name)
+    return params, opt_state, step + 1, dynamic_scale, metrics
 
 
 def eval_step(params, batch, model, axis_name=None):
@@ -142,6 +198,7 @@ def eval_step(params, batch, model, axis_name=None):
 
 def init_fn(init_rng, input_ids, model, tx):
     params = model.init(init_rng, input_ids=input_ids)["params"]
+    params = freeze(params)
     opt_state = tx.init(params)
     step = 0
     return params, opt_state, step
@@ -150,12 +207,15 @@ def init_fn(init_rng, input_ids, model, tx):
 class Trainer:
     model: nn.Module
     tx: optax.GradientTransformation
-    cast_params_bf16: bool
+    cast: Optional[DType]
+    dynamic_scale: bool
+    init_scale: float
 
     _rng: Array
     _params: PyTree
     _opt_state: PyTree
     _global_step: int
+    _dynamic_scale: Optional[dynamic_scale_lib.DynamicScale]
 
     _p_train_step: Callable
     _p_eval_step: Callable
@@ -192,10 +252,12 @@ class Trainer:
 
 class DPTrainer(Trainer):
 
-    def __init__(self, model, tx, rng, cast_params_bf16=False):
+    def __init__(self, model, tx, rng, cast=None, dynamic_scale=False):
+        if dynamic_scale:
+            raise NotImplementedError("Dynamic scale is not supported in DPTrainer.")
         self.model = model
         self.tx = tx
-        self.cast_params_bf16 = cast_params_bf16
+        self.cast = jnp.dtype(cast) if cast is not None else None
 
         self._rng = rng
     
@@ -224,7 +286,7 @@ class DPTrainer(Trainer):
         self._global_step = global_step
 
         p_train_step = jax.pmap(
-            partial(train_step, model=self.model, tx=self.tx, cast=self.cast_params_bf16, axis_name="batch"),
+            partial(train_step, model=self.model, tx=self.tx, cast=self.cast, axis_name="batch"),
             axis_name="batch",
             donate_argnums=(0, 1, 2),
         )
@@ -268,13 +330,20 @@ class DPTrainer(Trainer):
 
 class MPTrainer(Trainer):
 
-    def __init__(self, model, tx, rng, mesh=(1, 8), cast_params_bf16=False):
+    def __init__(self, model, tx, rng, mesh=(1, 8), cast=None, dynamic_scale=False, init_scale=256.0):
         self.model = model
         self.tx = tx
-        self.cast_params_bf16 = cast_params_bf16
+        self.cast = jnp.dtype(cast) if cast is not None else None
+        self.dynamic_scale = dynamic_scale
+        self.init_scale = init_scale
         self.mesh = create_mesh(mesh, ("X", "Y"))
     
         self._rng = rng
+        if self.dynamic_scale:
+            scale = jnp.asarray(self.init_scale, dtype="float32")
+            dynamic_scale = dynamic_scale_lib.DynamicScale(scale=scale)
+            dynamic_scale = jax.device_put(dynamic_scale, NamedSharding(self.mesh, P()))
+            self._dynamic_scale = dynamic_scale
 
     def init(self, input_ids, checkpoint=None):
         self.replace_freeze_params_optimizer(self._rng, input_ids)
@@ -301,10 +370,18 @@ class MPTrainer(Trainer):
         self._opt_state = opt_state
         self._global_step = global_step
 
-        p_train_step = pjit(
-            partial(train_step, model=self.model, tx=self.tx, cast=self.cast_params_bf16),
-            out_shardings=out_shardings + out_shardings[-1:],
-            donate_argnums=(0, 1, 2))
+        none_sharding = out_shardings[-1]
+        if self.dynamic_scale:
+            p_train_step = pjit(
+                partial(train_step_dynamic_scale, model=self.model, tx=self.tx, cast=self.cast),
+                out_shardings=out_shardings + (none_sharding,) * 2,
+                donate_argnums=(0, 1, 2))
+        else:
+            p_train_step = pjit(
+                partial(train_step, model=self.model, tx=self.tx, cast=self.cast),
+                out_shardings=out_shardings + (none_sharding,),
+                donate_argnums=(0, 1, 2))
+
         p_eval_step = pjit(
             partial(eval_step, model=self.model))
         
@@ -313,9 +390,14 @@ class MPTrainer(Trainer):
         self._rng, self._dropout_rng = jax.random.split(self._rng)
     
     def train_step(self, batch):
-        self._params, self._opt_state, self._global_step, metrics = self._p_train_step(
-            self._params, self._opt_state, self._global_step, batch, self._dropout_rng,
-        )
+        if self.dynamic_scale:
+            self._params, self._opt_state, self._global_step, self._dynamic_scale, metrics = self._p_train_step(
+                self._params, self._opt_state, self._global_step, self._dynamic_scale, batch, self._dropout_rng,
+            )
+        else:
+            self._params, self._opt_state, self._global_step, metrics = self._p_train_step(
+                self._params, self._opt_state, self._global_step, batch, self._dropout_rng,
+            )
         return jax.device_get(metrics)
 
     def eval_step(self, batch):

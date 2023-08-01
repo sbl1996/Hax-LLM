@@ -4,6 +4,8 @@ import numpy as np
 
 def create_tfds(data, batch_size, train=True, seed=None):
     import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+    
     drop_remainder = train
     n = next(iter(data.values())).shape[0]
     data = {**data, "mask": np.ones(n, dtype=np.bool_)}

@@ -98,6 +98,7 @@ def eval_step(params, batch, model, axis_name=None):
 
 def init_fn(init_rng, inputs, attn_mask, model, tx):
     params = model.init(init_rng, inputs=inputs, attn_mask=attn_mask)["params"]
+    params = freeze(params)
     opt_state = tx.init(params)
     step = 0
     return params, opt_state, step

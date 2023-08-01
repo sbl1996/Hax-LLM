@@ -16,26 +16,26 @@ def partial_stop(output, stop_str):
     return False
 
 
-def generate_stream(pipeline: ChatPipeline, params, context_len=2048, stream_interval=2):
+def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interval=2):
     tokenizer = pipeline.tokenizer
     prompt = params["prompt"]
     len_prompt = len(prompt)
-    temperature = float(params.get("temperature", 1.0))
+    temperature = float(params.get("temperature") or 1.0)
     # repetition_penalty = float(params.get("repetition_penalty", 1.0))
-    top_p = float(params.get("top_p", 1.0))
-    top_k = int(params.get("top_k", -1))  # -1 means disable
-    stop_str = params.get("stop", None)
-    echo = bool(params.get("echo", True))
-    stop_token_ids = params.get("stop_token_ids", None) or []
+    top_p = float(params.get("top_p") or 1.0)
+    top_k = int(params.get("top_k") or -1)  # -1 means disable
+    stop_str = params.get("stop")
+    echo = bool(params.get("echo") or False)
+    stop_token_ids = params.get("stop_token_ids") or []
     stop_token_ids.append(tokenizer.eos_token_id)
 
     input_ids = tokenizer(prompt).input_ids
     input_echo_len = len(input_ids)
     output_ids = list(input_ids)
 
-    max_new_tokens = int(params.get("max_new_tokens", context_len - input_echo_len - 8))
+    max_new_tokens = int(params.get("max_new_tokens", max_len - input_echo_len - 8))
 
-    max_src_len = context_len - max_new_tokens - 8
+    max_src_len = max_len - max_new_tokens - 8
 
     input_ids = input_ids[-max_src_len:]
 
@@ -202,10 +202,11 @@ def chat_loop(
             "stop": conv.stop_str,
             "stop_token_ids": conv.stop_token_ids,
             "echo": False,
+            "max_len": max_len,
         }
 
         chatio.prompt_for_output(conv.roles[1])
-        output_stream = generate_stream(pipeline, gen_params, context_len=max_len)
+        output_stream = generate_stream(pipeline, gen_params)
         t = time.time()
         outputs = chatio.stream_output(output_stream)
         duration = time.time() - t

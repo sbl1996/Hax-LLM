@@ -225,8 +225,6 @@ def chat_app(cfg: DictConfig) -> None:
 
     assert os.path.exists(checkpoint), f"Checkpoint {checkpoint} does not exist"
 
-    # support for both cpu, gpu and tpu
-    
     platform = jax.default_backend()
 
     mesh = getattr(cfg, "mesh", None)

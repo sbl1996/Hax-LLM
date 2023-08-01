@@ -1,4 +1,4 @@
-from typing import Union, List
+from typing import Union, List, Tuple
 from functools import partial
 
 
@@ -29,10 +29,6 @@ def init_mesh(mesh):
     device_mesh = mesh_utils.create_device_mesh(mesh, contiguous_submeshes=True)
     mesh = Mesh(devices=device_mesh, axis_names=("X", "Y"))
     return mesh
-
-
-def _need_refresh_cache(config):
-    return hasattr(config, "refresh_cache")
 
 
 class TextGenerationPipeline:
@@ -81,34 +77,6 @@ class TextGenerationPipeline:
         self.params = None
         self.cache = None
         self._apply_fn = None
-        self._refresh_cache_fn = None
-
-    def _init_cache_refresh(self):
-        model = self.model
-        config = model.config
-        if not _need_refresh_cache(config):
-            return
-        model = model.clone(config=config.replace(refresh_cache=True))
-
-        def refresh_fn(params, cache, input_ids, model):
-            logits, new_vars = model.apply(
-                {"params": params, "cache": cache},
-                input_ids=input_ids,
-                train=False,
-                mutable=["cache"],
-            )
-            return new_vars['cache']
-
-        p_refresh_fn = jax.jit(partial(refresh_fn, model=self.model))
-        self._refresh_cache_fn = p_refresh_fn
-
-    def refresh_cache(self):
-        if self._refresh_cache_fn is None:
-            self._init_cache_refresh()
-        if self._refresh_cache_fn is None:
-            return
-        input_ids = jnp.zeros((1, 1), dtype=jnp.int32)
-        self.cache = self._refresh_cache_fn(self.params, self.cache, input_ids)
 
     def init_without_params(self, mesh=None):
         self._rng, init_rng = random.split(self._rng)
@@ -116,6 +84,7 @@ class TextGenerationPipeline:
 
         def init_fn(init_rng, input_ids, model):
             state = model.init(init_rng, input_ids=input_ids)
+            state = freeze(state)
             return state['cache']
 
         mesh = init_mesh(mesh)
@@ -161,6 +130,7 @@ class TextGenerationPipeline:
 
         def init_fn(init_rng, input_ids, model):
             state = model.init(init_rng, input_ids=input_ids)
+            state = freeze(state)
             return state['params'], state['cache']
 
         mesh = init_mesh(mesh)
@@ -210,7 +180,6 @@ class TextGenerationPipeline:
         self._apply_fn = p_apply_fn
         self.params = params
         self.cache = cache
-        self.refresh_cache()
     
     def set_params(self, params):
         self.params = params
@@ -246,7 +215,7 @@ class TextGenerationPipeline:
         return self.random_sample(inputs, temperature=0.0, max_len=max_len, max_source_length=max_source_length)
 
     def random_sample(
-            self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None):
+            self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None, stop_token_ids=None):
         temperature = self.temperature if temperature is None else temperature
         top_k = self.top_k if top_k is None else top_k
         top_p = self.top_p if top_p is None else top_p
@@ -258,7 +227,8 @@ class TextGenerationPipeline:
             inputs, kwargs = self.prepare_call_args(inputs)
             return random_sample(
                 inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-                temperature=temperature, top_k=top_k, top_p=top_p, rng=rng, max_len=max_len, **kwargs)
+                temperature=temperature, top_k=top_k, top_p=top_p, rng=rng, max_len=max_len,
+                stop_token_ids=stop_token_ids, **kwargs)
         elif isinstance(inputs, list) or (isinstance(inputs, np.ndarray) and inputs.ndim == 2):
             if not is_greedy and rng is None:
                 self._rng, rng = random.split(self._rng)
@@ -279,7 +249,7 @@ class TextGenerationPipeline:
             outputs = batch_random_sample(
                 input_ids, self._apply_fn, self.params, self.cache,
                 max_len=max_len, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
-                pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+                pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id, stop_token_ids=stop_token_ids)
             if decode:
                 outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             return outputs
@@ -295,7 +265,7 @@ class TextGenerationPipeline:
 
 class ChatPipeline(TextGenerationPipeline):
 
-    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=64):
+    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=64, **kwargs):
         r"""
         Initialize the ChatPipeline with given tokenizer, model, and other optional parameters.
 
@@ -312,7 +282,7 @@ class ChatPipeline(TextGenerationPipeline):
         pad_multiple: int, default 64
             multiple of padding length for two-stage decoding (to avoid jit recompilation)
         """
-        super().__init__(tokenizer, model, max_len, seed, two_stage=True, pad_multiple=pad_multiple)
+        super().__init__(tokenizer, model, max_len, seed, two_stage=True, pad_multiple=pad_multiple, **kwargs)
         self.reset_chat_state()
     
     def reset_chat_state(self):
@@ -348,3 +318,7 @@ class ChatPipeline(TextGenerationPipeline):
         logits = logits.astype(jnp.float32)
         self._ccache = cache
         return logits
+
+    def chat(self, query: str, history: List[Tuple[str, str]] = None,
+             temperature=0.8, top_k=None, top_p=0.8, max_len=None):
+        return self.random_sample(query, history, temperature, top_k, top_p, max_len)
