@@ -1,23 +1,21 @@
 import time
 import os
 import re
-import importlib
 
 from typing import List, Literal, Optional, Union
 
-from transformers import AutoTokenizer
-
-import jax.numpy as jnp
+import hydra
+from omegaconf import DictConfig
 
 import uvicorn
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import ServerSentEvent, EventSourceResponse
+from sse_starlette.sse import EventSourceResponse
 
 from haxllm.chat.conversation import get_conv_template
-from haxllm.pipeline.text_generation import ChatPipeline
 from haxllm.chat.inference import generate_stream
+from haxllm.chat.config_utils import load_config
 
 app = FastAPI()
 
@@ -28,6 +26,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+global model, tokenizer, conv_template
 
 class ModelCard(BaseModel):
     id: str
@@ -91,8 +91,6 @@ async def list_models():
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest):
-    global model, tokenizer
-
     if request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid request")
     query = request.messages[-1].content
@@ -146,8 +144,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 
 async def predict(prompt, gen_params, model_id: str):
-    global model, tokenizer
-
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(role="assistant"),
@@ -190,24 +186,6 @@ async def predict(prompt, gen_params, model_id: str):
     chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
     yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
-    # current_length = 0
-    # for outputs in output_stream:
-    #     new_response = outputs["text"]
-    #     print("Full: " + new_response)
-    #     if len(new_response) == current_length:
-    #         continue
-
-    #     new_text = new_response[current_length:]
-    #     print(new_text)
-    #     current_length = len(new_response)
-    #     choice_data = ChatCompletionResponseStreamChoice(
-    #         index=0,
-    #         delta=DeltaMessage(content=new_text),
-    #         finish_reason=None
-    #     )
-    #     chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    #     yield "{}".format(chunk.model_dump_json(exclude_unset=True))
-
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(),
@@ -218,64 +196,29 @@ async def predict(prompt, gen_params, model_id: str):
     yield '[DONE]'
 
 
-if __name__ == "__main__":
+@hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
+def chat_api_server(cfg: DictConfig) -> None:
     from jax.experimental.compilation_cache import compilation_cache as cc
     cc.initialize_cache(os.path.expanduser("~/jax_cache"))
     import logging
     logging.getLogger("jax").setLevel(logging.WARNING)
 
-    start = time.time()
+    global model, tokenizer, conv_template
 
-    model_name = "chatglm2-6b"
+    pipeline, conv_template = load_config(cfg)
+    model = pipeline
+    tokenizer = pipeline.tokenizer
 
-    random_seed = 0
-    tokenizer_name = "THUDM/chatglm2-6b"
-    conv_template = "chatglm2-6b"
+    print("Default conversation setting:")
+    print(f"  temperature: {pipeline.temperature}")
+    print(f"  top_p: {pipeline.top_p}")
+    print(f"  top_k: {pipeline.top_k}")
+    print(f"  max_len: {pipeline.max_len}")
 
-    checkpoint = "/home/hastur/Code/weights/chatglm2-6b_np.safetensors"
+    host = getattr(cfg, "host", "127.0.0.1")
+    port = getattr(cfg, "port", 8000)
+    uvicorn.run(app, host=host, port=port, workers=1)
 
-    temperature = 0.8
-    top_p = 0.8
-    top_k = -1
 
-    mesh = [1, 8]
-    dtype = jnp.bfloat16
-    param_dtype = jnp.bfloat16
-
-    print(f"Loading tokenizer from {tokenizer_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
-    tokenizer.decode(tokenizer("init")['input_ids'])
-    print("Load tokenizer {}".format(time.time() - start))
-
-    parallel = mesh is not None
-
-    module = "haxllm.model"
-    mod = importlib.import_module(module + "." + "chatglm2")
-
-    model_config = {"name": model_name, "scan": True}
-    config = getattr(mod, "load_config")(
-        dtype=jnp.dtype(dtype),
-        param_dtype=jnp.dtype(param_dtype),
-        **model_config,
-        decode=True,
-        shard=parallel,
-        shard_cache=parallel,
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = config.pad_token_id
-
-    model = getattr(mod, "TransformerLMHeadModel")(config)
-
-    max_len = 1024
-    model = ChatPipeline(
-        tokenizer, model, max_len=max_len, seed=random_seed,
-        pad_multiple=128, temperature=temperature, top_p=top_p, top_k=top_k)
-    model.init(transformer_weight=checkpoint, mesh=mesh)
-
-    print("Conversation setting:")
-    print(f"  temperature: {temperature}")
-    print(f"  top_p: {top_p}")
-    print(f"  top_k: {top_k}")
-    print(f"  max_len: {max_len}")
-
-    uvicorn.run(app, host='0.0.0.0', port=8000, workers=1)
+if __name__ == "__main__":
+    chat_api_server()

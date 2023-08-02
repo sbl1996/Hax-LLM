@@ -177,6 +177,7 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
 def batch_random_sample(
     input_ids, apply_fn, params, cache, max_len, temperature=1.0, top_k=5, top_p=1.0,
     rng=None, pad_token_id=None, eos_token_id=None, stop_token_ids=None):
+    # TODO: using right padding to batch first stage context encode
     if stop_token_ids is None:
         stop_token_ids = [eos_token_id]
     if eos_token_id not in stop_token_ids:

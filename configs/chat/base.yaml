@@ -23,5 +23,11 @@ peft: null
 model: null
 checkpoint: null
 
-debug: False
+# Chat CLI
 style: rich
+
+# Chat API Server
+host: 127.0.0.1
+port: 8000
+
+debug: False

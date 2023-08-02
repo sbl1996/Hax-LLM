@@ -3,14 +3,19 @@ import openai
 openai.api_base = "http://localhost:8000/v1"
 openai.api_key = "none"
 
-# req = openai.ChatCompletion.create(
-#     model="chatglm2-6b",
-#     messages=[
-#         {"role": "user", "content": "Fuck you!"}
-#     ],
-#     stream=False
-# )
-# print(req.choices[0].message.content)
+# Test completion
+
+req = openai.ChatCompletion.create(
+    model="chatglm2-6b",
+    messages=[
+        {"role": "user", "content": "你好"}
+    ],
+    stream=False
+)
+print(req.choices[0].message.content)
+
+
+# Test stream 
 
 for chunk in openai.ChatCompletion.create(
     model="chatglm2-6b",

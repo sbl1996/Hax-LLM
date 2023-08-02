@@ -154,11 +154,7 @@ class ChatIO(abc.ABC):
 def chat_loop(
     pipeline: ChatPipeline,
     chatio: ChatIO,
-    max_len: int,
     conv_template: Optional[str] = None,
-    temperature: float = 1.0,
-    top_k: int = -1,
-    top_p: float = 1.0,
     debug: bool = False,
 ):
     def new_chat():
@@ -194,15 +190,15 @@ def chat_loop(
 
         gen_params = {
             "prompt": prompt,
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
+            "temperature": pipeline.temperature,
+            "top_k": pipeline.top_k,
+            "top_p": pipeline.top_p,
             # "repetition_penalty": repetition_penalty,
             # "max_new_tokens": max_new_tokens,
             "stop": conv.stop_str,
             "stop_token_ids": conv.stop_token_ids,
             "echo": False,
-            "max_len": max_len,
+            "max_len": pipeline.max_len,
         }
 
         chatio.prompt_for_output(conv.roles[1])

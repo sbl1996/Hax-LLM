@@ -265,7 +265,7 @@ class TextGenerationPipeline:
 
 class ChatPipeline(TextGenerationPipeline):
 
-    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=64, **kwargs):
+    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=128, **kwargs):
         r"""
         Initialize the ChatPipeline with given tokenizer, model, and other optional parameters.
 
@@ -322,3 +322,14 @@ class ChatPipeline(TextGenerationPipeline):
     def chat(self, query: str, history: List[Tuple[str, str]] = None,
              temperature=0.8, top_k=None, top_p=0.8, max_len=None):
         return self.random_sample(query, history, temperature, top_k, top_p, max_len)
+
+# TODO: refactor
+def apply_with_pad(apply_fn, params, cache, input_ids, pad_multiple, pad_token_id):
+    seq_len = input_ids.shape[1]
+    pad_context = find_pad_context_length(seq_len, pad_multiple)
+    inputs = jnp.full((1, pad_context), pad_token_id, dtype=jnp.int32)
+    inputs = inputs.at[:, :seq_len].set(input_ids)
+    cache, logits = apply_fn(params, cache, inputs)
+    logits = logits[:, :seq_len]
+    cache = fix_cache_index(cache, pad_context - seq_len)
+    return cache, logits
