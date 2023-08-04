@@ -8,9 +8,11 @@
 ## Models
 - GPT-2
 - BERT (RoBERTa)
-- LLaMA
+- LLaMA (1, 2)
 - Vicuna
 - ChatGLM2
+- InternLM
+- Qwen (in process)
 
 
 ## Parameter-Efficient Fine-Tuning (PEFT)
@@ -22,6 +24,7 @@
 ## Supported Tasks
 - Sequence classification
 - Language modeling
+- Visual question answering (in process)
 
 
 ## Training Features
@@ -43,7 +46,7 @@
 ## Experiments
 Check the experiments and training scripts on this [repo](https://github.com/sbl1996/llm_experiments).
 
-## Chat
+## Chat CLI
 
 ### Vicuna
 
