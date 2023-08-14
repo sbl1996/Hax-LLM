@@ -15,6 +15,7 @@ class SeparatorStyle(Enum):
     RWKV = auto()
     PHOENIX = auto()
     CHAT_GLM = auto()
+    CHAT_GLM2 = auto()
     NON_CHAT = auto()
     LLAMA2 = auto()
     INTERN_LM = auto()
@@ -128,7 +129,23 @@ class Conversation:
                 ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += role + ": " + "<s>" + message + "</s>"
+                    round = i // 2
+                    ret += f"[Round {round}]{sep}{role}：{message}"
+                else:
+                    ret += f"{sep}{role}："
+                    if message:
+                        ret += message + sep
+            return ret
+        elif self.sep_style == SeparatorStyle.CHAT_GLM2:
+            sep = self.sep
+            if self.system:
+                ret = self.system + sep
+            else:
+                ret = ""
+            for i, (role, message) in enumerate(self.messages):
+                if i % 2 == 0:
+                    round = i // 2 + 1  # only difference from CHAT_GLM
+                    ret += f"[Round {round}]{sep}{role}：{message}"
                 else:
                     ret += f"{sep}{role}："
                     if message:
@@ -368,7 +385,7 @@ register_conv_template(
         roles=("问", "答"),
         messages=(),
         offset=0,
-        sep_style=SeparatorStyle.CHAT_GLM,
+        sep_style=SeparatorStyle.CHAT_GLM2,
         sep="\n\n",
         stop_token_ids=[0],
     )

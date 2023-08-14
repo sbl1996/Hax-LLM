@@ -24,7 +24,7 @@ def find_prompt_prefix_suffix(examples, tokenizer):
 
 
 # ChatGLM2 style dataset, modified from https://github.com/THUDM/ChatGLM2-6B/blob/main/ptuning/main.py#L158-L213
-def preprocess_fn(tokenizer, example, max_len, max_source_length, train=True):
+def preprocess_fn(tokenizer, example, max_len, max_source_length, prompt_template=None, train=True):
     prompt_column = "content"
     response_column = "summary"
     n = len(example[prompt_column])
@@ -37,16 +37,43 @@ def preprocess_fn(tokenizer, example, max_len, max_source_length, train=True):
         labels = np.full((n, max_len), -100, dtype=np.int32)
 
         query = example[prompt_column]
+        if prompt_template:
+            query = [prompt_template.replace("<text>", q) for q in query]
         answer = example[response_column]
         prompt = [tokenizer.build_prompt(q) for q in query]
 
         for i in range(n):
             a_ids = tokenizer.encode(text=prompt[i], add_special_tokens=True, truncation=True, max_length=max_source_length)
+
+            # Option 1: a_ids + b_ids
             b_ids = tokenizer.encode(text=answer[i], add_special_tokens=False, truncation=True, max_length=max_target_length)
 
             a_ids[-len(prompt_suffix):] = prompt_suffix
             context_length = len(a_ids)
             input_ids = a_ids + b_ids + [tokenizer.eos_token_id]
+
+            # Option 2: encode(prompt + answer)
+            # Note that a_ids + b_ids != encode(prompt + answer)
+            # below is a workaround to fix this issue
+            # input_ids = tokenizer.encode(text=prompt[i] + answer[i], add_special_tokens=True, truncation=True, max_length=max_source_length + max_target_length + 1)
+
+            # context_length = len(a_ids)
+
+            # if input_ids[:context_length] != a_ids:
+            #     print(i)
+            #     print("query: " + str(query[i]))
+            #     print("answer: " + str(answer[i]))
+            #     print("prompt: " + str(prompt[i]))
+
+            #     print("input_ids[:context_length]: " + str(input_ids[:context_length]))
+            #     print("a_ids: " + str(a_ids))
+            #     raise ValueError("input_ids[:context_length] != a_ids")
+
+            # input_ids[context_length - len(prompt_suffix):context_length] = prompt_suffix
+
+            # input_ids.append(tokenizer.eos_token_id)
+            
+            # Option end
 
             l = len(input_ids)
             inputs[i, :l] = input_ids

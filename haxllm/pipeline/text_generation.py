@@ -211,8 +211,8 @@ class TextGenerationPipeline:
             "decode": decode,
         }
 
-    def greedy_search(self, inputs, max_len=None, max_source_length=None):
-        return self.random_sample(inputs, temperature=0.0, max_len=max_len, max_source_length=max_source_length)
+    def greedy_search(self, inputs, max_len=None, max_source_length=None, stop_token_ids=None):
+        return self.random_sample(inputs, temperature=0.0, max_len=max_len, max_source_length=max_source_length, stop_token_ids=stop_token_ids)
 
     def random_sample(
             self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None, stop_token_ids=None):

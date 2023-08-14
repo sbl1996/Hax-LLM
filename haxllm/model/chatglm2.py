@@ -38,6 +38,9 @@ def load_config(name, **kwargs):
     return _load_config(TransformerConfig, config, **kwargs)
 
 
+stop_token_ids = [0, 2]
+
+
 @struct.dataclass
 class TransformerConfig(RematScanConfigMixin):
     vocab_size: int = 65024

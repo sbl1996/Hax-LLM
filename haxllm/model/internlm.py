@@ -31,6 +31,18 @@ def load_config(name, **kwargs):
     return _load_config(TransformerConfig, config, **kwargs)
 
 
+def build_prompt(self, query, history=[]):
+    prompt = ""
+    for record in history:
+        prompt += f"""<s><|User|>:{record[0]}<eoh>\n<|Bot|>:{record[1]}<eoa>\n"""
+    if len(prompt) == 0:
+        prompt += "<s>"
+    prompt += f"""<|User|>:{query}<eoh>\n<|Bot|>:"""
+    return prompt
+
+stop_token_ids = [2, 103028]
+
+
 @struct.dataclass
 class TransformerConfig(RematScanConfigMixin):
     vocab_size: int = 103168
