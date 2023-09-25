@@ -8,7 +8,7 @@ from flax import struct
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, SelfAttention, Embed
 from haxllm.model.utils import load_config as _load_config
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
 
 
 config_hub = {
@@ -19,16 +19,6 @@ config_hub = {
         n_layers=32,
     ),
 }
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        available = ", ".join(config_hub.keys())
-        module_name = __name__.split(".")[-1]
-        raise ValueError(f"Unknown {module_name} model {name}, available: {available}")
-    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass

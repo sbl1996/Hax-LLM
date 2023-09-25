@@ -10,7 +10,7 @@ from flax import struct
 from haxllm.model.parallel import SelfAttention, DenseGeneral, Embed, MlpBlock
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.modules import make_block_stack
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
 
 
 config_hub = {
@@ -35,14 +35,6 @@ config_hub = {
         n_layers=48,
     ),
 }
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown gpt2 model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass

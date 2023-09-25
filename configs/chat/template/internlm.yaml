@@ -1,4 +1,5 @@
 family: internlm
 tokenizer: internlm/internlm-7b
-scan: True
+remat: False
+scan: False
 conv_template: internlm

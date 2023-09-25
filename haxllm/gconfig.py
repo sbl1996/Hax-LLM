@@ -3,6 +3,7 @@ import jax
 _GCONFIG = {
     "remat_scan_level": 2,
     "remat_policy": "default",
+    "seed": 42,
 }
 
 def get(key):
@@ -23,6 +24,18 @@ def set(key, value):
         else:
             raise ValueError(f"Unknown remat policy {value}")
     _GCONFIG[key] = value
+
+
+def set_gconfig(key_or_dict, value=None):
+    if isinstance(key_or_dict, dict):
+        for key, value in key_or_dict.items():
+            set(key, value)
+    else:
+        set(key_or_dict, value)
+
+
+def get_gconfig(key):
+    return _GCONFIG[key]
 
 
 def save_partial_dots(state, ratio):
@@ -53,3 +66,7 @@ def get_remat_policy():
         return save_partial_dots({"n": 0, "c": 0}, ratio)
     elif remat_policy == "none":
         return jax.checkpoint_policies.everything_saveable
+
+
+def get_seed():
+    return get("seed")

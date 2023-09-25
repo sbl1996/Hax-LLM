@@ -9,7 +9,7 @@ from flax import linen as nn
 from haxllm.model.parallel import SelfAttention, MlpBlock, DenseGeneral
 from haxllm.model.modules import make_block_stack
 from haxllm.model.utils import load_config as _load_config, truncated_normal_init
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
 
 
 config_hub = {
@@ -45,14 +45,6 @@ config_hub = {
         vocab_size=50265,
     ),
 }
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown bert model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass

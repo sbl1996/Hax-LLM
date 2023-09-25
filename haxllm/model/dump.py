@@ -66,6 +66,7 @@ def check_ckpt(model_dir, ckpt_type):
         index_file = model_dir / SAFE_TENSORS_INDEX
     else:
         raise ValueError("Unknown ckpt type: {}".format(ckpt_type))
+    print(ckpt_type, index_file)
     if not index_file.exists():
         return False
     ckpt_files = get_ckpt_files_from_index(index_file)
@@ -115,13 +116,17 @@ if __name__ == "__main__":
                 try:
                     model = AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True)
                 except ValueError:
-                    model = AutoModel.from_pretrained(source, trust_remote_code=True)
+                    try:
+                        model = AutoModel.from_pretrained(source, trust_remote_code=True)
+                    except ImportError as e:
+                        raise ValueError("Cannot load model from huggingface hub, try to specify --type, original error: {}".format(e))
                 del model
         else:
             ckpt_exists = check_ckpt(model_dir, args.type)
             if not ckpt_exists:
                 from huggingface_hub import hf_hub_download
-                ckpt_index = hf_hub_download(repo_id=source, filename=SAFE_TENSORS_INDEX)
+                filename = SAFE_TENSORS_INDEX if args.type == "safetensors" else TORCH_INDEX
+                ckpt_index = hf_hub_download(repo_id=source, filename=filename)
                 ckpt_files = get_ckpt_files_from_index(ckpt_index)
                 for f in ckpt_files:
                     hf_hub_download(repo_id=source, filename=f)

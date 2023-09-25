@@ -16,7 +16,7 @@ from haxllm.model.efficient_attention import (
     dot_product_attention as dot_product_attention_m,
 )
 from haxllm.gconfig import get_remat_policy
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
 
 
 default_kernel_init = initializers.lecun_normal()

@@ -8,9 +8,12 @@ import jax.numpy as jnp
 
 from transformers import AutoTokenizer
 
-from haxllm.pipeline.text_generation import ChatPipeline
+from haxllm.pipeline.text_generation import ChatPipeline, TextGenerationPipeline
+from haxllm.config_utils import get_module
+from haxllm.model.utils import load_config as _load_config, load_model_cls
 
-def load_config(cfg: DictConfig):
+
+def load_config(cfg: DictConfig, chat: bool = True):
     model_name = getattr(cfg, "model", None)
     if model_name is None:
         raise ValueError("Model name not specified")
@@ -46,6 +49,7 @@ def load_config(cfg: DictConfig):
     temperature = getattr(cfg, "temperature", 1.0)
     top_p = getattr(cfg, "top_p", 1.0)
     top_k = getattr(cfg, "top_k", -1)
+    max_new_tokens = getattr(cfg, "max_new_tokens", None)
 
     platform = jax.default_backend()
 
@@ -62,33 +66,34 @@ def load_config(cfg: DictConfig):
         param_dtype = jnp.bfloat16 if platform == 'tpu' else jnp.float16
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    tokenizer.padding_side = getattr(cfg, "padding_side", "right")
+    tokenizer.truncation_side = getattr(cfg, "truncation_side", "right")
     tokenizer.decode(tokenizer("init")['input_ids'])
 
     parallel = mesh is not None
 
-    module = "haxllm.model"
     peft = getattr(cfg, "peft", None)
-    if peft is not None:
-        module = module + "." + peft
-    mod = importlib.import_module(module + "." + template_config.pop("family"))
+    mod = get_module(template_config.pop("family"), peft)
 
-    model_config = {"name": model_name, **template_config}
-    config = getattr(mod, "load_config")(
-        dtype=jnp.dtype(dtype),
-        param_dtype=jnp.dtype(param_dtype),
+    model_config = {"name": model_name, "dtype": dtype, "param_dtype": param_dtype, **template_config}
+    config = _load_config(
+        mod,
         **model_config,
         decode=True,
         shard=parallel,
-        shard_cache=parallel,
+        padding_left=tokenizer.padding_side == "left",
     )
-    if tokenizer.pad_token_id is None:
+
+    if config.pad_token_id is not None and tokenizer.pad_token_id != config.pad_token_id:
+        print(f"Changing tokenizer pad token id from {tokenizer.pad_token_id} to {config.pad_token_id}")
         tokenizer.pad_token_id = config.pad_token_id
 
-    model = getattr(mod, "TransformerLMHeadModel")(config)
+    model = load_model_cls(mod, "lm")(config)
 
     max_len = getattr(cfg, "max_len", None) or config.n_positions
-    pipeline = ChatPipeline(
+    Pipeline = ChatPipeline if chat else TextGenerationPipeline
+    pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,
         temperature=temperature, top_p=top_p, top_k=top_k)
     pipeline.init(transformer_weight=checkpoint, mesh=mesh)
-    return pipeline, conv_template
+    return pipeline, conv_template, max_new_tokens

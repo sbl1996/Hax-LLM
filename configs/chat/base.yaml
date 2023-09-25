@@ -18,6 +18,7 @@ max_len: null
 temperature: 0.0
 top_k: -1
 top_p: 1.0
+max_new_tokens: null
 
 peft: null
 model: null
@@ -29,5 +30,10 @@ style: rich
 # Chat API Server
 host: 127.0.0.1
 port: 8000
+
+# Eval
+batch_size: 8
+data_dir: null
+padding_side: null
 
 debug: False

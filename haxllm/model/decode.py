@@ -7,8 +7,24 @@ from flax.core.frozen_dict import unfreeze, FrozenDict
 
 
 def add_batch_dim(x, batch_size):
-    if x.ndim <= 2:
-        # cache_index and cache_position_ids
+    r"""
+    Add batch dimension to the input tensor.
+
+    Parameters
+    ----------
+    x : Tensor
+        Input tensor.
+        `x` maybe one of the following:
+            - cached_key: (batch_size, num_heads, seq_len, head_dim)
+            - cached_value: (batch_size, num_heads, seq_len, head_dim)
+            - cached_index: ()
+            - cache_position_ids: ()
+            - cache_position: (batch_size,)
+        With scan and remat_scan, 2 additional dimensions are added to the front.
+    batch_size : int
+        Batch size.
+    """
+    if x.ndim <= 3:
         return jnp.tile(x, [1] * x.ndim)
     reps = [1] * x.ndim
     reps[-4] = batch_size
@@ -28,13 +44,15 @@ def fix_cache_index(cache, offset):
     if isinstance(cache, FrozenDict):
         cache = unfreeze(cache)
     if 'hs' in cache['transformer']:
-        v = cache['transformer']['hs']['attn']['cache_index']
-        cache['transformer']['hs']['attn']['cache_index'] = v - offset
+        keys = ['hs']
     else:
         keys = [ k for k in cache['transformer'] if k.startswith('h_') ]
-        for key in keys:
-            v = cache['transformer'][key]['attn']['cache_index']
-            cache['transformer'][key]['attn']['cache_index'] = v - offset
+    
+    for key in keys:
+        parent = cache['transformer'][key]['attn']
+        parent['cache_index'] = parent['cache_index'] - offset
+        if "cache_position" in parent:
+            parent['cache_position'] = parent['cache_position'] - offset
     return cache
 
 
@@ -114,7 +132,7 @@ def split_rng(rng):
 
 def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
                   temperature=1.0, top_k=5, top_p=1.0, rng=None, two_stage=False, pad_context=None,
-                  pad_token_id=None, decode=True, stop_token_ids=None):
+                  pad_token_id=None, decode=True, stop_token_ids=None, max_new_tokens=None):
     if stop_token_ids is None:
         stop_token_ids = [tokenizer.eos_token_id]
     if tokenizer.eos_token_id not in stop_token_ids:
@@ -130,41 +148,40 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         tokens = tokenizer(inputs)['input_ids']
     else:
         tokens = inputs
+    if tokens[0] == pad_token_id:
+        raise ValueError("Padding left or empty input detected, not supported")
     context_length = len(tokens)
     assert context_length < max_len, "Context length must be less than max_len"
 
     cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), cache)
 
-    if pad_context is None:
-        live_seq = jnp.zeros((1, max_len), dtype=jnp.int32)
-    else:
-        live_seq = jnp.full((1, max_len), pad_token_id, dtype=jnp.int32)
+    live_seq = jnp.full((1, max_len), pad_token_id, dtype=jnp.int32)
     live_seq = live_seq.at[:, :context_length].set(tokens)
 
-    if two_stage:
-        first_len = context_length if pad_context is None else pad_context
-        input_ids = live_seq[:, :first_len]
-        cache, logits = apply_fn(params, cache, input_ids)
-        logits = logits.astype(jnp.float32)[0, context_length-1]
-        rng, subrng = split_rng(rng)
-        token = sample_token(logits, subrng, temperature, top_p, top_k)
-        live_seq = live_seq.at[:, context_length].set(token)
-        if pad_context is not None:
-            cache = fix_cache_index(cache, pad_context - context_length)
-        i = context_length
-    else:
-        i = 0
-
+    i = 0
+    new_tokens = 0
     while i < max_len:
-        input_ids = live_seq[:, [i]]
-        cache, logits = apply_fn(params, cache, input_ids)
-        i += 1
+        if two_stage and i == 0:
+            first_len = context_length if pad_context is None else pad_context
+            input_ids = live_seq[:, :first_len]
+            cache, logits = apply_fn(params, cache, input_ids)
+            if pad_context is not None:
+                cache = fix_cache_index(cache, pad_context - context_length)
+            logits = logits.astype(jnp.float32)[0, context_length-1]
+            i = context_length
+        else:
+            input_ids = live_seq[:, [i]]
+            cache, logits = apply_fn(params, cache, input_ids)
+            logits = logits.astype(jnp.float32)[0, -1]
+            i += 1
         if i < context_length:
             continue
-        logits = logits.astype(jnp.float32)[0, 0]
         rng, subrng = split_rng(rng)
         token = sample_token(logits, subrng, temperature, top_p, top_k)
         live_seq = live_seq.at[:, i].set(token)
+        new_tokens += 1
+        if max_new_tokens is not None and new_tokens >= max_new_tokens:
+            break
         if token in stop_token_ids:
             break
     live_seq = jax.device_get(live_seq[0, :i])
@@ -176,19 +193,31 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
 
 def batch_random_sample(
     input_ids, apply_fn, params, cache, max_len, temperature=1.0, top_k=5, top_p=1.0,
-    rng=None, pad_token_id=None, eos_token_id=None, stop_token_ids=None):
-    # TODO: using right padding to batch first stage context encode
+    rng=None, pad_token_id=None, eos_token_id=None, stop_token_ids=None, padding_left=False,
+    two_stage=None, pad_context=None, max_new_tokens=None):
     if stop_token_ids is None:
         stop_token_ids = [eos_token_id]
     if eos_token_id not in stop_token_ids:
         stop_token_ids.append(eos_token_id)
+
     if temperature < 1e-5:
         top_k = 1
     if temperature >= 1e-5 or top_k != 1:
         assert rng is not None, "Must provide rng if not using greedy decoding"
+
     assert pad_token_id is not None and eos_token_id is not None, "Must provide pad_token_id and eos_token_id" 
-    # (batch_size, max_source_length)
+    
+    if max_new_tokens is not None:
+        assert padding_left is True, "Must use padding_left if max_new_tokens is not None"
+
+    if padding_left:
+        assert two_stage is not False, "Must use two_stage if padding_left is True"
+        assert pad_context is None, "pad_context must be None if padding_left is True"
+    else:
+        assert two_stage is not True, "two_stage not supported if padding_left is False"
+
     batch_size, max_source_length = input_ids.shape
+
     context_length = jnp.argmax(input_ids == pad_token_id, axis=1)
     context_length = jnp.where(context_length == 0, max_source_length, context_length)
 
@@ -200,11 +229,17 @@ def batch_random_sample(
     i = 0
     end_index = jnp.zeros((batch_size,), dtype=jnp.int32)
     is_end = jnp.zeros((batch_size,), dtype=jnp.bool_)
+    new_tokens = 0
     while i < max_len:
-        input_ids = live_seqs[:, [i]]
-        cache, logits = apply_fn(params, cache, input_ids)
-        i += 1
-        logits = logits.astype(jnp.float32)[:, 0]
+        if padding_left and i == 0:
+            input_ids = live_seqs[:, :max_source_length]
+            cache, logits = apply_fn(params, cache, input_ids)
+            i = max_source_length
+        else:
+            input_ids = live_seqs[:, [i]]
+            cache, logits = apply_fn(params, cache, input_ids)
+            i += 1
+        logits = logits.astype(jnp.float32)[:, -1]
         if rng is None:
             subrngs = None
         else:
@@ -215,6 +250,12 @@ def batch_random_sample(
         tokens = jnp.where(
             is_end | is_context, live_seqs[:, i], tokens)
         live_seqs = live_seqs.at[:, i].set(tokens)
+
+        if padding_left and i >= max_source_length:
+            new_tokens += 1
+            if max_new_tokens is not None and new_tokens >= max_new_tokens:
+                i += 1
+                break
 
         is_stop_token = tokens == stop_token_ids[0]
         for stop_token_id in stop_token_ids[1:]:

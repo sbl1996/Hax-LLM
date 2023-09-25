@@ -1,76 +1,16 @@
-from typing import Tuple
-from flax import struct
-import optax
-
-from haxllm.optim import warmup_linear_decay_schedule
-
-@struct.dataclass
-class RematScanConfigMixin:
-    remat: bool = False
-    scan: bool = False
-    remat_scan: bool = False
-    lengths: Tuple[int, int] = (-1, 1)
-
-    def remat_scan_lengths(self):
-        if not self.remat_scan:
-            raise ValueError("remat_scan_lengths called when remat_scan is False")
-        return self.lengths
-
-    def scan_lengths(self):
-        if not self.scan:
-            raise ValueError("scan_lengths called when scan is False")
-        return self.lengths
+import importlib
 
 
-def set_extra(extra, cfg, name):
-    if hasattr(cfg, name):
-        extra[name] = getattr(cfg, name)
-
-
-def get_optimizer(cfg, steps_per_epoch):
-    init_lr = cfg.optimizer.warmup_min_lr
-    peak_lr = cfg.optimizer.learning_rate
-    total_steps = steps_per_epoch * cfg.train.epochs
-    warmup_steps = getattr(cfg.optimizer, "warmup_steps", 0)
-    if warmup_steps == 0 and hasattr(cfg.optimizer, "warmup_ratio"):
-        warmup_steps = int(total_steps * cfg.optimizer.warmup_ratio)
-    min_ratio = getattr(cfg.optimizer, "min_ratio", 0.0)
-    print(f"init_lr: {init_lr}, peak_lr: {peak_lr}, warmup_steps: {warmup_steps}")
-    if warmup_steps == 0:
-        init_lr = peak_lr
-    schedule = getattr(cfg.optimizer, "schedule", "cosine")
-    if schedule == "cosine":
-        lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_lr, peak_lr, warmup_steps=warmup_steps, decay_steps=total_steps,
-            end_value=peak_lr * min_ratio)
-    elif schedule == "linear":
-        lr_schedule = warmup_linear_decay_schedule(
-            init_lr, peak_lr, warmup_steps=warmup_steps, decay_steps=total_steps,
-            end_value=peak_lr * min_ratio)
+def get_module(family, peft=None):
+    if peft:
+        if peft == 'ptuning':
+            mod = importlib.import_module("haxllm.model.ptuning." + family)
+        elif peft == 'lora':
+            mod = importlib.import_module("haxllm.model.lora." + family)
+        elif peft == 'llama_adapter':
+            mod = importlib.import_module("haxllm.model.llama_adapter." + family)
+        else:
+            raise ValueError(f"Unknown PEFT method: {peft}")
     else:
-        raise ValueError(f"Unknown schedule {schedule}")
-
-    optimizer = []
-    if cfg.optimizer.clip_norm > 0:
-        optimizer.append(optax.clip_by_global_norm(cfg.optimizer.clip_norm))
-        
-    opt_name = cfg.optimizer.name
-
-    extras = {}
-    if opt_name in ["adamw", "lion"]:
-        set_extra(extras, cfg.optimizer, "b1")
-        set_extra(extras, cfg.optimizer, "b2")
-        set_extra(extras, cfg.optimizer, "mu_dtype")
-    if opt_name == "adamw":
-        set_extra(extras, cfg.optimizer, "eps")
-
-    if opt_name == 'sgdw':
-        from haxllm.optim import sgdw
-        optimizer.append(sgdw(
-            learning_rate=lr_schedule, momentum=cfg.optimizer.momentum, weight_decay=cfg.optimizer.weight_decay,
-            nesterov=cfg.optimizer.nesterov, accumulator_dtype=cfg.optimizer.accumulator_dtype))
-    else:
-        optimizer.append(getattr(optax, opt_name)(learning_rate=lr_schedule, weight_decay=cfg.optimizer.weight_decay, **extras))
-    optimizer = optax.chain(*optimizer)
-    optimizer.trainable_pattern = getattr(cfg.train, "trainable_pattern", None)
-    return optimizer
+        mod = importlib.import_module("haxllm.model." + family)
+    return mod

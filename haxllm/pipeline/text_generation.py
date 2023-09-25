@@ -1,6 +1,7 @@
 from typing import Union, List, Tuple
-from functools import partial
 
+import warnings
+from functools import partial
 
 import numpy as np
 import jax
@@ -16,7 +17,7 @@ from flax import linen as nn
 
 from haxllm.utils import load_transformer_params
 from haxllm.model.decode import random_sample, beam_search, fix_cache_index, batch_random_sample
-
+from haxllm.gconfig import get_seed
 
 def find_pad_context_length(seq_len, multiple=64):
     # Find the smallest multiple of `multiple` that is larger than seq_len
@@ -33,8 +34,9 @@ def init_mesh(mesh):
 
 class TextGenerationPipeline:
 
-    def __init__(self, tokenizer, model, max_len=512, seed=0, rng=None,
-                 two_stage=False, pad_multiple=64, temperature=1.0, top_k=-1, top_p=1.0):
+    def __init__(self, tokenizer, model, max_len=512, seed=None, rng=None,
+                 two_stage=False, pad_multiple=128, temperature=1.0, top_k=-1, top_p=1.0,
+                 max_new_tokens=None, stop_token_ids=None, verbose=True):
         r"""
         Initialize the TextGenerationPipeline with given tokenizer, model, and other optional parameters.
 
@@ -46,15 +48,30 @@ class TextGenerationPipeline:
             Pre-trained model for text generation.
         max_len: int, default 512
             maximum length of the generated text.
-        seed: int, default 0
+        seed: int, default None
             random seed for reproducible results.
+            If None, use seed from gconfig.
         two_stage: bool, default False
             flag to enable two-stage decoding.
-        pad_multiple: int, default 64
+        pad_multiple: int, default 128
             multiple of padding length for two-stage decoding (to avoid jit recompilation)
         rng: jax.random.PRNGKey, default None
             random number generator for reproducible results.
+        temperature: float, default 1.0
+            temperature for random sampling.
+        top_k: int, default -1
+            number of top-k tokens to sample from.
+        top_p: float, default 1.0
+            cumulative probability for top-p sampling.
+        max_new_tokens: int, default None
+            maximum number of new tokens to generate.
+        stop_token_ids: list of int, default None
+            list of token ids to stop decoding.
+        verbose: bool, default True
+            flag to enable verbose output.
         """
+        if seed is None:
+            seed = get_seed()
         self.seed = seed
 
         tokenizer.decode(tokenizer("init")['input_ids'])
@@ -68,6 +85,9 @@ class TextGenerationPipeline:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.max_new_tokens = max_new_tokens
+        self.stop_token_ids = stop_token_ids
+        self.verbose = verbose
 
         if rng is None:
             self._rng = random.PRNGKey(self.seed)
@@ -77,6 +97,10 @@ class TextGenerationPipeline:
         self.params = None
         self.cache = None
         self._apply_fn = None
+
+    def print(self, *args, **kwargs):
+        if self.verbose:
+            print(*args, **kwargs)
 
     def init_without_params(self, mesh=None):
         self._rng, init_rng = random.split(self._rng)
@@ -90,7 +114,7 @@ class TextGenerationPipeline:
         mesh = init_mesh(mesh)
         parallel = mesh is not None
         if parallel:
-            print("Init model on {}".format(mesh))
+            self.print("Init model on {}".format(mesh))
 
             abs_cache = jax.eval_shape(
                 partial(init_fn, model=self.model), init_rng, input_ids)
@@ -101,7 +125,7 @@ class TextGenerationPipeline:
             with mesh:
                 cache = p_init_fn(init_rng, input_ids)
         else:
-            print("Init model on CPU")
+            self.print("Init model on CPU")
             p_init_fn = jax.jit(partial(init_fn, model=self.model))
 
             with jax.default_device(jax.devices("cpu")[0]):
@@ -137,7 +161,7 @@ class TextGenerationPipeline:
         parallel = mesh is not None
         if parallel:
             load_device = mesh
-            print("Init model on {}".format(mesh))
+            self.print("Init model on {}".format(mesh))
 
             abs_params, abs_cache = jax.eval_shape(
                 partial(init_fn, model=self.model), init_rng, input_ids)
@@ -149,7 +173,7 @@ class TextGenerationPipeline:
             with mesh:
                 params, cache = p_init_fn(init_rng, input_ids)
         else:
-            print("Init model on CPU")
+            self.print("Init model on CPU")
             load_device = 'cpu'
             p_init_fn = jax.jit(partial(init_fn, model=self.model))
 
@@ -159,7 +183,7 @@ class TextGenerationPipeline:
         if transformer_weight:
             params = unfreeze(flatten_dict(params, sep="."))
             params = load_transformer_params(
-                params, transformer_weight, lm_head=True, device=load_device)
+                params, transformer_weight, lm_head=True, device=load_device, verbose=self.verbose)
             params = freeze(unflatten_dict(params, sep="."))
 
         if not parallel:
@@ -211,16 +235,35 @@ class TextGenerationPipeline:
             "decode": decode,
         }
 
-    def greedy_search(self, inputs, max_len=None, max_source_length=None, stop_token_ids=None):
-        return self.random_sample(inputs, temperature=0.0, max_len=max_len, max_source_length=max_source_length, stop_token_ids=stop_token_ids)
+    def greedy_search(self, inputs, max_len=None, max_source_length=None, stop_token_ids=None, padding_left=None):
+        return self.random_sample(inputs, temperature=0.0, max_len=max_len, max_source_length=max_source_length,
+                                  stop_token_ids=stop_token_ids, padding_left=padding_left)
 
     def random_sample(
-            self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None, stop_token_ids=None):
+            self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None, stop_token_ids=None,
+            padding_left=None, max_new_tokens=None):
         temperature = self.temperature if temperature is None else temperature
+        stop_token_ids = self.stop_token_ids if stop_token_ids is None else stop_token_ids
+
         top_k = self.top_k if top_k is None else top_k
         top_p = self.top_p if top_p is None else top_p
+        max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
+
         max_len = max_len or self.max_len
+
         is_greedy = temperature == 0.0 or top_k == 1
+
+        if padding_left is None:
+            padding_left = self.tokenizer.padding_side == "left"
+        if padding_left:
+            if not getattr(self.model.config, "padding_left", False):
+                warnings.warn(
+                    "provided padding_left={}, tokenizer.padding_side={}, but model does not have "
+                    "config.padding_left=True. This may cause errors.".format(
+                        padding_left, self.tokenizer.padding_side
+                    ),
+                )
+
         if isinstance(inputs, str) or (isinstance(inputs, np.ndarray) and inputs.ndim == 1):
             if not is_greedy and rng is None:
                 self._rng, rng = random.split(self._rng)
@@ -228,7 +271,7 @@ class TextGenerationPipeline:
             return random_sample(
                 inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
                 temperature=temperature, top_k=top_k, top_p=top_p, rng=rng, max_len=max_len,
-                stop_token_ids=stop_token_ids, **kwargs)
+                max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, **kwargs)
         elif isinstance(inputs, list) or (isinstance(inputs, np.ndarray) and inputs.ndim == 2):
             if not is_greedy and rng is None:
                 self._rng, rng = random.split(self._rng)
@@ -240,7 +283,10 @@ class TextGenerationPipeline:
                 else:
                     input_ids = self.tokenizer(inputs, max_length=max_source_length, truncation=True)['input_ids']
                 pad_len = max(len(s) for s in input_ids)
-                input_ids = [s + [pad_token_id] * (pad_len - len(s)) for s in input_ids]
+                if padding_left:
+                    input_ids = [[pad_token_id] * (pad_len - len(s)) + s for s in input_ids]
+                else:
+                    input_ids = [s + [pad_token_id] * (pad_len - len(s)) for s in input_ids]
                 input_ids = np.array(input_ids, dtype=np.int32)
             else:
                 input_ids = inputs
@@ -249,7 +295,8 @@ class TextGenerationPipeline:
             outputs = batch_random_sample(
                 input_ids, self._apply_fn, self.params, self.cache,
                 max_len=max_len, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
-                pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id, stop_token_ids=stop_token_ids)
+                pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id,
+                max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, padding_left=padding_left)
             if decode:
                 outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             return outputs
@@ -279,7 +326,7 @@ class ChatPipeline(TextGenerationPipeline):
             maximum length of the generated text.
         seed: int, default 0
             random seed for reproducible results.
-        pad_multiple: int, default 64
+        pad_multiple: int, default 128
             multiple of padding length for two-stage decoding (to avoid jit recompilation)
         """
         super().__init__(tokenizer, model, max_len, seed, two_stage=True, pad_multiple=pad_multiple, **kwargs)

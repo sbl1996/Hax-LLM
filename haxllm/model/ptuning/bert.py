@@ -9,14 +9,6 @@ from haxllm.model.bert import config_hub, remap_state_dict, TransformerConfig as
 from haxllm.model.ptuning.modules import PrefixEmbed, SelfAttention
 
 
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown ptuning bert model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
-
-
 @struct.dataclass
 class TransformerConfig(BaseTransformerConfig):
     pre_seq_len: int = 0

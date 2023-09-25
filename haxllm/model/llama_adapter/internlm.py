@@ -5,12 +5,12 @@ from flax import struct
 
 from haxllm.model.modules import RMSNorm
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral
-from haxllm.model.chatglm2 import (
+from haxllm.model.internlm import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
     TransformerModel,
-    stop_token_ids
+    ChatSetting,
 )
 from haxllm.model.llama_adapter.modules import PrefixEmbed, SelfAttention
 
@@ -53,15 +53,16 @@ class TransformerBlock(nn.Module):
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
-            multi_query_groups=config.num_groups,
             prefix_len=config.pre_seq_len,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
             qkv_bias=True,
-            out_bias=False,
+            out_bias=True,
             decode=config.decode,
+            memory_efficient=config.memory_efficient_attention,
+            memory_efficient_mask_mode='causal',
             rope=True,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
@@ -69,7 +70,7 @@ class TransformerBlock(nn.Module):
             shard=config.shard,
             shard_cache=config.shard_cache,
             zero_init=config.zero_init_prefix_attn,
-            name="attn")(x, mask, padding_mask, prefix_key_value=prefix_key_value)
+            name="attn")(x, mask=mask, padding_mask=padding_mask, prefix_key_value=prefix_key_value)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps,
@@ -101,7 +102,8 @@ class TransformerLMHeadModel(nn.Module):
     def __call__(self, *, input_ids, train=False):
         config = self.config
         x = TransformerModel(
-            config=config, block_cls=TransformerBlock, name="transformer")(inputs=input_ids, train=train)
+            config=config, block_cls=TransformerBlock, name="transformer")(
+            inputs=input_ids, train=train)
 
         if config.decode:
             shard_axes = {"kernel": ("Y", None)}

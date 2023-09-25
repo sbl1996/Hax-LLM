@@ -1,10 +1,52 @@
 import math
 
+from enum import Enum, auto
 import jax
 import jax.numpy as jnp
 
 
-def load_config(cls, base_config, **kwargs):
+class ModelTask(Enum):
+    SequenceClassification = auto()
+    LanguageModeling = auto()
+
+
+def parse_task(task):
+    if isinstance(task, ModelTask):
+        return task
+    assert isinstance(task, str), f"task must be a string, got {task}"
+    task = task.lower()
+    if task == "sequence_classification" or task == 'cls':
+        return ModelTask.SequenceClassification
+    elif task == "language_modeling" or task == 'lm':
+        return ModelTask.LanguageModeling
+    else:
+        raise ValueError(f"Unknown task {task}")
+
+
+def load_model_cls(module, task):
+    task = parse_task(task)
+    if task == ModelTask.SequenceClassification:
+        return getattr(module, "TransformerSequenceClassifier")
+    elif task == ModelTask.LanguageModeling:
+        return getattr(module, "TransformerLMHeadModel")
+    else:
+        raise ValueError(f"Unknown task {task}")
+
+
+def load_config(module, name, **kwargs):
+    hub = getattr(module, "config_hub")
+    config_cls = getattr(module, "TransformerConfig")
+    if name in hub:
+        config = hub[name]
+    else:
+        available = ", ".join(hub.keys())
+        type_name = config_cls.__name__
+        module_name = type_name.split(".")[-1]
+        raise ValueError(f"Unknown {module_name} model {name}, available: {available}")
+    return _load_config1(config_cls, config, **kwargs)
+
+
+def _load_config1(cls, base_config, **kwargs):
     d = {**base_config}
     kwargs = {**kwargs}
 
@@ -43,11 +85,17 @@ def load_config(cls, base_config, **kwargs):
         lengths = []
     kwargs["lengths"] = tuple(lengths)
 
+    ignored_keys = ["remat_policy"]
     for k, v in kwargs.items():
+        if k in ignored_keys:
+            continue
         if k not in cls.__dataclass_fields__:
             print(f"Unknown config key {k} for {cls.__name__}")
             continue
         d[k] = v
+    
+    if d['shard'] and "shard_cache" not in d:
+        d['shard_cache'] = True
     return cls(**d)
 
 

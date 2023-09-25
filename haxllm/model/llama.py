@@ -1,14 +1,15 @@
 from typing import Callable, Any
 
+import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, SelfAttention, Embed
-from haxllm.model.utils import load_config as _load_config
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
+from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.chat.setting import register_chat_setting
 
 
 config_hub = {
@@ -61,15 +62,6 @@ config_hub = {
 }
 
 
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        available = ", ".join(config_hub.keys())
-        raise ValueError(f"Unknown llama model {name}, available: {available}")
-    return _load_config(TransformerConfig, config, **kwargs)
-
-
 @struct.dataclass
 class TransformerConfig(RematScanConfigMixin):
     vocab_size: int = 32000
@@ -87,10 +79,22 @@ class TransformerConfig(RematScanConfigMixin):
     eos_token_id: int = 2
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    decode: bool = False
+    padding_left: bool = False
     memory_efficient_attention: bool = False
+    decode: bool = False
     shard: bool = False
     shard_cache: bool = False
+
+
+def get_chat_setting(name=None):
+    if name is None or name == 'none':
+        return BaseChatSetting.none()
+    elif name == VicunaChatSetting.name:
+        return VicunaChatSetting()
+    elif name == LLaMA2ChatSetting.name:
+        return LLaMA2ChatSetting()
+    else:
+        raise ValueError(f"unknown chat config: {name}, must be one of {VicunaChatSetting.name}, {LLaMA2ChatSetting.name} or 'none'")
 
 
 class TransformerBlock(nn.Module):
@@ -101,10 +105,14 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        inputs, padding_mask = inputs
+
         if config.memory_efficient_attention or config.decode:
             mask = None
         else:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
+            if padding_mask is not None:
+                mask = mask & ~padding_mask[:, None, None, :]
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
@@ -117,14 +125,13 @@ class TransformerBlock(nn.Module):
             qkv_bias=False,
             out_bias=False,
             decode=config.decode,
-            memory_efficient=config.memory_efficient_attention,
-            memory_efficient_mask_mode='causal',
             rope=True,
+            padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
-            name="attn")(x, mask)
+            name="attn")(x, mask, padding_mask)
 
         x = x + inputs
 
@@ -139,10 +146,15 @@ class TransformerBlock(nn.Module):
             shard_axes2=("Y", "X"),
             shard=config.shard,
             name="mlp")(y)
+
+        y = x + y
+
+        outputs = (y, padding_mask)
+
         if self.scan:
-            return x + y, None
+            return outputs, None
         else:
-            return x + y
+            return outputs
 
 
 class TransformerModel(nn.Module):
@@ -154,6 +166,9 @@ class TransformerModel(nn.Module):
         config = self.config
         remat = config.remat or config.remat_scan
 
+        if not config.decode:
+            assert inputs.shape[1] > 1, "input sequence length must be > 1 for training"
+
         embed_layer = Embed if remat else Embed
         x = embed_layer(
             num_embeddings=config.vocab_size,
@@ -164,8 +179,12 @@ class TransformerModel(nn.Module):
             shard=config.shard,
             name="wte")(inputs)
 
+        padding_mask = None
+        if config.padding_left and inputs.shape[1] > 1:
+            padding_mask = jnp.equal(inputs, config.pad_token_id)
+
         x = make_block_stack(
-            self.block_cls, config.n_layers, config)(x, train)
+            self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
 
         norm_layer = RMSNorm if remat else RMSNorm
         x = norm_layer(epsilon=config.rms_norm_eps,
@@ -173,26 +192,26 @@ class TransformerModel(nn.Module):
         return x
 
 
-class TransformerSequenceClassifier(nn.Module):
-    config: TransformerConfig
+# class TransformerSequenceClassifier(nn.Module):
+#     config: TransformerConfig
 
-    @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
-        config = self.config
-        x = TransformerModel(
-            config=config, name="transformer")(inputs, train)
+#     @nn.compact
+#     def __call__(self, *, inputs, attn_mask, train=False):
+#         config = self.config
+#         x = TransformerModel(
+#             config=config, name="transformer")(inputs, train)
 
-        batch_size = inputs.shape[0]
-        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
-        x = x[jnp.arange(batch_size), seq_len]
+#         batch_size = inputs.shape[0]
+#         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
+#         x = x[jnp.arange(batch_size), seq_len]
 
-        x = DenseGeneral(
-            config.num_labels,
-            dtype=config.dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
-            name="score")(x)
-        return x
+#         x = DenseGeneral(
+#             config.num_labels,
+#             dtype=config.dtype,
+#             kernel_init=config.kernel_init,
+#             bias_init=config.bias_init,
+#             name="score")(x)
+#         return x
 
 
 class TransformerLMHeadModel(nn.Module):
@@ -203,6 +222,7 @@ class TransformerLMHeadModel(nn.Module):
         config = self.config
         x = TransformerModel(
             config=config, name="transformer")(inputs=input_ids, train=train)
+
         if config.decode:
             shard_axes = {"kernel": ("Y", None)}
         else:
@@ -260,3 +280,88 @@ def remap_state_dict(state_dict):
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
     root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
     return root
+
+
+@register_chat_setting()
+class VicunaChatSetting:
+    name = "vicuna_v1"
+    system = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions."
+    roles = ("USER", "ASSISTANT")
+    stop_token_ids = (2,)
+
+    def get_prompt(self, messages):
+        seps = [" ", "</s>"]
+        ret = self.system + seps[0]
+        for i, (role, message) in enumerate(messages):
+            if message:
+                ret += role + ": " + message + seps[i % 2]
+            else:
+                ret += role + ":"
+        return ret
+
+
+B_INST, E_INST = "[INST]", "[/INST]"
+B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+DEFAULT_SYSTEM_PROMPT = """\
+You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
+
+If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
+
+@register_chat_setting()
+class LLaMA2ChatSetting:
+    name = "llama2-chat"
+    system = DEFAULT_SYSTEM_PROMPT
+    roles = ("user", "assistant")
+    stop_token_ids = (2,)
+
+    def get_prompt(self, messages):
+        # TODO: add support for custom system prompt
+        BOS = "<s>"
+        EOS = "</s>"
+        dialog = [
+            {"role": role, "content": message}
+            for role, message in messages
+        ]
+        if len(dialog) % 2 == 0:
+            assert dialog[-1]["content"] is None
+            dialog = dialog[:-1]
+            append = True
+        else:
+            append = False
+        if dialog[0]["role"] != "system":
+            dialog = [
+                {
+                    "role": "system",
+                    "content": DEFAULT_SYSTEM_PROMPT,
+                }
+            ] + dialog
+        dialog = [
+            {
+                "role": dialog[1]["role"],
+                "content": B_SYS
+                + dialog[0]["content"]
+                + E_SYS
+                + dialog[1]["content"],
+            }
+        ] + dialog[2:]
+        assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
+            [msg["role"] == "assistant" for msg in dialog[1::2]]
+        ), (
+            "model only supports 'system', 'user' and 'assistant' roles, "
+            "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
+        )
+        ret = "".join(
+            [
+                f"{BOS}{B_INST} {(prompt['content']).strip()} {E_INST} {(answer['content']).strip()} {EOS}"
+                for prompt, answer in zip(
+                    dialog[::2],
+                    dialog[1::2],
+                )
+            ]
+        )
+        assert (
+            dialog[-1]["role"] == "user"
+        ), f"Last message must be from user, got {dialog[-1]['role']}"
+        if append:
+            ret += f"{BOS}{B_INST} {(dialog[-1]['content']).strip()} {E_INST}"
+        return ret

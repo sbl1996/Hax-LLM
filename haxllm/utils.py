@@ -178,7 +178,8 @@ def has_bf16_in_safetensors(fp):
     return any([ d['dtype'] == 'BF16' for k, d in header.items() if 'dtype' in d])
 
 
-def load_transformer_params(params, path: str, device, lm_head=False):
+def load_transformer_params(params, path: str, device, lm_head=False, verbose=False):
+    fprint = print if verbose else lambda *args, **kwargs: None
     cpu = False
     mesh = None
     if isinstance(device, str):
@@ -197,7 +198,7 @@ def load_transformer_params(params, path: str, device, lm_head=False):
     # detect scan or remat_scan
     hs_keys = [k for k in params.keys() if k.startswith("transformer.hs")]
     if hs_keys:
-        print("Converting scan params...")
+        fprint("Converting scan params...")
         src_keys = [k for k in transformer_params if k.startswith("h_")]
         h_params = flatten_dict(transformer_params[src_keys[0]], sep=".")
         sample_key = next(iter(h_params.keys()))
@@ -227,15 +228,15 @@ def load_transformer_params(params, path: str, device, lm_head=False):
     all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
     if lm_head:
         all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
-    print("Loading param on device...")
-    for key in tqdm(all_keys):
+    fprint("Loading param on device...")
+    for key in tqdm(all_keys, disable=not verbose):
         if key not in new_transformer_params:
-            print(f"Key {key} not found in transformer params")
+            fprint(f"Key {key} not found in transformer params")
             continue
         
         full_key = key if key.startswith("lm_head") else prefix + key
         p = params[full_key]
-        # print(f"Loading param {key}")
+        # fprint(f"Loading param {key}")
         x = new_transformer_params[key]
         if isinstance(p, nn.Partitioned):
             dtype = p.value.dtype

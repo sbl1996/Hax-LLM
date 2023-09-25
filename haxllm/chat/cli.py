@@ -169,13 +169,15 @@ def chat_app(cfg: DictConfig) -> None:
     import logging
     logging.getLogger("jax").setLevel(logging.WARNING)
 
-    pipeline, conv_template = load_config(cfg)
+    pipeline, conv_template, max_new_tokens = load_config(cfg)
 
     print("Conversation setting:")
+    print(f"  template: {conv_template}")
     print(f"  temperature: {pipeline.temperature}")
     print(f"  top_p: {pipeline.top_p}")
     print(f"  top_k: {pipeline.top_k}")
     print(f"  max_len: {pipeline.max_len}")
+    print(f"  max_new_tokens: {max_new_tokens}")
 
     if cfg.style == "simple":
         chatio = SimpleChatIO()
@@ -192,6 +194,7 @@ def chat_app(cfg: DictConfig) -> None:
             pipeline,
             chatio,
             conv_template=conv_template,
+            max_new_tokens=max_new_tokens,
             debug=debug,
         )
     except KeyboardInterrupt:

@@ -1,3 +1,4 @@
 family: llama
 tokenizer: huggyllama/llama-7b
-scan: True
+remat: False
+scan: False

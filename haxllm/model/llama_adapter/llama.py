@@ -5,22 +5,14 @@ from flax import struct
 
 from haxllm.model.modules import RMSNorm
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral
-from haxllm.model.utils import load_config as _load_config
 from haxllm.model.llama import (
     config_hub,
     remap_state_dict,
     TransformerConfig as BaseTransformerConfig,
     TransformerModel,
+    build_prompt,
 )
 from haxllm.model.llama_adapter.modules import PrefixEmbed, SelfAttention
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown llama model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass
@@ -39,6 +31,8 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        inputs, padding_mask = inputs
+
         prefix_key_value = PrefixEmbed(
             seq_len=config.pre_seq_len,
             projection=config.prefix_projection,
@@ -51,7 +45,9 @@ class TransformerBlock(nn.Module):
         if config.memory_efficient_attention or config.decode:
             mask = None
         else:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
+            if padding_mask is not None:
+                mask = mask & ~padding_mask[:, None, None, :]
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
@@ -68,11 +64,13 @@ class TransformerBlock(nn.Module):
             memory_efficient=config.memory_efficient_attention,
             memory_efficient_mask_mode='causal',
             rope=True,
+            padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
+            shard_cache=config.shard_cache,
             zero_init=config.zero_init_prefix_attn,
-            name="attn")(x, mask=mask, prefix_key_value=prefix_key_value)
+            name="attn")(x, mask=mask, padding_mask=padding_mask, prefix_key_value=prefix_key_value)
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps,
@@ -86,10 +84,15 @@ class TransformerBlock(nn.Module):
             shard_axes2=("Y", "X"),
             shard=config.shard,
             name="mlp")(y)
+
+        y = x + y
+
+        outputs = (y, padding_mask)
+
         if self.scan:
-            return x + y, None
+            return outputs, None
         else:
-            return x + y
+            return outputs
 
 
 class TransformerLMHeadModel(nn.Module):

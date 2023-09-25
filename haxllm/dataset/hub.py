@@ -2,8 +2,8 @@ from typing import Sequence
 import importlib
 
 import numpy as np
-from sklearn.model_selection import train_test_split
 
+from haxllm.gconfig import get_seed
 
 dataset_hub = {}
 
@@ -43,6 +43,13 @@ def load_for_causal_lm(dataset, preprocess_fn):
     labels = tokenized_dataset["labels"] # type: ignore
     return {"input_ids": input_ids, "labels": labels}
 
+def add_prefix(x, prefix):
+    if isinstance(x, str):
+        return f"{prefix} {x}"
+    elif isinstance(x, Sequence):
+        return [f"{prefix} {s}" for s in x]
+    else:
+        raise ValueError(f"Unknown type {type(x)}")
 
 def create_dataset(
     name,
@@ -50,14 +57,17 @@ def create_dataset(
     max_len=128,
     splits=("train", "validation"),
     batch_size=128,
-    seed=42,
+    seed=None,
     sub_ratio=None,
     task_type="sequnece_classification",
     loader="tf",
     cache_dir=None,
     num_workers=0,
+    load_kwargs={},
     **kwargs,
 ):
+    if seed is None:
+        seed = get_seed()
     load_fn, preprocess_fn, ds_splits, options = get_registered_dataset(name)
     for split in splits:
         if split not in ds_splits:
@@ -90,7 +100,7 @@ def create_dataset(
     else:
         raise ValueError(f"Unknown task type {task_type}")
 
-    ds_train = load_fn(train_split, cache_dir=cache_dir)
+    ds_train = load_fn(train_split, cache_dir=cache_dir, **load_kwargs)
     ds_train = ds_train.shuffle(seed=seed)
     if train_sub_ratio is not None:
         n_sub = int(len(ds_train) * train_sub_ratio)
@@ -100,7 +110,7 @@ def create_dataset(
     keys = list(train_data.keys())
     train_data = tuple(train_data[k] for k in keys)
 
-    ds_eval = load_fn(eval_split, cache_dir=cache_dir)
+    ds_eval = load_fn(eval_split, cache_dir=cache_dir, **load_kwargs)
     if eval_sub_ratio is not None:
         n_sub = int(len(ds_eval) * eval_sub_ratio)
         ds_eval = ds_eval.shuffle(seed=seed).select(range(n_sub))

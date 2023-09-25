@@ -1,14 +1,16 @@
 from typing import Callable, Any
+import dataclasses
 
+import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
 from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, SelfAttention, Embed
-from haxllm.model.utils import load_config as _load_config
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
+from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.chat.setting import register_chat_setting
 
 
 config_hub = {
@@ -19,28 +21,6 @@ config_hub = {
         n_layers=32,
     ),
 }
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        available = ", ".join(config_hub.keys())
-        module_name = __name__.split(".")[-1]
-        raise ValueError(f"Unknown {module_name} model {name}, available: {available}")
-    return _load_config(TransformerConfig, config, **kwargs)
-
-
-def build_prompt(self, query, history=[]):
-    prompt = ""
-    for record in history:
-        prompt += f"""<s><|User|>:{record[0]}<eoh>\n<|Bot|>:{record[1]}<eoa>\n"""
-    if len(prompt) == 0:
-        prompt += "<s>"
-    prompt += f"""<|User|>:{query}<eoh>\n<|Bot|>:"""
-    return prompt
-
-stop_token_ids = [2, 103028]
 
 
 @struct.dataclass
@@ -60,10 +40,17 @@ class TransformerConfig(RematScanConfigMixin):
     eos_token_id: int = 2
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
-    decode: bool = False
+    padding_left: bool = False
     memory_efficient_attention: bool = False
+    decode: bool = False
     shard: bool = False
     shard_cache: bool = False
+
+
+def get_chat_setting(name=None):
+    if name is not None:
+        assert name == ChatSetting.name
+    return ChatSetting()
 
 
 class TransformerBlock(nn.Module):
@@ -74,10 +61,14 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        inputs, padding_mask = inputs
+
         if config.memory_efficient_attention or config.decode:
             mask = None
         else:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
+            if padding_mask is not None:
+                mask = mask & ~padding_mask[:, None, None, :]
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
@@ -90,14 +81,13 @@ class TransformerBlock(nn.Module):
             qkv_bias=True,
             out_bias=True,
             decode=config.decode,
-            memory_efficient=config.memory_efficient_attention,
-            memory_efficient_mask_mode='causal',
             rope=True,
+            padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
-            name="attn")(x, mask)
+            name="attn")(x, mask, padding_mask)
 
         x = x + inputs
 
@@ -112,10 +102,15 @@ class TransformerBlock(nn.Module):
             shard_axes2=("Y", "X"),
             shard=config.shard,
             name="mlp")(y)
+
+        y = x + y
+
+        outputs = (y, padding_mask)
+
         if self.scan:
-            return x + y, None
+            return outputs, None
         else:
-            return x + y
+            return outputs
 
 
 class TransformerModel(nn.Module):
@@ -127,6 +122,9 @@ class TransformerModel(nn.Module):
         config = self.config
         remat = config.remat or config.remat_scan
 
+        if not config.decode:
+            assert inputs.shape[1] > 1, "input sequence length must be > 1 for training"
+
         embed_layer = Embed if remat else Embed
         x = embed_layer(
             num_embeddings=config.vocab_size,
@@ -137,8 +135,12 @@ class TransformerModel(nn.Module):
             shard=config.shard,
             name="wte")(inputs)
 
+        padding_mask = None
+        if config.padding_left and inputs.shape[1] > 1:
+            padding_mask = jnp.equal(inputs, config.pad_token_id)
+
         x = make_block_stack(
-            self.block_cls, config.n_layers, config)(x, train)
+            self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
 
         norm_layer = RMSNorm if remat else RMSNorm
         x = norm_layer(epsilon=config.rms_norm_eps,
@@ -146,26 +148,26 @@ class TransformerModel(nn.Module):
         return x
 
 
-class TransformerSequenceClassifier(nn.Module):
-    config: TransformerConfig
+# class TransformerSequenceClassifier(nn.Module):
+#     config: TransformerConfig
 
-    @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
-        config = self.config
-        x = TransformerModel(
-            config=config, name="transformer")(inputs, train)
+#     @nn.compact
+#     def __call__(self, *, inputs, attn_mask, train=False):
+#         config = self.config
+#         x = TransformerModel(
+#             config=config, name="transformer")(inputs, train)
 
-        batch_size = inputs.shape[0]
-        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
-        x = x[jnp.arange(batch_size), seq_len]
+#         batch_size = inputs.shape[0]
+#         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
+#         x = x[jnp.arange(batch_size), seq_len]
 
-        x = DenseGeneral(
-            config.num_labels,
-            dtype=config.dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
-            name="score")(x)
-        return x
+#         x = DenseGeneral(
+#             config.num_labels,
+#             dtype=config.dtype,
+#             kernel_init=config.kernel_init,
+#             bias_init=config.bias_init,
+#             name="score")(x)
+#         return x
 
 
 class TransformerLMHeadModel(nn.Module):
@@ -176,6 +178,7 @@ class TransformerLMHeadModel(nn.Module):
         config = self.config
         x = TransformerModel(
             config=config, name="transformer")(inputs=input_ids, train=train)
+
         if config.decode:
             shard_axes = {"kernel": ("Y", None)}
         else:
@@ -237,3 +240,49 @@ def remap_state_dict(state_dict):
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
     root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
     return root
+
+
+@register_chat_setting()
+class ChatSetting:
+    name = "internlm"
+    system = ""
+    roles = ("<|User|>", "<|Bot|>")
+    stop_token_ids = (2, 103028)
+
+    def get_prompt(self, messages):
+        r'''
+        prompt = ""
+        for record in history:
+            prompt += f"""<s><|User|>:{record[0]}<eoh>\n<|Bot|>:{record[1]}<eoa>\n"""
+        if len(prompt) == 0:
+            prompt += "<s>"
+        prompt += f"""<|User|>:{query}<eoh>\n<|Bot|>:"""            
+        '''
+        sep = "<eoh>\n"
+        sep2 = "<eoa>\n"
+        ret = ""
+        m = messages
+        n = len(m)
+        n = n - 2 if n % 2 == 0 else n - 1
+        for i in range(0, n, 2):
+            role1, message1 = m[i]
+            role2, message2 = m[i+1]
+            ret += f"""<s>{role1}:{message1}{sep}{role2}:{message2}{sep2}"""
+        if len(ret) == 0:
+            assert len(m) - n == 2
+            role1, message1 = m[-2]
+            role2, message2 = m[-1]
+            ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+            if message2:
+                ret += message2 + sep2
+        else:
+            if len(m) - n == 1:
+                role, message = m[-1]
+                ret += f"""<s>{role}:{message}{sep2}"""
+            else:
+                role1, message1 = m[-2]
+                role2, message2 = m[-1]
+                ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+                if message2:
+                    ret += message2 + sep2
+        return ret

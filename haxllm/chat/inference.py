@@ -26,15 +26,16 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
     top_k = int(params.get("top_k") or -1)  # -1 means disable
     stop_str = params.get("stop")
     echo = bool(params.get("echo") or False)
-    stop_token_ids = params.get("stop_token_ids") or []
+    stop_token_ids = list(params.get("stop_token_ids")) or []
     stop_token_ids.append(tokenizer.eos_token_id)
 
     input_ids = tokenizer(prompt).input_ids
     input_echo_len = len(input_ids)
     output_ids = list(input_ids)
 
-    max_new_tokens = int(params.get("max_new_tokens", max_len - input_echo_len - 8))
+    max_new_tokens = int(params.get("max_new_tokens") or (max_len - input_echo_len - 8))
 
+    # TODO: why 8?
     max_src_len = max_len - max_new_tokens - 8
 
     input_ids = input_ids[-max_src_len:]
@@ -59,6 +60,7 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
         token = int(token)
 
         output_ids.append(token)
+        # print(f"[{i}] token {token} {tokenizer.convert_ids_to_tokens([token])}")
 
         if token in stop_token_ids:
             stopped = True
@@ -80,30 +82,6 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
             )
 
             partially_stopped = False
-            # TODO: add support for stop_str
-            # if stop_str:
-            #     if isinstance(stop_str, str):
-            #         pos = output.rfind(stop_str, rfind_start)
-            #         if pos != -1:
-            #             output = output[:pos]
-            #             stopped = True
-            #         else:
-            #             partially_stopped = partial_stop(output, stop_str)
-            #     elif isinstance(stop_str, Iterable):
-            #         for each_stop in stop_str:
-            #             pos = output.rfind(each_stop, rfind_start)
-            #             if pos != -1:
-            #                 output = output[:pos]
-            #                 stopped = True
-            #                 break
-            #             else:
-            #                 partially_stopped = partial_stop(output, each_stop)
-            #                 if partially_stopped:
-            #                     break
-            #     else:
-            #         raise ValueError("Invalid stop field type.")
-
-            # prevent yielding partial stop sequence
             if not partially_stopped:
                 yield {
                     "text": output,
@@ -118,7 +96,10 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
         if stopped:
             break
 
+
     # finish stream event, which contains finish reason
+
+    # TODO: local variable 'i' referenced before assignment
     if i == max_new_tokens - 1:
         finish_reason = "length"
     elif stopped:
@@ -155,6 +136,7 @@ def chat_loop(
     pipeline: ChatPipeline,
     chatio: ChatIO,
     conv_template: Optional[str] = None,
+    max_new_tokens: Optional[int] = None,
     debug: bool = False,
 ):
     def new_chat():
@@ -167,13 +149,18 @@ def chat_loop(
     conv = new_chat()
     pipeline.reset_chat_state()
 
+    error_code = "__END_OF_A_MESSAGE_47582648__"
+
     while True:
         try:
-            inp = chatio.prompt_for_input(conv.roles[0])
+            inp = chatio.prompt_for_input(conv.config.roles[0])
         except EOFError:
-            inp = ""
+            inp = error_code
+        
+        if inp == "":
+            continue
 
-        if inp == "!!exit" or not inp:
+        if inp == "!!exit" or inp == error_code:
             print("exit...")
             break
 
@@ -183,8 +170,8 @@ def chat_loop(
             pipeline.reset_chat_state()
             continue
         
-        conv.append_message(conv.roles[0], inp)
-        conv.append_message(conv.roles[1], None)
+        conv.append_message(conv.config.roles[0], inp)
+        conv.append_message(conv.config.roles[1], None)
 
         prompt = conv.get_prompt()
 
@@ -194,14 +181,13 @@ def chat_loop(
             "top_k": pipeline.top_k,
             "top_p": pipeline.top_p,
             # "repetition_penalty": repetition_penalty,
-            # "max_new_tokens": max_new_tokens,
-            "stop": conv.stop_str,
-            "stop_token_ids": conv.stop_token_ids,
+            "max_new_tokens": max_new_tokens,
+            "stop_token_ids": conv.config.stop_token_ids,
             "echo": False,
             "max_len": pipeline.max_len,
         }
 
-        chatio.prompt_for_output(conv.roles[1])
+        chatio.prompt_for_output(conv.config.roles[1])
         output_stream = generate_stream(pipeline, gen_params)
         t = time.time()
         outputs = chatio.stream_output(output_stream)
@@ -211,7 +197,7 @@ def chat_loop(
         if debug:
             num_tokens = len(pipeline.tokenizer.encode(outputs))
             msg = {
-                "conv_template": conv.name,
+                "conv_template": conv.config.name,
                 "prompt": prompt,
                 "outputs": outputs,
                 "speed (token/s)": round(num_tokens / duration, 2),

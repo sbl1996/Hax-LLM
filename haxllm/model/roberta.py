@@ -20,14 +20,6 @@ config_hub = {
 }
 
 
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown roberta model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
-
-
 @struct.dataclass
 class TransformerConfig(BertConfig):
     vocab_size: int = 50265

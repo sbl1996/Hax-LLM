@@ -1,4 +1,5 @@
 family: llama
 tokenizer: meta-llama/Llama-2-7b-chat-hf
-scan: True
+remat: False
+scan: False
 conv_template: llama2-chat

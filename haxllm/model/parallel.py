@@ -2,11 +2,8 @@ from typing import Mapping, Optional, Tuple, Callable, Sequence, Union
 import functools
 import dataclasses
 
-import numpy as np
-
 import jax
 import jax.numpy as jnp
-from jax import lax
 
 import flax.linen as nn
 from flax.core.frozen_dict import FrozenDict
@@ -15,7 +12,6 @@ from flax.linen import partitioning as nn_partitioning, initializers
 from flax.linen.attention import (
     Dtype,
     Array,
-    combine_masks,
     PRNGKey,
     Shape,
     dot_product_attention,
@@ -24,7 +20,7 @@ from flax.linen.attention import (
 from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
-
+from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -160,161 +156,17 @@ class Embed(ShardMixIn, nn.Embed):
 ShardAxis = Optional[str]
 
 
-def precompute_freqs_cis(
-    dim: int, end: int, theta = 10000.0, dtype = jnp.float32
-):
-    # returns:
-    #   cos, sin: (end, dim)
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
-    t = np.arange(end, dtype=np.float32)  # type: ignore
-    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
-    freqs = np.concatenate((freqs, freqs), axis=-1)
-    cos, sin = np.cos(freqs), np.sin(freqs)
-    return jnp.array(cos, dtype=dtype), jnp.array(sin, dtype=dtype)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    # inputs:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    #   cos, sin: (seq_len, head_dim)
-    # returns:
-    #   q, k: (batch_size, seq_len, num_heads, head_dim)
-    q_len = q.shape[1]
-    kv_len = k.shape[1]
-    prefix_len = kv_len - q_len
-
-    cos_k = cos[None, :kv_len, None, :]
-    sin_k = sin[None, :kv_len, None, :]
-    cos_q = cos_k[:, prefix_len:]
-    sin_q = sin_k[:, prefix_len:]
-
-    q = (q * cos_q) + (rotate_half(q) * sin_q)
-    k = (k * cos_k) + (rotate_half(k) * sin_k)
-    return q, k
-
-
-def apply_rotary_pos_emb_index(q, k, cos, sin, position_id=None):
-    # inputs:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    #   cos, sin: (seq_len, head_dim)
-    #   position_id: (batch_size, seq_len)
-    # returns:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    if position_id is None:
-        q_pos = jnp.arange(q.shape[1])[None, :]
-        k_pos = jnp.arange(k.shape[1])[None, :]
-    else:
-        q_pos = position_id
-        k_pos = position_id
-
-    cos_q = jnp.take(cos, q_pos, axis=0)[:, :, None, :]
-    sin_q = jnp.take(sin, q_pos, axis=0)[:, :, None, :]
-    q = (q * cos_q) + (rotate_half(q) * sin_q)
-
-    cos_k = jnp.take(cos, k_pos, axis=0)[:, :, None, :]
-    sin_k = jnp.take(sin, k_pos, axis=0)[:, :, None, :]
-    k = (k * cos_k) + (rotate_half(k) * sin_k)
-    return q, k
-
-
-# from chatglm2, different from original rope
-
-def precompute_freqs_cis2(
-    dim: int, end: int, theta: float = 10000.0, dtype = jnp.float32
-):
-    # returns:
-    #   cos, sin: (end, dim)
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
-    t = np.arange(end, dtype=np.float32)  # type: ignore
-    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
-    cos, sin = np.cos(freqs), np.sin(freqs)
-    return jnp.array(cos, dtype=dtype), jnp.array(sin, dtype=dtype)
-
-
-def apply_cos_sin(x, cos, sin):
-    dim = x.shape[-1]
-    x1 = x[..., :dim // 2]
-    x2 = x[..., dim // 2:]
-    x1 = x1.reshape(x1.shape[:-1] + (-1, 2))
-    x1 = jnp.stack((x1[..., 0] * cos - x1[..., 1] * sin, x1[..., 1] * cos + x1[..., 0] * sin), axis=-1)
-    x1 = x1.reshape(x2.shape)
-    x = jnp.concatenate((x1, x2), axis=-1)
-    return x
-
-
-def apply_rotary_pos_emb2(q, k, cos, sin):
-    # inputs:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    #   cos, sin: (seq_len, head_dim // 2)
-    # returns:
-    #   q, k: (batch_size, seq_len, num_heads, head_dim)
-    q_len = q.shape[1]
-    kv_len = k.shape[1]
-    prefix_len = kv_len - q_len
-
-    cos_k = cos[None, :kv_len, None, :]
-    sin_k = sin[None, :kv_len, None, :]
-
-    cos_q = cos_k[:, prefix_len:]
-    sin_q = sin_k[:, prefix_len:]
-
-    q = apply_cos_sin(q, cos_q, sin_q)
-    k = apply_cos_sin(k, cos_k, sin_k)
-    return q, k
-
-
-def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id=None):
-    # inputs:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    #   cos, sin: (seq_len, head_dim)
-    #   position_id: (batch_size, seq_len)
-    # returns:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    if position_id is None:
-        q_pos = jnp.arange(q.shape[1])[None, :]
-        k_pos = jnp.arange(k.shape[1])[None, :]
-    else:
-        q_pos = position_id
-        k_pos = position_id
-    
-    cos_q = jnp.take(cos, q_pos, axis=0)[:, :, None, :]
-    sin_q = jnp.take(sin, q_pos, axis=0)[:, :, None, :]
-    q = apply_cos_sin(q, cos_q, sin_q)
-
-    cos_k = jnp.take(cos, k_pos, axis=0)[:, :, None, :]
-    sin_k = jnp.take(sin, k_pos, axis=0)[:, :, None, :]
-    k = apply_cos_sin(k, cos_k, sin_k)
-    return q, k
-
-
-def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
-    q1, q2 = jnp.array_split(q, 2, axis=-1)
-    k1, k2 = jnp.array_split(k, 2, axis=-1)
-    block_position_ids = position_ids[:, 1, :]
-    position_ids = position_ids[:, 0, :]
-    q1, k1 = apply_rotary_pos_emb_index(q1, k1, cos, sin, position_ids)
-    q2, k2 = apply_rotary_pos_emb_index(q2, k2, cos, sin, block_position_ids)
-    q = jnp.concatenate([q1, q2], axis=-1)
-    k = jnp.concatenate([k1, k2], axis=-1)
-    return q, k
-
-
 def replicate_for_multi_query(x, num_heads):
     src_num_heads, head_dim = x.shape[-2:]
-    x = jnp.expand_dims(x, axis=-2)
-    x = jnp.tile(x, (1, 1, 1, num_heads // src_num_heads, 1))
-    x = jnp.reshape(x, (*x.shape[:2], num_heads, head_dim))
+    x = jnp.repeat(x, num_heads // src_num_heads, axis=-2)
+    # x = jnp.expand_dims(x, axis=-2)
+    # x = jnp.tile(x, (1, 1, 1, num_heads // src_num_heads, 1))
+    # x = jnp.reshape(x, (*x.shape[:2], num_heads, head_dim))
     return x
 
 
 ModuleClass = Callable[..., nn.Module]
+
 
 
 class SelfAttention(ShardModule):
@@ -332,6 +184,7 @@ class SelfAttention(ShardModule):
     out_bias: bool = True
     decode: bool = False
     rope: bool = False
+    padding_left: bool = False
     memory_efficient: bool = False
     memory_efficient_mask_mode: str = "causal"
     query_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
@@ -346,6 +199,7 @@ class SelfAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
+        padding_mask: Optional[Array] = None,
     ):
         r"""
         Parameters
@@ -354,15 +208,21 @@ class SelfAttention(ShardModule):
             Input features.
         mask: Optional[Array], shape [batch, 1, q_len, kv_len]
             Mask to apply to attention scores.
-            In training and eval mode, either causal mask or padding mask is needed.
-            In decode, only causal mask is supported and we infer it from cache.
-            Therefor, mask is not needed for decoding.
+        padding_mask: Optional[Array], shape [batch, q_len]
+            Mask to indicate which query elements are padding.
+            If both mask and padding_mask are provided, you must combine them by yourself.
+            We only use padding_mask to infer position_ids.
         
         Returns
         -------
         out: Array, shape [batch, q_len, features]
             Output features.
 
+        Notes
+        -----
+        In training and eval mode, either causal mask or padding mask is needed.
+        In decode, only causal mask is supported and we infer it from cache.
+        Therefor, mask is not needed for decoding.
         """
         multi_query = self.multi_query_groups is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
@@ -394,6 +254,10 @@ class SelfAttention(ShardModule):
         kv_num_heads = self.num_heads
         if multi_query:
             kv_num_heads = self.multi_query_groups
+            kv_dense_shard_axes = None
+        else:
+            kv_dense_shard_axes = {"kernel": kv_shard_axes}
+
 
         kv_dense = [
             functools.partial(
@@ -404,7 +268,7 @@ class SelfAttention(ShardModule):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 use_bias=self.qkv_bias,
-                shard_axes={"kernel": kv_shard_axes},
+                shard_axes=kv_dense_shard_axes,
                 shard=self.shard,
                 axis=-1,
             ) for cls in dense_cls[1:3]
@@ -414,63 +278,39 @@ class SelfAttention(ShardModule):
         value = kv_dense[1](name="value")(x)
 
         # TODO: we can cache untiled key and value for memory efficiency
+        # If we shard at the last axis, it may be padded to meet 8x128 layout which results 8x expansion of memory.
         if multi_query:
+            # GSPMD automatically recognize it to (X, None, Y, None)
             key = replicate_for_multi_query(key, self.num_heads)
             value = replicate_for_multi_query(value, self.num_heads)
 
         if self.rope:
-            if multi_query:
-                cos, sin = precompute_freqs_cis2(
-                    dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
-            else:
-                cos, sin = precompute_freqs_cis(
-                    dim=head_dim, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, multi_query)
         else:
             add_pos = lambda q, k, p=None: (q, k)
 
         if not self.decode:
-            query, key = add_pos(query, key)
+            if self.padding_left:
+                position_ids = get_position_ids_for_padding_left(padding_mask)
+            else:
+                position_ids = None
+            query, key = add_pos(query, key, position_ids)
         else:
             assert mask is None, "Mask is not needed for decoding, we infer it from cache."
-            is_initialized = self.has_variable("cache", "cached_key")
-            init_fn = jnp.zeros
-            if self.shard and self.shard_cache:
-                init_fn = nn.with_partitioning(init_fn, kv_shard_axes)
-            cached_key = self.variable(
-                "cache", "cached_key", init_fn, key.shape, key.dtype
-            )
-            cached_value = self.variable(
-                "cache", "cached_value", init_fn, value.shape, value.dtype
-            )
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
-            )
-            if not is_initialized:
-                query, key = add_pos(query, key)
-            else:
-                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                num_queries = query.shape[-3]
-                cur_index = cache_index.value
-
-                position_ids = jnp.arange(num_queries) + cur_index
-                position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                query, key = add_pos(query, key, position_ids)
-
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
-                cached_key.value = key
-                cached_value.value = value
-
-                cache_index.value = cache_index.value + num_queries
-
-                idx = jnp.arange(num_queries) + cur_index
-                mask = jnp.arange(max_length)[None, :] <= idx[:, None]
-                mask = jnp.broadcast_to(
-                    mask, tuple(batch_dims) + (1, num_queries, max_length),
+            is_initialized, cached_key, cached_value, cache_index = init_decode_cache(self, key, value, kv_shard_axes)
+            if self.padding_left:
+                cache_position = self.variable(
+                    "cache", "cache_position", lambda: jnp.zeros(key.shape[0], dtype=jnp.int32)
                 )
+
+            if is_initialized:
+                if self.padding_left:
+                    query, key, value, mask = decode_for_padding_left(
+                        add_pos, query, key, value, cache_index, cached_key, cached_value, cache_position, padding_mask)
+                else:
+                    query, key, value, mask = decode_for_padding_right(
+                        add_pos, query, key, value, cache_index, cached_key, cached_value)
+
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:
@@ -480,8 +320,10 @@ class SelfAttention(ShardModule):
             deterministic = True
 
         if self.memory_efficient:
+            raise NotImplementedError
             assert not self.decode, "Memory efficient attention does not support decoding."
             assert deterministic, "Memory efficient attention does not support dropout."
+            assert not self.padding_left, "Memory efficient attention does not support padding_left."
         
             mask_mode = self.memory_efficient_mask_mode
             context_lengths = None

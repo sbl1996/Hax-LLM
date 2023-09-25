@@ -8,8 +8,8 @@ from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
-from haxllm.model.utils import load_config as _load_config
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.chat.setting import register_chat_setting
 
 
 config_hub = {
@@ -30,20 +30,10 @@ config_hub = {
 }
 
 
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown chatglm2 model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
-
-
-stop_token_ids = [0, 2]
-
-
 @struct.dataclass
 class TransformerConfig(RematScanConfigMixin):
     vocab_size: int = 65024
+    unpadded_vocab_size: int = 64794
     num_labels: int = 2
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
@@ -52,18 +42,25 @@ class TransformerConfig(RematScanConfigMixin):
     n_heads: int = 32
     n_layers: int = 28
     num_groups: int = 2
-    layer_norm_epsilon: float = 1e-5
+    rms_norm_eps: float = 1e-5
     n_positions: int = 32768
     pad_token_id: int = 0
     eos_token_id: int = 2
     mask_token_id: int = 64789
     gmask_token_id: int = 64790
-    memory_efficient_attention: bool = False
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
+    padding_left: bool = False
+    memory_efficient_attention: bool = False
     decode: bool = False
     shard: bool = False
     shard_cache: bool = False
+
+
+def get_chat_setting(name=None):
+    if name is not None:
+        assert name == ChatSetting.name
+    return ChatSetting()
 
 
 # TODO: skip apply_query_key_layer_scaling, same as query_key_layer_scaling_coeff in chatglm
@@ -76,12 +73,16 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        inputs, padding_mask = inputs
+
         if config.memory_efficient_attention or config.decode:
             mask = None
         else:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)
+            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
+            if padding_mask is not None:
+                mask = mask & ~padding_mask[:, None, None, :]
 
-        x = RMSNorm(epsilon=config.layer_norm_epsilon,
+        x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
@@ -94,16 +95,16 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             decode=config.decode,
             rope=True,
+            padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
-            kv_shard_axes=("X", None, "Y"),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
-            name="attn")(x, mask)
+            name="attn")(x, mask, padding_mask)
 
         x = x + inputs
 
-        y = RMSNorm(epsilon=config.layer_norm_epsilon,
+        y = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_2")(x)
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,
@@ -117,10 +118,12 @@ class TransformerBlock(nn.Module):
 
         y = x + y
 
+        outputs = (y, padding_mask)
+
         if self.scan:
-            return y, None
+            return outputs, None
         else:
-            return y
+            return outputs
 
 
 class TransformerModel(nn.Module):
@@ -132,6 +135,9 @@ class TransformerModel(nn.Module):
         config = self.config
         remat = config.remat or config.remat_scan
 
+        if not config.decode:
+            assert inputs.shape[1] > 1, "input sequence length must be > 1 for training"
+
         embed_layer = Embed if remat else Embed
         x = embed_layer(
             num_embeddings=config.vocab_size,
@@ -142,35 +148,39 @@ class TransformerModel(nn.Module):
             shard=config.shard,
             name="wte")(inputs)
 
+        padding_mask = None
+        if config.padding_left and inputs.shape[1] > 1:
+            padding_mask = jnp.equal(inputs, config.pad_token_id)
+
         x = make_block_stack(
-            self.block_cls, config.n_layers, config)(x, train)
+            self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
 
         norm_layer = RMSNorm if remat else RMSNorm
-        x = norm_layer(epsilon=config.layer_norm_epsilon,
+        x = norm_layer(epsilon=config.rms_norm_eps,
                        dtype=config.dtype, name="ln_f")(x)
         return x
 
 
-class TransformerSequenceClassifier(nn.Module):
-    config: TransformerConfig
+# class TransformerSequenceClassifier(nn.Module):
+#     config: TransformerConfig
 
-    @nn.compact
-    def __call__(self, *, inputs, attn_mask, train=False):
-        config = self.config
-        x = TransformerModel(
-            config=config, name="transformer")(inputs, train)
+#     @nn.compact
+#     def __call__(self, *, inputs, attn_mask, train=False):
+#         config = self.config
+#         x = TransformerModel(
+#             config=config, name="transformer")(inputs, train)
 
-        batch_size = inputs.shape[0]
-        seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
-        x = x[jnp.arange(batch_size), seq_len]
+#         batch_size = inputs.shape[0]
+#         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
+#         x = x[jnp.arange(batch_size), seq_len]
 
-        x = DenseGeneral(
-            config.num_labels,
-            dtype=config.dtype,
-            kernel_init=config.kernel_init,
-            bias_init=config.bias_init,
-            name="score")(x)
-        return x
+#         x = DenseGeneral(
+#             config.num_labels,
+#             dtype=config.dtype,
+#             kernel_init=config.kernel_init,
+#             bias_init=config.bias_init,
+#             name="score")(x)
+#         return x
 
 
 class TransformerLMHeadModel(nn.Module):
@@ -187,6 +197,7 @@ class TransformerLMHeadModel(nn.Module):
         else:
             # shard output in training to avoid out of memory
             shard_axes = {'kernel': (None, 'Y')}
+
         x = DenseGeneral(
             config.vocab_size,
             use_bias=False,
@@ -281,3 +292,27 @@ def remap_state_dict(state_dict):
     }
     root["lm_head"] = {"kernel": state_dict.pop("output_layer.weight").T}
     return root
+
+
+@register_chat_setting()
+class ChatSetting:
+    name = "chatglm2"
+    system = ""
+    roles = ("问", "答")
+    stop_token_ids = (0, 2)
+
+    def get_prompt(self, messages):
+        sep = "\n\n"
+        if self.system:
+            ret = self.system + sep
+        else:
+            ret = ""
+        for i, (role, message) in enumerate(messages):
+            if i % 2 == 0:
+                round = i // 2 + 1  # only difference from CHAT_GLM
+                ret += f"[Round {round}]{sep}{role}：{message}"
+            else:
+                ret += f"{sep}{role}："
+                if message:
+                    ret += message + sep
+        return ret

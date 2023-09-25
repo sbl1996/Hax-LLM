@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax.core import meta
 from flax.linen import initializers
-from flax.linen.attention import Dtype, Array, combine_masks, PRNGKey, Shape
+from flax.linen.attention import Dtype, Array, PRNGKey, Shape
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import default_embed_init, default_kernel_init
 
@@ -18,13 +18,10 @@ from haxllm.model.parallel import (
     ShardModule,
     DenseGeneral,
     ShardAxis,
-    precompute_freqs_cis,
-    apply_rotary_pos_emb_index,
-    precompute_freqs_cis2,
-    apply_rotary_pos_emb_index2,
     ModuleClass,
     replicate_for_multi_query
 )
+from haxllm.model.attention import decode_for_padding_right, make_apply_rope
 
 
 class PrefixEmbed(nn.Module):
@@ -272,14 +269,7 @@ class SelfAttention(ShardModule):
             value = replicate_for_multi_query(value, self.num_heads)
 
         if self.rope:
-            if multi_query:
-                cos, sin = precompute_freqs_cis2(
-                    dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
-            else:
-                cos, sin = precompute_freqs_cis(
-                    dim=head_dim, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, multi_query)
         else:
             add_pos = lambda q, k, p=None: (q, k)
 
@@ -300,30 +290,10 @@ class SelfAttention(ShardModule):
             cache_index = self.variable(
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
-            if not is_initialized:
-                query, key = add_pos(query, key)
-            else:
-                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                num_queries = query.shape[-3]
-                cur_index = cache_index.value
 
-                position_ids = jnp.arange(num_queries) + cur_index
-                position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                query, key = add_pos(query, key, position_ids)
-
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
-                cached_key.value = key
-                cached_value.value = value
-
-                cache_index.value = cache_index.value + num_queries
-
-                idx = jnp.arange(num_queries) + cur_index
-                mask = jnp.arange(max_length)[None, :] <= idx[:, None]
-                mask = jnp.broadcast_to(
-                    mask, tuple(batch_dims) + (1, num_queries, max_length),
-                )
+            if is_initialized:
+                query, key, value, mask = decode_for_padding_right(
+                    add_pos, query, key, value, cache_index, cached_key, cached_value)
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:

@@ -1,8 +1,6 @@
 import functools
 from typing import Callable, Sequence, Union, Optional, Tuple
 
-import jax
-from jax import lax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -14,19 +12,11 @@ from haxllm.model.parallel import (
     ShardModule,
     DenseGeneral,
     ShardAxis,
-    precompute_freqs_cis,
-    apply_rotary_pos_emb_index,
-    precompute_freqs_cis2,
-    apply_rotary_pos_emb_index2,
     replicate_for_multi_query,
     ModuleClass,
 )
 from haxllm.model.ptuning.modules import PrefixEmbed, dot_product_attention
-
-
-# Shape with longer sequence length
-def _longer_shape(shape, extra_length, axis):
-    return shape[:axis] + (shape[axis] + extra_length,) + shape[axis + 1:]
+from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache
 
 
 # Modified from haxllm.model.parallel.SelfAttention
@@ -46,6 +36,7 @@ class SelfAttention(ShardModule):
     out_bias: bool = True
     decode: bool = False
     rope: bool = False
+    padding_left: bool = False
     zero_init: bool = True
     memory_efficient: bool = False
     memory_efficient_mask_mode: str = "causal"
@@ -61,8 +52,40 @@ class SelfAttention(ShardModule):
         self,
         x: Array,
         mask: Optional[Array] = None,
+        padding_mask: Optional[Array] = None,
         prefix_key_value: Optional[Tuple[Array, Array]] = None,
     ):
+        r"""
+        Parameters
+        ----------
+        x: Array, shape [batch, q_len, features]
+            Input features.
+        mask: Optional[Array], shape [batch, 1, q_len, kv_len]
+            Mask to apply to attention scores.
+        padding_mask: Optional[Array], shape [batch, q_len]
+            Mask to indicate which query elements are padding.
+            If both mask and padding_mask are provided, you must combine them by yourself.
+            We only use padding_mask to infer position_ids.
+        prefix_key_value: Optional[Tuple[Array, Array]], shape [batch, prefix_len, features]
+            Prefix key and value vectors.
+        Returns
+        -------
+        out: Array, shape [batch, q_len, features]
+            Output features.
+
+        Notes
+        -----
+        In training and eval mode, either causal mask or padding mask is needed.
+        In decode, only causal mask is supported and we infer it from cache.
+        Therefor, mask is not needed for decoding.
+        """
+        assert prefix_key_value is not None, "prefix_key_value must be provided."
+        for kv in prefix_key_value:
+            assert kv.shape[1] == self.prefix_len, "prefix_key_value must have the same prefix length as the module."
+        if self.padding_left:
+            if x.shape[1] > 1:
+                assert padding_mask is not None, "padding_mask must be provided for the first stage of decoding with padding_left."
+
         multi_query = self.multi_query_groups is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
         features = x.shape[-1]
@@ -93,6 +116,10 @@ class SelfAttention(ShardModule):
         kv_num_heads = self.num_heads
         if multi_query:
             kv_num_heads = self.multi_query_groups
+            kv_dense_shard_axes = None
+        else:
+            kv_dense_shard_axes = {"kernel": kv_shard_axes}
+
 
         kv_dense = [
             functools.partial(
@@ -103,7 +130,7 @@ class SelfAttention(ShardModule):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 use_bias=self.qkv_bias,
-                shard_axes={"kernel": kv_shard_axes},
+                shard_axes=kv_dense_shard_axes,
                 shard=self.shard,
                 axis=-1,
             ) for cls in dense_cls[1:3]
@@ -120,103 +147,46 @@ class SelfAttention(ShardModule):
             value = replicate_for_multi_query(value, self.num_heads)
 
         if self.rope:
-            if multi_query:
-                cos, sin = precompute_freqs_cis2(
-                    dim=head_dim // 2, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
-            else:
-                cos, sin = precompute_freqs_cis(
-                    dim=head_dim, end=self.max_len, dtype=self.dtype)
-                add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, multi_query)
         else:
             add_pos = lambda q, k, p=None: (q, k)
 
         if not self.decode:
-            # Training
-            assert prefix_key_value is not None
-            query, key = add_pos(query, key)
-
-            adapter_k, adapter_v = prefix_key_value
-            adapter_k = k_dense(adapter_k)
-            adapter_v = v_dense(adapter_v)
-            if multi_query:
-                adapter_k = replicate_for_multi_query(adapter_k, self.num_heads)
-                adapter_v = replicate_for_multi_query(adapter_v, self.num_heads)
-
-            key = jnp.concatenate([adapter_k, key], axis=1)
-            value = jnp.concatenate([adapter_v, value], axis=1)
-            prefix_len = adapter_k.shape[1]
-            assert prefix_len == self.prefix_len
-
-            assert mask is not None, "causal mask is required for training."
-            prefix_mask = jnp.ones(mask.shape[:-1] + (prefix_len,), dtype=mask.dtype)
-            mask = jnp.concatenate([prefix_mask, mask], axis=-1)
-        else:
-            is_initialized = self.has_variable("cache", "cached_key")
-            init_fn = jnp.zeros
-            if self.shard_cache:
-                init_fn = nn.with_partitioning(init_fn, kv_shard_axes)
-            prefix_len = self.prefix_len
-            
-            cached_key = self.variable(
-                "cache", "cached_key", init_fn, key.shape, key.dtype
-            )
-            cached_value = self.variable(
-                "cache", "cached_value", init_fn, value.shape, value.dtype
-            )
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
-            )
-            if not is_initialized:
-                assert prefix_key_value is not None
-                query, key = add_pos(query, key)
-
-                adapter_k, adapter_v = prefix_key_value
-                adapter_k = k_dense(adapter_k)
-                adapter_v = v_dense(adapter_v)
-                if multi_query:
-                    adapter_k = replicate_for_multi_query(adapter_k, self.num_heads)
-                    adapter_v = replicate_for_multi_query(adapter_v, self.num_heads)
-
-                key = jnp.concatenate([adapter_k, key], axis=1)
-                value = jnp.concatenate([adapter_v, value], axis=1)
-                prefix_len = adapter_k.shape[1]
-                assert prefix_len == self.prefix_len
+            if self.padding_left:
+                position_ids = get_position_ids_for_padding_left(padding_mask)
             else:
-                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-                num_queries = query.shape[-3]
-                cur_index = cache_index.value
-
-                position_ids = jnp.arange(num_queries) + cur_index
-                position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-                query, key = add_pos(query, key, position_ids)
-                
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
-                cached_key.value = key
-                cached_value.value = value
-
-                cache_index.value = cache_index.value + num_queries
-
-                idx = jnp.arange(num_queries) + cur_index
-                mask = jnp.arange(max_length)[None, :] <= idx[:, None]
-                mask = jnp.broadcast_to(
-                    mask, tuple(batch_dims) + (1, num_queries, max_length),
+                position_ids = None
+            query, key = add_pos(query, key, position_ids)
+        else:
+            assert mask is None, "Mask is not needed for decoding, we infer it from cache."
+            is_initialized, cached_key, cached_value, cache_index = init_decode_cache(self, key, value, kv_shard_axes)
+            if self.padding_left:
+                cache_position = self.variable(
+                    "cache", "cache_position", lambda: jnp.zeros(key.shape[0], dtype=jnp.int32)
                 )
 
-                assert prefix_key_value is not None
-                adapter_k, adapter_v = prefix_key_value
-                adapter_k = k_dense(adapter_k)
-                adapter_v = v_dense(adapter_v)
-                if multi_query:
-                    adapter_k = replicate_for_multi_query(adapter_k, self.num_heads)
-                    adapter_v = replicate_for_multi_query(adapter_v, self.num_heads)
-                key = jnp.concatenate([adapter_k, key], axis=1)
-                value = jnp.concatenate([adapter_v, value], axis=1)
+            if is_initialized:
+                if self.padding_left:
+                    query, key, value, mask = decode_for_padding_left(
+                        add_pos, query, key, value, cache_index, cached_key, cached_value, cache_position, padding_mask)
+                else:
+                    query, key, value, mask = decode_for_padding_right(
+                        add_pos, query, key, value, cache_index, cached_key, cached_value)
 
-                prefix_mask = jnp.ones(mask.shape[:-1] + (prefix_len,), dtype=mask.dtype)
-                mask = jnp.concatenate([prefix_mask, mask], axis=-1)
+
+        adapter_k, adapter_v = prefix_key_value
+        adapter_k = k_dense(adapter_k)
+        adapter_v = v_dense(adapter_v)
+        if multi_query:
+            adapter_k = replicate_for_multi_query(adapter_k, self.num_heads)
+            adapter_v = replicate_for_multi_query(adapter_v, self.num_heads)
+        key = jnp.concatenate([adapter_k, key], axis=1)
+        value = jnp.concatenate([adapter_v, value], axis=1)
+        if not self.decode:
+            assert mask is not None, "causal mask is required for training."
+        if mask is not None:
+            prefix_mask = jnp.ones(mask.shape[:-1] + (self.prefix_len,), dtype=mask.dtype)
+            mask = jnp.concatenate([prefix_mask, mask], axis=-1)
 
 
         dropout_rng = None
@@ -230,6 +200,7 @@ class SelfAttention(ShardModule):
             raise NotImplementedError
             assert not self.decode, "Memory efficient attention does not support decoding."
             assert deterministic, "Memory efficient attention does not support dropout."
+            assert not self.padding_left, "Memory efficient attention does not support padding_left."
         
             mask_mode = self.memory_efficient_mask_mode
             context_lengths = None

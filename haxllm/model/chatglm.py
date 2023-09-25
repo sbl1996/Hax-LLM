@@ -1,3 +1,5 @@
+# deprecated
+
 import functools
 from typing import Any, Callable
 
@@ -10,7 +12,7 @@ from flax import struct
 from haxllm.model.parallel import SelfAttention, DenseGeneral, Embed, MlpBlock
 from haxllm.model.utils import load_config as _load_config
 from haxllm.model.modules import make_block_stack
-from haxllm.config_utils import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin
 
 
 config_hub = {
@@ -27,14 +29,6 @@ config_hub = {
         intermediate_size=16384,
     ),
 }
-
-
-def load_config(name, **kwargs):
-    if name in config_hub:
-        config = config_hub[name]
-    else:
-        raise ValueError(f"Unknown gpt2 model {name}")
-    return _load_config(TransformerConfig, config, **kwargs)
 
 
 @struct.dataclass
@@ -370,3 +364,26 @@ def remap_state_dict(state_dict):
     }
     root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
     return root
+
+
+class ChatSetting:
+    name = "chatglm"
+    system = ""
+    roles = ("问", "答")
+    stop_token_ids = (0, 2)
+
+    def get_prompt(self, messages):
+        sep = "\n\n"
+        if self.system:
+            ret = self.system + sep
+        else:
+            ret = ""
+        for i, (role, message) in enumerate(messages):
+            if i % 2 == 0:
+                round = i // 2
+                ret += f"[Round {round}]{sep}{role}：{message}"
+            else:
+                ret += f"{sep}{role}："
+                if message:
+                    ret += message + sep
+        return ret
