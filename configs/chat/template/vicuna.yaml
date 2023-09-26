@@ -2,4 +2,4 @@ family: llama
 tokenizer: huggyllama/llama-7b
 remat: False
 scan: False
-conv_template: vicuna_v1.1
+conv_template: vicuna_v1

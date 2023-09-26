@@ -1,7 +1,5 @@
 from typing import Callable, Any
-import dataclasses
 
-import jax
 import jax.numpy as jnp
 
 import flax.linen as nn

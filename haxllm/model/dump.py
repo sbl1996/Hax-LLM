@@ -5,11 +5,15 @@ import argparse
 import importlib
 from pathlib import Path
 
+import numpy as np
+
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
 import jax.numpy as jnp
 from flax.traverse_util import flatten_dict
+
+from haxllm.utils import has_bf16_in_safetensors
 
 
 def tensor_to_numpy(v):
@@ -39,6 +43,8 @@ def load_from_safetensors_files(files):
     tensors = {}
     for f in files:
         print("Loading from {}".format(f))
+        if has_bf16_in_safetensors(f):
+            np.bfloat16 = jnp.bfloat16
         with safe_open(f, framework="numpy", device='cpu') as f:
             for k in f.keys():
                 if k in tensors:
