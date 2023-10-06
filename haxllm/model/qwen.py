@@ -19,6 +19,7 @@ config_hub = {
         n_layers=32,
     ),
     "qwen-14b": dict(
+        vocab_size=152064,
         hidden_size=5120,
         intermediate_size=13696,
         n_heads=40,

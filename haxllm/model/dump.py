@@ -160,7 +160,7 @@ if __name__ == "__main__":
         tensors = load_from_torch_bin_files(bin_files)
     else:
         tensors = load_from_safetensors_files(bin_files)
-
+    
     target = Path(args.output).expanduser().absolute()
     if target.is_dir():
         save_path = target / "{}_np.safetensors".format(model_name)
