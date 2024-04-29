@@ -102,17 +102,17 @@ async def create_chat_completion(request: ChatCompletionRequest):
         system_message = ""
 
     conv = get_conv_template(conv_template)
-    conv.system = system_message
+    conv.config.system = system_message
 
     for msg in prev_messages:
         if msg.role == "user":
-            conv.append_message(conv.roles[0], msg.content)
+            conv.append_message(conv.config.roles[0], msg.content)
         elif msg.role == "assistant":
-            conv.append_message(conv.roles[1], msg.content)
+            conv.append_message(conv.config.roles[1], msg.content)
         elif msg.role == "system":
             raise HTTPException(status_code=400, detail="Invalid request")
-    conv.append_message(conv.roles[0], query)
-    conv.append_message(conv.roles[1], None)
+    conv.append_message(conv.config.roles[0], query)
+    conv.append_message(conv.config.roles[1], None)
     prompt = conv.get_prompt()
 
     gen_params = {
@@ -120,7 +120,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         "top_k": request.top_k or model.top_k,
         "top_p": request.top_p or model.top_p,
         "max_len": request.max_length or model.max_len,
-        "stop_token_ids": conv.stop_token_ids,
+        "stop_token_ids": conv.config.stop_token_ids,
     }
 
     if request.stream:
@@ -160,6 +160,8 @@ async def predict(prompt, gen_params, model_id: str):
     pre = 0
     for outputs in output_stream:
         output_text = outputs["text"]
+        usage = outputs["usage"]
+        print(f"prompt: {usage['prompt_tokens']}, completion: {usage['completion_tokens']}, total: {usage['total_tokens']}")
         # More fluent, but more requests, and more likely to be cut off
         # seps = r'([！，。？；：、 ?,.:“”‘’【】《》（）\n])'
         # Less fluent, and less requests, suitable for online chat
@@ -198,14 +200,16 @@ async def predict(prompt, gen_params, model_id: str):
 
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
 def chat_api_server(cfg: DictConfig) -> None:
+    from jax_smi import initialise_tracking
+    initialise_tracking()
     from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.initialize_cache(os.path.expanduser("~/jax_cache"))
+    cc.set_cache_dir(os.path.expanduser("~/jax_cache"))
     import logging
     logging.getLogger("jax").setLevel(logging.WARNING)
 
     global model, tokenizer, conv_template
 
-    pipeline, conv_template = load_config(cfg)
+    pipeline, conv_template, max_new_tokens = load_config(cfg)
     model = pipeline
     tokenizer = pipeline.tokenizer
 

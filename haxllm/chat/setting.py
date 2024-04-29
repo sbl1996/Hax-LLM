@@ -27,6 +27,7 @@ chat_settings: Dict[str, ChatSetting] = {}
 
 
 def get_chat_setting(name: str) -> ChatSetting:
+    name = name.lower()
     return chat_settings[name]()
 
 
@@ -35,10 +36,11 @@ def _register_chat_setting(
     if not inspect.isclass(setting):
         raise TypeError('module must be a class, '
                         f'but got {type(setting)}')
+    setting_name = setting.name.lower()
     if not force:
-        assert setting.name not in chat_settings, f"{setting.name} has been registered."
+        assert setting_name not in chat_settings, f"{setting_name} has been registered."
 
-    chat_settings[setting.name] = setting
+    chat_settings[setting_name] = setting
 
 
 def register_chat_setting(force: bool = False):

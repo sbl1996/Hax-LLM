@@ -85,8 +85,11 @@ def load_config(cfg: DictConfig, chat: bool = True):
     )
 
     if config.pad_token_id is not None and tokenizer.pad_token_id != config.pad_token_id:
-        print(f"Changing tokenizer pad token id from {tokenizer.pad_token_id} to {config.pad_token_id}")
+        original_pad_token_id = tokenizer.pad_token_id
         tokenizer.pad_token_id = config.pad_token_id
+        print(f"Changing tokenizer pad token id from {original_pad_token_id} to {config.pad_token_id}, now {tokenizer.pad_token_id}")
+        if tokenizer.pad_token_id is None:
+            raise ValueError("Tokenizer pad token id is None")
 
     model = load_model_cls(mod, "lm")(config)
 

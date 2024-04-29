@@ -211,11 +211,12 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=None):
     n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("h.")]) + 1
     hidden_size = state_dict['wte.weight'].shape[1]
     # hard code for GPT-2
-    head_dim = 64
+    if head_dim is None:
+        head_dim = 64
     n_heads = hidden_size  // head_dim
 
     # Embedding

@@ -301,13 +301,14 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=None):
     state_dict = {k.replace("transformer.", ""): v for k, v in state_dict.items()}
 
     n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
     hidden_size = state_dict['word_embeddings.weight'].shape[1]
     # hard code for now
-    head_dim = 128
+    if head_dim is None:
+        head_dim = 128
     n_heads = hidden_size  // head_dim
 
     root = {}

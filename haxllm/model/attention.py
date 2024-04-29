@@ -152,14 +152,14 @@ def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q, k
 
 
-def make_apply_rope(head_dim, max_len, dtype, multi_query=False):
-    if multi_query:
+def make_apply_rope(head_dim, max_len, dtype, theta=10000.0, variant=1):
+    if variant == 2:
         cos, sin = precompute_freqs_cis2(
-            dim=head_dim // 2, end=max_len, dtype=dtype)
+            dim=head_dim // 2, end=max_len, dtype=dtype, theta=theta)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
     else:
         cos, sin = precompute_freqs_cis(
-            dim=head_dim, end=max_len, dtype=dtype)
+            dim=head_dim, end=max_len, dtype=dtype, theta=theta)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     return add_pos
 

@@ -1,6 +1,5 @@
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 
-import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -9,7 +8,7 @@ from flax import struct
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin
-from haxllm.chat.setting import register_chat_setting
+from haxllm.chat.setting import register_chat_setting, ChatSetting
 
 
 config_hub = {
@@ -59,6 +58,30 @@ config_hub = {
         rms_norm_eps=1e-5,
         n_positions=4096,
     ),
+    "yi-6b": dict(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_kv_heads=4,
+        n_layers=32,
+        rms_norm_eps=1e-5,
+        n_positions=4096,
+        vocab_size=64000,
+        rope_theta=5000000.0,
+    ),
+    "llama3-8b": dict(
+        hidden_size=4096,
+        intermediate_size=14336,
+        n_heads=32,
+        n_kv_heads=8,
+        n_layers=32,
+        rms_norm_eps=1e-5,
+        n_positions=8192,
+        vocab_size=128256,
+        rope_theta=500000.0,
+        bos_token_id=128000,
+        eos_token_id=128009,
+    ),
 }
 
 
@@ -71,8 +94,10 @@ class TransformerConfig(RematScanConfigMixin):
     hidden_size: int = 4096
     intermediate_size: int = 11008
     n_heads: int = 32
+    n_kv_heads: Optional[int] = None
     n_layers: int = 32
     rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
     n_positions: int = 2048
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -88,7 +113,7 @@ class TransformerConfig(RematScanConfigMixin):
 
 def get_chat_setting(name=None):
     if name is None or name == 'none':
-        return BaseChatSetting.none()
+        return ChatSetting.none()
     elif name == VicunaChatSetting.name:
         return VicunaChatSetting()
     elif name == LLaMA2ChatSetting.name:
@@ -118,6 +143,7 @@ class TransformerBlock(nn.Module):
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
+            multi_query_groups=config.n_kv_heads,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
@@ -126,6 +152,7 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             decode=config.decode,
             rope=True,
+            rope_theta=config.rope_theta,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),
@@ -241,11 +268,16 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=None):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
-    head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0] * 2
+    rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
+    if rope_key in state_dict:
+        head_dim = state_dict[rope_key].shape[0] * 2
+    elif head_dim is None:
+        head_dim = 128
     n_heads = hidden_size  // head_dim
+    n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.weight'].shape[0] // head_dim
 
     root = {}
     root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight")}
@@ -259,15 +291,25 @@ def remap_state_dict(state_dict):
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.q_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
             },
             "key": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.weight").T.reshape(hidden_size, n_kv_heads, head_dim),
             },
             "value": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
+                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.weight").T.reshape(hidden_size, n_kv_heads, head_dim),
             },
             "out": {
                 "kernel": state_dict.pop(f"model.layers.{d}.self_attn.o_proj.weight").T.reshape(n_heads, head_dim, hidden_size),
             },
         }
+        for part_k, part in [("query", "q"), ("key", "k"), ("value", "v"), ("out", "o")]:
+            bias = state_dict.pop(f"model.layers.{d}.self_attn.{part}_proj.bias", None)
+            if bias is not None:
+                if part == 'q':
+                    bias = bias.reshape(n_heads, head_dim)
+                elif part in ['k', 'v']:
+                    bias = bias.reshape(n_kv_heads, head_dim)
+                else:
+                    bias = bias.reshape(hidden_size)
+                block_d["attn"][part_k]["bias"] = bias
         block_d["ln_2"] = {"scale": state_dict.pop(
             f"model.layers.{d}.post_attention_layernorm.weight")}
         block_d["mlp"] = {
@@ -275,6 +317,10 @@ def remap_state_dict(state_dict):
             "up": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.up_proj.weight").T},
             "down": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.down_proj.weight").T},
         }
+        for part in ["gate", "up", "down"]:
+            bias = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.bias", None)
+            if bias is not None:
+                block_d["mlp"][part]["bias"] = bias
         root[f"h_{d}"] = block_d
 
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
@@ -297,6 +343,52 @@ class VicunaChatSetting:
                 ret += role + ": " + message + seps[i % 2]
             else:
                 ret += role + ":"
+        return ret
+
+
+@register_chat_setting()
+class YiChatSetting:
+    name = "Yi-chat"
+    system = ""
+    roles = ("user", "assistant")
+    stop_token_ids = (2, 7,)
+
+    def get_prompt(self, messages):
+        bos = "<|im_start|>"
+        eos = "<|im_end|>"
+        ret = ""
+        for i, (role, message) in enumerate(messages):
+            ret += bos
+            if message:
+                ret += role + "\n" + message + eos + "\n"
+            else:
+                ret += role + "\n"
+        return ret
+
+
+@register_chat_setting()
+class LLaMA3ChatSetting:
+    name = "llama3-chat"
+    system = "You are a helpful assistant."
+    roles = ("user", "assistant")
+    stop_token_ids = (128001, 128009,)
+
+    def get_prompt(self, messages):
+        boh = "<|start_header_id|>"
+        eoh = "<|end_header_id|>"
+        eos = "<|eot_id|>"
+        ret = "<|begin_of_text|>"
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        if system:
+            ret += f"{boh}system{eoh}\n\n{system}{eos}"
+        for i, (role, message) in enumerate(messages):
+            ret += f"{boh}{role}{eoh}\n\n"
+            if message:
+                ret += message.strip() + eos
         return ret
 
 

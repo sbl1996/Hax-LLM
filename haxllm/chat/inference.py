@@ -83,13 +83,14 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
 
             partially_stopped = False
             if not partially_stopped:
+                usage = {
+                    "prompt_tokens": input_echo_len,
+                    "completion_tokens": i,
+                    "total_tokens": input_echo_len + i,
+                }
                 yield {
                     "text": output,
-                    "usage": {
-                        "prompt_tokens": input_echo_len,
-                        "completion_tokens": i,
-                        "total_tokens": input_echo_len + i,
-                    },
+                    "usage": usage,
                     "finish_reason": None,
                 }
 
@@ -188,7 +189,7 @@ def chat_loop(
         }
 
         chatio.prompt_for_output(conv.config.roles[1])
-        output_stream = generate_stream(pipeline, gen_params)
+        output_stream = generate_stream(pipeline, gen_params, pipeline.max_len)
         t = time.time()
         outputs = chatio.stream_output(output_stream)
         duration = time.time() - t

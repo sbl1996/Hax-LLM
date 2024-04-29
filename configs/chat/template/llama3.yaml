@@ -1,0 +1,5 @@
+family: llama
+tokenizer: shenzhi-wang/Llama3-8B-Chinese-Chat
+remat: False
+scan: False
+conv_template: llama3-chat

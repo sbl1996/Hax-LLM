@@ -1,0 +1,5 @@
+family: llama
+tokenizer: 01-ai/Yi-6B-Chat
+remat: False
+scan: False
+conv_template: Yi-chat

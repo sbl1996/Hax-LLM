@@ -202,10 +202,11 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=128):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("transformer.h.")]) + 1
     hidden_size = state_dict['transformer.wte.weight'].shape[1]
-    head_dim = 128  # TODO: hardcode
+    if head_dim is None:
+        head_dim = 128
     n_heads = hidden_size  // head_dim
 
     root = {}
@@ -249,24 +250,30 @@ def remap_state_dict(state_dict):
 
 @register_chat_setting()
 class ChatSetting:
-    # TODO: implement
     name = "qwen"
     system = "You are a helpful assistant."
     roles = ("user", "assistant")
     stop_token_ids = (151643,)
 
     def get_prompt(self, messages):
-        assert self.system, "system is not set"
-        im_start, im_end = "<|im_start|>", "<|im_end|>"
+        return encode_message(messages, self.system)
 
-        sep = "\n"
-        ret = f"{im_start}system{sep}{self.system}{im_end}"
 
-        for i, (role, message) in enumerate(messages):
-            if i % 2 == 0:
-                ret += f"{sep}{im_start}{role}{sep}{message}{im_end}"
-            else:
-                ret += f"{sep}{im_start}{role}{sep}"
-                if message:
-                    ret += f"{message}{im_end}"
-        return ret
+def encode_message(messages, system):
+    im_start, im_end = "<|im_start|>", "<|im_end|>"
+    if messages[0][0] == "system":
+        system = messages[0][1]
+        messages = messages[1:]
+    system = system.strip()
+
+    sep = "\n"
+    ret = f"{im_start}system{sep}{system}{im_end}"
+
+    for i, (role, message) in enumerate(messages):
+        if i % 2 == 0:
+            ret += f"{sep}{im_start}{role}{sep}{message}{im_end}"
+        else:
+            ret += f"{sep}{im_start}{role}{sep}"
+            if message:
+                ret += f"{message}{im_end}"
+    return ret

@@ -195,10 +195,12 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=None):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
-    head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0] * 2
+    infer_head_dim = state_dict['model.layers.0.self_attn.rotary_emb.inv_freq'].shape[0] * 2
+    if head_dim is not None and head_dim != infer_head_dim:
+        raise ValueError(f"head_dim {head_dim} does not match inferred head_dim {infer_head_dim}")
     n_heads = hidden_size  // head_dim
 
     root = {}

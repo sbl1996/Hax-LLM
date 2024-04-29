@@ -62,7 +62,7 @@ class TransformerBlock(nn.Module):
             qkv_bias=True,
             out_bias=False,
             decode=config.decode,
-            rope=True,
+            rope=2,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),

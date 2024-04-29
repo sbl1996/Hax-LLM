@@ -147,7 +147,7 @@ class SelfAttention(ShardModule):
             value = replicate_for_multi_query(value, self.num_heads)
 
         if self.rope:
-            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, multi_query)
+            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, self.rope_theta, variant=2 if self.rope == 2 else 1)
         else:
             add_pos = lambda q, k, p=None: (q, k)
 

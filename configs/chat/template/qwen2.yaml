@@ -1,0 +1,5 @@
+family: qwen2
+tokenizer: Qwen/Qwen1.5-0.5B-Chat
+remat: False
+scan: False
+conv_template: qwen2

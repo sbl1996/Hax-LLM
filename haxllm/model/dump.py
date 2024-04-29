@@ -54,7 +54,8 @@ def load_from_safetensors_files(files):
 
 SAFE_TENSORS_INDEX = "model.safetensors.index.json"
 TORCH_INDEX = "pytorch_model.bin.index.json"
-
+SINGLE_SAFE_TENSORS = "model.safetensors"
+SINGLE_TORCH = "pytorch_model.bin"
 
 def get_ckpt_files_from_index(index_file):
     with open(index_file) as f:
@@ -68,15 +69,19 @@ def get_ckpt_files_from_index(index_file):
 def check_ckpt(model_dir, ckpt_type):
     if ckpt_type == "bin":
         index_file = model_dir / TORCH_INDEX
+        single_file = model_dir / SINGLE_TORCH
     elif ckpt_type == "safetensors":
         index_file = model_dir / SAFE_TENSORS_INDEX
+        single_file = model_dir / SINGLE_SAFE_TENSORS
     else:
         raise ValueError("Unknown ckpt type: {}".format(ckpt_type))
-    print(ckpt_type, index_file)
-    if not index_file.exists():
-        return False
-    ckpt_files = get_ckpt_files_from_index(index_file)
-    return all((model_dir / f).exists() for f in ckpt_files)
+    if index_file.exists():
+        print(ckpt_type, index_file, single_file)
+        ckpt_files = get_ckpt_files_from_index(index_file)
+        return all((model_dir / f).exists() for f in ckpt_files)
+    elif single_file.exists():
+        return True
+    return False
 
 
 def check_safetensors_ckpt(model_dir):
@@ -97,6 +102,8 @@ if __name__ == "__main__":
                         help="Output path to save the dumped model")
     parser.add_argument("-t", "--type", type=str, default=None,
                         help="Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension")
+    parser.add_argument("-d", "--dim", type=int, default=None,
+                        help="Dimension of the head, if not specified, will try to infer from the model config")
 
 
     args = parser.parse_args()
@@ -143,9 +150,9 @@ if __name__ == "__main__":
     source = Path(source).expanduser().absolute()
     if source.is_dir():
         model_dir = source
-        bin_files = sorted(model_dir.glob("pytorch_model-*.bin"))
+        bin_files = sorted(model_dir.glob("pytorch_model*.bin"))
         if not bin_files:
-            bin_files = sorted(model_dir.glob("model-*.safetensors"))
+            bin_files = sorted(model_dir.glob("model*.safetensors"))
         if not bin_files:
             raise ValueError("No model files found in {}".format(model_dir))
         model_name = model_name or model_dir.name    
@@ -169,7 +176,7 @@ if __name__ == "__main__":
         assert not target.exists(), "Target file already exists: {}".format(target)
         save_path = target
 
-    tensors = mod.remap_state_dict(tensors)
+    tensors = mod.remap_state_dict(tensors, head_dim=args.dim)
     tensors = flatten_dict(tensors, sep=".")
     print("Saving to {}".format(save_path))
     save_file(tensors, save_path)

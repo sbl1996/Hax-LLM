@@ -208,13 +208,14 @@ class TransformerSequenceClassifier(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict):
+def remap_state_dict(state_dict, head_dim=None):
     state_dict = {k.replace("bert.", ""): v for k, v in state_dict.items()}
 
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("encoder.layer.")]) + 1
     hidden_size = state_dict['embeddings.word_embeddings.weight'].shape[1]
     # hard code for bert
-    head_dim = 64
+    if head_dim is None:
+        head_dim = 64
     n_heads = hidden_size  // head_dim
 
     root = {}
