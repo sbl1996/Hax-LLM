@@ -58,6 +58,7 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     temperature: Optional[float] = None
+    frequency_penalty: Optional[float] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     max_length: Optional[int] = None
@@ -115,10 +116,14 @@ async def create_chat_completion(request: ChatCompletionRequest):
     conv.append_message(conv.config.roles[1], None)
     prompt = conv.get_prompt()
 
+    repetition_penalty = model.repetition_penalty
+    if request.frequency_penalty is not None:
+        repetition_penalty = request.frequency_penalty + 1.0
     gen_params = {
         "temperature": request.temperature or model.temperature,
         "top_k": request.top_k or model.top_k,
         "top_p": request.top_p or model.top_p,
+        "repetition_penalty": repetition_penalty,
         "max_len": request.max_length or model.max_len,
         "stop_token_ids": conv.config.stop_token_ids,
     }
@@ -161,7 +166,6 @@ async def predict(prompt, gen_params, model_id: str):
     for outputs in output_stream:
         output_text = outputs["text"]
         usage = outputs["usage"]
-        print(f"prompt: {usage['prompt_tokens']}, completion: {usage['completion_tokens']}, total: {usage['total_tokens']}")
         # More fluent, but more requests, and more likely to be cut off
         # seps = r'([！，。？；：、 ?,.:“”‘’【】《》（）\n])'
         # Less fluent, and less requests, suitable for online chat
@@ -179,6 +183,7 @@ async def predict(prompt, gen_params, model_id: str):
             chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
             yield "{}".format(chunk.model_dump_json(exclude_unset=True))
             pre = now
+    print(f"prompt: {usage['prompt_tokens']}, completion: {usage['completion_tokens']}, total: {usage['total_tokens']}")
     new_text = "".join(output_text[pre:])
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
@@ -217,6 +222,7 @@ def chat_api_server(cfg: DictConfig) -> None:
     print(f"  temperature: {pipeline.temperature}")
     print(f"  top_p: {pipeline.top_p}")
     print(f"  top_k: {pipeline.top_k}")
+    print(f"  repetition_penalty: {pipeline.repetition_penalty}")
     print(f"  max_len: {pipeline.max_len}")
 
     host = getattr(cfg, "host", "127.0.0.1")

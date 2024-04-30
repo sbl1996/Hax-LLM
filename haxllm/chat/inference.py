@@ -2,6 +2,7 @@ import abc
 from typing import Optional
 import time
 
+import numpy as np
 import jax.numpy as jnp
 
 from haxllm.chat.conversation import get_conv_template
@@ -21,7 +22,7 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
     prompt = params["prompt"]
     len_prompt = len(prompt)
     temperature = float(params.get("temperature") or 1.0)
-    # repetition_penalty = float(params.get("repetition_penalty", 1.0))
+    repetition_penalty = float(params.get("repetition_penalty", 1.0))
     top_p = float(params.get("top_p") or 1.0)
     top_k = int(params.get("top_k") or -1)  # -1 means disable
     stop_str = params.get("stop")
@@ -32,6 +33,9 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
     input_ids = tokenizer(prompt).input_ids
     input_echo_len = len(input_ids)
     output_ids = list(input_ids)
+    live_seq = np.full((max_len,), fill_value=tokenizer.pad_token_id, dtype=np.int32)
+    offset = len(input_ids)
+    live_seq[:offset] = input_ids
 
     max_new_tokens = int(params.get("max_new_tokens") or (max_len - input_echo_len - 8))
 
@@ -56,10 +60,12 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
                 jnp.array([[token]], dtype=jnp.int32))
 
         rng, subrng = split_rng(rng)
-        token = sample_token(logits[0, -1, :], subrng, temperature, top_p, top_k) 
+        token = sample_token(logits[0, -1, :], live_seq, subrng, temperature, top_p, top_k, repetition_penalty) 
         token = int(token)
 
         output_ids.append(token)
+        live_seq[offset] = token
+        offset += 1
         # print(f"[{i}] token {token} {tokenizer.convert_ids_to_tokens([token])}")
 
         if token in stop_token_ids:

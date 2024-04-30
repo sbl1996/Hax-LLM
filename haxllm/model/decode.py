@@ -91,6 +91,25 @@ def sample_token_top_k_single(logits, rng, k):
     return token
 
 
+@partial(jax.jit, static_argnums=(3,))
+def sample_token_top_k_top_p_single(logits, rng, p, k):
+    sorted_indices = jnp.argsort(logits)[::-1]
+    sorted_logits = logits[sorted_indices]
+
+    topk_score = sorted_logits[-min(k, len(sorted_logits))]
+    indices_to_remove = logits < topk_score
+    big_neg = jnp.finfo(logits.dtype).min
+    logits = jnp.where(indices_to_remove, big_neg, logits)
+
+    cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits))
+    mask = cumulative_probs > p
+    mask = jnp.concatenate([jnp.zeros((1,), dtype=jnp.bool_), mask[:-1]])
+    sorted_logits = jnp.where(mask, big_neg, sorted_logits)
+    token = jax.random.categorical(rng, sorted_logits)
+    token = sorted_indices[token]
+    return token
+
+
 @partial(jax.jit, static_argnums=(2,))
 def sample_token_top_k(logits, rng, k):
     if logits.ndim == 1:
@@ -105,11 +124,48 @@ def sample_token_top_k(logits, rng, k):
         raise NotImplementedError
 
 
-def sample_token(logits, rng, temperature: float = 1.0, top_p: float = 1.0, top_k: int = -1):
+@partial(jax.jit, static_argnums=(3,))
+def sample_token_top_k_top_p(logits, rng, p, k):
+    if logits.ndim == 1:
+        return sample_token_top_k_top_p_single(logits, rng, p, k)
+    elif logits.ndim == 2:
+        if rng.ndim == 2:
+            assert logits.shape[0] == rng.shape[0]
+            return jax.vmap(sample_token_top_k_top_p_single, in_axes=(0, 0, None, None))(logits, rng, p, k)
+        else:
+            return jax.vmap(sample_token_top_k_top_p_single, in_axes=(0, None, None, None))(logits, rng, p, k)
+    else:
+        raise NotImplementedError
+
+
+@jax.jit
+def add_repeat_penalty(logits, input_ids, penalty=1.0):
+    # Keep shape static to avoid recompilation
+    ndim = logits.ndim
+    if logits.ndim == 1:
+        logits = logits[None, :]
+    if input_ids.ndim == 1:
+        input_ids = input_ids[None, :]
+    assert logits.shape[0] == input_ids.shape[0] == 1, "Only support batch_size=1"
+    logits = logits[0]
+    input_ids = input_ids[0]
+    new_logits = logits / jnp.where(
+        logits > 0, penalty, -penalty)
+    logits = logits.at[input_ids].set(new_logits[input_ids])
+    if ndim == 2:
+        logits = logits[None, :]
+    return logits
+
+
+def sample_token(logits, live_seq, rng, temperature: float = 1.0, top_p: float = 1.0, top_k: int = -1, repetition_penalty: float = 1.0):
     if temperature < 1e-5 or top_k == 1:
         return jnp.argmax(logits, axis=-1)
+    if repetition_penalty != 1.0:
+        logits = add_repeat_penalty(logits, live_seq, repetition_penalty)
     logits = logits / temperature
-    if top_k > 1:
+    if top_k > 1 and top_p < 1.0:
+        return sample_token_top_k_top_p(logits, rng, top_p, top_k)
+    elif top_k > 1:
         return sample_token_top_k(logits, rng, top_k)
     elif top_p < 1.0:
         return sample_token_top_p(logits, rng, top_p)
@@ -131,8 +187,9 @@ def split_rng(rng):
 
 
 def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
-                  temperature=1.0, top_k=5, top_p=1.0, rng=None, two_stage=False, pad_context=None,
-                  pad_token_id=None, decode=True, stop_token_ids=None, max_new_tokens=None):
+                  temperature=1.0, top_k=5, top_p=1.0, repetition_penalty=1.0,
+                  rng=None, two_stage=False, pad_context=None, pad_token_id=None,
+                  decode=True, stop_token_ids=None, max_new_tokens=None):
     if stop_token_ids is None:
         stop_token_ids = [tokenizer.eos_token_id]
     if tokenizer.eos_token_id not in stop_token_ids:
@@ -177,7 +234,7 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
         if i < context_length:
             continue
         rng, subrng = split_rng(rng)
-        token = sample_token(logits, subrng, temperature, top_p, top_k)
+        token = sample_token(logits, live_seq, subrng, temperature, top_p, top_k, repetition_penalty)
         live_seq = live_seq.at[:, i].set(token)
         new_tokens += 1
         if max_new_tokens is not None and new_tokens >= max_new_tokens:
@@ -245,7 +302,7 @@ def batch_random_sample(
         else:
             rngs = jax.random.split(rng, batch_size + 1)
             rng, subrngs = rngs[0], rngs[1:]
-        tokens = sample_token(logits, subrngs, temperature, top_p, top_k)
+        tokens = sample_token(logits, live_seqs, subrngs, temperature, top_p, top_k)
         is_context = i < context_length
         tokens = jnp.where(
             is_end | is_context, live_seqs[:, i], tokens)

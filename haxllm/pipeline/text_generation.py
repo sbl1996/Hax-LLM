@@ -35,7 +35,8 @@ def init_mesh(mesh):
 class TextGenerationPipeline:
 
     def __init__(self, tokenizer, model, max_len=512, seed=None, rng=None,
-                 two_stage=False, pad_multiple=128, temperature=1.0, top_k=-1, top_p=1.0,
+                 two_stage=False, pad_multiple=128, temperature=1.0, top_k=-1,
+                 top_p=1.0, repetition_penalty=1.0,
                  max_new_tokens=None, stop_token_ids=None, verbose=True):
         r"""
         Initialize the TextGenerationPipeline with given tokenizer, model, and other optional parameters.
@@ -63,6 +64,8 @@ class TextGenerationPipeline:
             number of top-k tokens to sample from.
         top_p: float, default 1.0
             cumulative probability for top-p sampling.
+        repetition_penalty: float, default 1.0
+            penalty for repeated tokens.
         max_new_tokens: int, default None
             maximum number of new tokens to generate.
         stop_token_ids: list of int, default None
@@ -85,6 +88,7 @@ class TextGenerationPipeline:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
         self.max_new_tokens = max_new_tokens
         self.stop_token_ids = stop_token_ids
         self.verbose = verbose
@@ -240,13 +244,15 @@ class TextGenerationPipeline:
                                   stop_token_ids=stop_token_ids, padding_left=padding_left)
 
     def random_sample(
-            self, inputs, temperature=None, top_k=None, top_p=None, max_len=None, rng=None, max_source_length=None, stop_token_ids=None,
+            self, inputs, temperature=None, top_k=None, top_p=None, repetition_penalty=None,
+            max_len=None, rng=None, max_source_length=None, stop_token_ids=None,
             padding_left=None, max_new_tokens=None):
         temperature = self.temperature if temperature is None else temperature
         stop_token_ids = self.stop_token_ids if stop_token_ids is None else stop_token_ids
 
         top_k = self.top_k if top_k is None else top_k
         top_p = self.top_p if top_p is None else top_p
+        repetition_penalty = self.repetition_penalty if repetition_penalty is None else repetition_penalty
         max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
 
         max_len = max_len or self.max_len
@@ -270,8 +276,8 @@ class TextGenerationPipeline:
             inputs, kwargs = self.prepare_call_args(inputs)
             return random_sample(
                 inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-                temperature=temperature, top_k=top_k, top_p=top_p, rng=rng, max_len=max_len,
-                max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, **kwargs)
+                temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
+                rng=rng, max_len=max_len, max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, **kwargs)
         elif isinstance(inputs, list) or (isinstance(inputs, np.ndarray) and inputs.ndim == 2):
             if not is_greedy and rng is None:
                 self._rng, rng = random.split(self._rng)
@@ -367,8 +373,8 @@ class ChatPipeline(TextGenerationPipeline):
         return logits
 
     def chat(self, query: str, history: List[Tuple[str, str]] = None,
-             temperature=0.8, top_k=None, top_p=0.8, max_len=None):
-        return self.random_sample(query, history, temperature, top_k, top_p, max_len)
+             temperature=0.8, top_k=None, top_p=0.8, repetition_penalty=1.0, max_len=None):
+        return self.random_sample(query, history, temperature, top_k, top_p, repetition_penalty, max_len)
 
 # TODO: refactor
 def apply_with_pad(apply_fn, params, cache, input_ids, pad_multiple, pad_token_id):
