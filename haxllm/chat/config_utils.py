@@ -73,13 +73,17 @@ def load_config(cfg: DictConfig, chat: bool = True):
     parallel = mesh is not None
 
     peft = getattr(cfg, "peft", None)
+    quantize = getattr(cfg, "quantize", False)
     mod = get_module(template_config.pop("family"), peft)
 
+    if quantize:
+        print("Loading int8 model...")
     model_config = {"name": model_name, "dtype": dtype, "param_dtype": param_dtype, **template_config}
     config = _load_config(
         mod,
         **model_config,
         decode=True,
+        quantize=quantize,
         shard=parallel,
         padding_left=tokenizer.padding_side == "left",
     )

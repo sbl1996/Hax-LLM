@@ -104,7 +104,8 @@ if __name__ == "__main__":
                         help="Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension")
     parser.add_argument("-d", "--dim", type=int, default=None,
                         help="Dimension of the head, if not specified, will try to infer from the model config")
-
+    parser.add_argument("-q", "--quantize", default=False, action='store_true',
+                        help="Whether to quantize the model to int8, default is False")
 
     args = parser.parse_args()
     mod_name = "haxllm.model.{}".format(args.model_family)
@@ -176,7 +177,7 @@ if __name__ == "__main__":
         assert not target.exists(), "Target file already exists: {}".format(target)
         save_path = target
 
-    tensors = mod.remap_state_dict(tensors, head_dim=args.dim)
+    tensors = mod.remap_state_dict(tensors, head_dim=args.dim, quantize=args.quantize)
     tensors = flatten_dict(tensors, sep=".")
     print("Saving to {}".format(save_path))
     save_file(tensors, save_path)

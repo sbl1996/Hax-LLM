@@ -61,6 +61,21 @@ config_hub = {
         n_layers=80,
         vocab_size=152064,
     ),
+    "qwen2-1.5b": dict(
+        hidden_size=1536,
+        intermediate_size=8960,
+        n_heads=12,
+        n_layers=28,
+        n_kv_heads=2,
+    ),
+    "qwen2-7b": dict(
+        hidden_size=3584,
+        intermediate_size=18944,
+        n_heads=28,
+        n_layers=28,
+        n_kv_heads=4,
+        vocab_size=152064,
+    ),
 }
 
 
@@ -88,6 +103,7 @@ class TransformerConfig(RematScanConfigMixin):
     decode: bool = False
     shard: bool = False
     shard_cache: bool = False
+    quantize: bool = False
 
 
 def get_chat_setting(name=None):
@@ -132,6 +148,7 @@ class TransformerBlock(nn.Module):
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
+            quantize=config.quantize,
             name="attn")(x, mask, padding_mask)
 
         x = x + inputs
@@ -146,6 +163,7 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
+            quantize=config.quantize,
             name="mlp")(y)
 
         y = x + y

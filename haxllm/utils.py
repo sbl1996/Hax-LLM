@@ -233,7 +233,7 @@ def load_transformer_params(params, path: str, device, lm_head=False, verbose=Fa
         if key not in new_transformer_params:
             fprint(f"Key {key} not found in transformer params")
             continue
-        
+
         full_key = key if key.startswith("lm_head") else prefix + key
         p = params[full_key]
         # fprint(f"Loading param {key}")

@@ -13,7 +13,7 @@ def precompute_freqs_cis(
     #   cos, sin: (end, dim)
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
     t = np.arange(end, dtype=np.float32)  # type: ignore
-    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
+    freqs = np.outer(t, freqs)  # type: ignore
     freqs = np.concatenate((freqs, freqs), axis=-1)
     cos, sin = np.cos(freqs), np.sin(freqs)
     return jnp.array(cos, dtype=dtype), jnp.array(sin, dtype=dtype)
@@ -79,7 +79,7 @@ def precompute_freqs_cis2(
     #   cos, sin: (end, dim)
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
     t = np.arange(end, dtype=np.float32)  # type: ignore
-    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
+    freqs = np.outer(t, freqs)  # type: ignore
     cos, sin = np.cos(freqs), np.sin(freqs)
     return jnp.array(cos, dtype=dtype), jnp.array(sin, dtype=dtype)
 

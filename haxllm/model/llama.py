@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
+from haxllm.model.quantize import block_abs_max_int8_quantize
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin
@@ -65,6 +66,17 @@ config_hub = {
         n_kv_heads=4,
         n_layers=32,
         rms_norm_eps=1e-5,
+        n_positions=4096,
+        vocab_size=64000,
+        rope_theta=5000000.0,
+    ),
+    "yi-1.5-9b": dict(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_kv_heads=4,
+        n_layers=48,
+        rms_norm_eps=1e-6,
         n_positions=4096,
         vocab_size=64000,
         rope_theta=5000000.0,
@@ -268,7 +280,7 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, head_dim=None):
+def remap_state_dict(state_dict, head_dim=None, quantize=False):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
     rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
@@ -321,10 +333,26 @@ def remap_state_dict(state_dict, head_dim=None):
             bias = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.bias", None)
             if bias is not None:
                 block_d["mlp"][part]["bias"] = bias
+
+        if quantize:
+            to_quantize = ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]
+            for l in to_quantize:
+                l1, l2 = l.split(".")
+                dense = block_d[l1][l2]
+                w = dense["kernel"]
+                w, qscale = block_abs_max_int8_quantize(w)
+                dense["kernel"] = w
+                dense["qscale"] = qscale
         root[f"h_{d}"] = block_d
 
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
-    root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
+    if "lm_head.weight" in state_dict:
+        weight = state_dict.pop("lm_head.weight").T
+    else:
+        # tie_word_embeddings
+        print("WARNING: using tied weights for lm_head")
+        weight = root["wte"]["embedding"].T.copy()
+    root["lm_head"] = {"kernel": weight}
     return root
 
 

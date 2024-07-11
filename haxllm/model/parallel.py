@@ -193,6 +193,7 @@ class SelfAttention(ShardModule):
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
     shard_cache: bool = False
+    quantize: bool = False
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
@@ -248,6 +249,7 @@ class SelfAttention(ShardModule):
             use_bias=self.qkv_bias,
             shard_axes={"kernel": self.query_shard_axes},
             shard=self.shard,
+            quantize=self.quantize,
             axis=-1,
             name="query",
         )(x)
@@ -271,6 +273,7 @@ class SelfAttention(ShardModule):
                 use_bias=self.qkv_bias,
                 shard_axes=kv_dense_shard_axes,
                 shard=self.shard,
+                quantize=self.quantize,
                 axis=-1,
             ) for cls in dense_cls[1:3]
         ]
@@ -447,6 +450,7 @@ class GLUMlpBlock(ShardModule):
     shard_axes1: Tuple[str, str] = ("X", "Y")
     shard_axes2: Tuple[str, str] = ("Y", "X")
     shard: bool = False
+    quantize: bool = False
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
@@ -467,6 +471,7 @@ class GLUMlpBlock(ShardModule):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 shard=self.shard,
+                quantize=self.quantize,
             ) for cls in dense_cls
         ]
 

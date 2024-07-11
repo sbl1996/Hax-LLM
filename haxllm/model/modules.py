@@ -53,6 +53,20 @@ class RMSNorm(nn.Module):
         return jnp.asarray(x, self.dtype)
 
 
+Q_BLOCK_SIZE = 32
+
+def dequantize(x, scale):
+    return x.astype(scale.dtype) / scale
+
+def block_dequantize(x, scale):
+    n_blocks = scale.shape[-1]
+    block_size = x.shape[-1] // scale.shape[-1]
+    original_shape = x.shape
+    x = x.reshape(*x.shape[:-1], n_blocks, block_size)
+    scale = jnp.expand_dims(scale, axis=-1)
+    return dequantize(x, scale).reshape(*original_shape)
+
+
 class DenseGeneral(nn.Module):
     features: Union[int, Sequence[int]]
     axis: Union[int, Sequence[int]] = -1
@@ -61,6 +75,7 @@ class DenseGeneral(nn.Module):
     param_dtype: Dtype = jnp.float32
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+    quantize: bool = False
 
     @nn.compact
     def __call__(self, inputs: Array) -> Array:
@@ -76,27 +91,33 @@ class DenseGeneral(nn.Module):
                 math.prod(shape[-n_features:]),
             )
             flat_shape = jax.tree_map(int, flat_shape)
-            kernel = self.kernel_init(rng, flat_shape, dtype)
+            kernel_init = initializers.zeros_init() if self.quantize else self.kernel_init
+            kernel = kernel_init(rng, flat_shape, dtype)
             if isinstance(kernel, meta.AxisMetadata):
                 return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
             return jnp.reshape(kernel, shape)
 
         expanded_batch_shape = tuple(1 for ax in range(inputs.ndim) if ax not in axis)
         kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
-        kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
+        w_dtype = jnp.int8 if self.quantize else self.param_dtype
+        kernel = self.param("kernel", kernel_init_wrap, kernel_shape, w_dtype)
+
+        if self.quantize:
+            qscale_shape = kernel_shape[:-1] + (kernel_shape[-1] // Q_BLOCK_SIZE,)
+            qscale = self.param(
+                "qscale", nn.initializers.ones, qscale_shape, self.param_dtype)
+            kernel = block_dequantize(kernel, qscale)
 
         contract_ind = tuple(range(0, n_axis))
 
         if self.use_bias:
-
             def bias_init_wrap(rng, shape, dtype=jnp.float32):
                 flat_shape = (math.prod(shape[-n_features:]),)
                 bias = self.bias_init(rng, flat_shape, dtype)
                 if isinstance(bias, meta.AxisMetadata):
                     return meta.replace_boxed(bias, jnp.reshape(bias.unbox(), shape))
                 return jnp.reshape(bias, shape)
-
-            bias = self.param("bias", bias_init_wrap, features, self.param_dtype)
+            bias = self.param("bias", bias_init_wrap, features, w_dtype)
         else:
             bias = None
 

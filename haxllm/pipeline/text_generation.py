@@ -35,7 +35,7 @@ def init_mesh(mesh):
 class TextGenerationPipeline:
 
     def __init__(self, tokenizer, model, max_len=512, seed=None, rng=None,
-                 two_stage=False, pad_multiple=128, temperature=1.0, top_k=-1,
+                 two_stage=False, pad_multiple=512, temperature=1.0, top_k=-1,
                  top_p=1.0, repetition_penalty=1.0,
                  max_new_tokens=None, stop_token_ids=None, verbose=True):
         r"""
@@ -54,7 +54,7 @@ class TextGenerationPipeline:
             If None, use seed from gconfig.
         two_stage: bool, default False
             flag to enable two-stage decoding.
-        pad_multiple: int, default 128
+        pad_multiple: int, default 512
             multiple of padding length for two-stage decoding (to avoid jit recompilation)
         rng: jax.random.PRNGKey, default None
             random number generator for reproducible results.
@@ -318,7 +318,7 @@ class TextGenerationPipeline:
 
 class ChatPipeline(TextGenerationPipeline):
 
-    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=128, **kwargs):
+    def __init__(self, tokenizer, model, max_len=512, seed=0, pad_multiple=512, **kwargs):
         r"""
         Initialize the ChatPipeline with given tokenizer, model, and other optional parameters.
 
@@ -332,7 +332,7 @@ class ChatPipeline(TextGenerationPipeline):
             maximum length of the generated text.
         seed: int, default 0
             random seed for reproducible results.
-        pad_multiple: int, default 128
+        pad_multiple: int, default 512
             multiple of padding length for two-stage decoding (to avoid jit recompilation)
         """
         super().__init__(tokenizer, model, max_len, seed, two_stage=True, pad_multiple=pad_multiple, **kwargs)
