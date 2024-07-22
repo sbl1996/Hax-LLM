@@ -21,6 +21,7 @@ from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
 from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache
+from haxllm.model.quantize import QConfig
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -193,7 +194,7 @@ class SelfAttention(ShardModule):
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
     shard_cache: bool = False
-    quantize: bool = False
+    qconfig: Optional[QConfig] = None
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
@@ -226,6 +227,8 @@ class SelfAttention(ShardModule):
         In decode, only causal mask is supported and we infer it from cache.
         Therefor, mask is not needed for decoding.
         """
+        get_qconfig = lambda name: self.qconfig if self.qconfig is not None and name in self.qconfig.q_layers else None
+
         multi_query = self.multi_query_groups is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
         features = x.shape[-1]
@@ -249,7 +252,7 @@ class SelfAttention(ShardModule):
             use_bias=self.qkv_bias,
             shard_axes={"kernel": self.query_shard_axes},
             shard=self.shard,
-            quantize=self.quantize,
+            qconfig=get_qconfig("attn.query"),
             axis=-1,
             name="query",
         )(x)
@@ -273,13 +276,14 @@ class SelfAttention(ShardModule):
                 use_bias=self.qkv_bias,
                 shard_axes=kv_dense_shard_axes,
                 shard=self.shard,
-                quantize=self.quantize,
                 axis=-1,
             ) for cls in dense_cls[1:3]
         ]
 
-        key = kv_dense[0](name="key")(x)
-        value = kv_dense[1](name="value")(x)
+        key = kv_dense[0](
+            qconfig=get_qconfig("attn.key"), name="key")(x)
+        value = kv_dense[1](
+            qconfig=get_qconfig("attn.value"), name="value")(x)
 
         # TODO: we can cache untiled key and value for memory efficiency
         # If we shard at the last axis, it may be padded to meet 8x128 layout which results 8x expansion of memory.
@@ -379,6 +383,7 @@ class SelfAttention(ShardModule):
             param_dtype=self.param_dtype,
             shard_axes={"kernel": self.out_shard_axes},
             shard=self.shard,
+            qconfig=get_qconfig("attn.out"),
             name="out",
         )(x)
         return out
@@ -450,11 +455,13 @@ class GLUMlpBlock(ShardModule):
     shard_axes1: Tuple[str, str] = ("X", "Y")
     shard_axes2: Tuple[str, str] = ("Y", "X")
     shard: bool = False
-    quantize: bool = False
+    qconfig: Optional[QConfig] = None
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
 
     @nn.compact
     def __call__(self, inputs):
+        get_qconfig = lambda name: self.qconfig if self.qconfig is not None and name in self.qconfig.q_layers else None
+
         if not isinstance(self.dense_cls, Sequence):
             dense_cls = [self.dense_cls for _ in range(3)]
         else:
@@ -471,7 +478,6 @@ class GLUMlpBlock(ShardModule):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 shard=self.shard,
-                quantize=self.quantize,
             ) for cls in dense_cls
         ]
 
@@ -479,17 +485,20 @@ class GLUMlpBlock(ShardModule):
         g = dense[0](
             features=self.intermediate_size,
             shard_axes={"kernel": self.shard_axes1},
+            qconfig=get_qconfig("mlp.gate"),
             name="gate",
         )(inputs)
         g = nn.silu(g)
         x = g * dense[1](
             features=self.intermediate_size,
             shard_axes={"kernel": self.shard_axes1},
+            qconfig=get_qconfig("mlp.up"),
             name="up",
         )(inputs)
         x = dense[2](
             features=actual_out_dim,
             shard_axes={"kernel": self.shard_axes2},
+            qconfig=get_qconfig("mlp.down"),
             name="down",
         )(x)
         return x

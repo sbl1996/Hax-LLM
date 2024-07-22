@@ -1,5 +1,4 @@
 import math
-import functools
 from typing import Callable, Optional, Tuple, Union, Sequence, Iterable, Any
 
 import jax
@@ -17,6 +16,7 @@ from haxllm.model.efficient_attention import (
 )
 from haxllm.gconfig import get_remat_policy
 from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.model.quantize import QConfig, QuantMethod
 
 
 default_kernel_init = initializers.lecun_normal()
@@ -53,20 +53,6 @@ class RMSNorm(nn.Module):
         return jnp.asarray(x, self.dtype)
 
 
-Q_BLOCK_SIZE = 32
-
-def dequantize(x, scale):
-    return x.astype(scale.dtype) / scale
-
-def block_dequantize(x, scale):
-    n_blocks = scale.shape[-1]
-    block_size = x.shape[-1] // scale.shape[-1]
-    original_shape = x.shape
-    x = x.reshape(*x.shape[:-1], n_blocks, block_size)
-    scale = jnp.expand_dims(scale, axis=-1)
-    return dequantize(x, scale).reshape(*original_shape)
-
-
 class DenseGeneral(nn.Module):
     features: Union[int, Sequence[int]]
     axis: Union[int, Sequence[int]] = -1
@@ -75,15 +61,17 @@ class DenseGeneral(nn.Module):
     param_dtype: Dtype = jnp.float32
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
-    quantize: bool = False
+    qconfig: Optional[QConfig] = None
 
     @nn.compact
     def __call__(self, inputs: Array) -> Array:
+        qconfig = self.qconfig
         features = _canonicalize_tuple(self.features)
         axis = _canonicalize_tuple(self.axis)
         ndim = inputs.ndim
         axis = _normalize_axes(axis, ndim)
         n_axis, n_features = len(axis), len(features)
+        zero_init = nn.initializers.zeros_init()
 
         def kernel_init_wrap(rng, shape, dtype=jnp.float32):
             flat_shape = (
@@ -91,22 +79,41 @@ class DenseGeneral(nn.Module):
                 math.prod(shape[-n_features:]),
             )
             flat_shape = jax.tree_map(int, flat_shape)
-            kernel_init = initializers.zeros_init() if self.quantize else self.kernel_init
+            kernel_init = initializers.zeros_init() if qconfig else self.kernel_init
             kernel = kernel_init(rng, flat_shape, dtype)
             if isinstance(kernel, meta.AxisMetadata):
+                # raise NotImplementedError
                 return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
             return jnp.reshape(kernel, shape)
 
-        expanded_batch_shape = tuple(1 for ax in range(inputs.ndim) if ax not in axis)
         kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
-        w_dtype = jnp.int8 if self.quantize else self.param_dtype
-        kernel = self.param("kernel", kernel_init_wrap, kernel_shape, w_dtype)
 
-        if self.quantize:
-            qscale_shape = kernel_shape[:-1] + (kernel_shape[-1] // Q_BLOCK_SIZE,)
+        if qconfig is None:
+            kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
+        elif qconfig.method == QuantMethod.gptq_q8_0:
+            kernel = self.param("kernel", kernel_init_wrap, kernel_shape, qconfig.w_dtype)
+            qscale_shape = kernel_shape[:-1] + (kernel_shape[-1] // qconfig.block_size,)
             qscale = self.param(
-                "qscale", nn.initializers.ones, qscale_shape, self.param_dtype)
-            kernel = block_dequantize(kernel, qscale)
+                "qscale", nn.initializers.ones, qscale_shape, qconfig.q_dtype or self.param_dtype)
+            kernel = qconfig.dequantize({"kernel": kernel, "qscale": qscale})
+        elif qconfig.method == QuantMethod.awq_q4:
+            shape1 = int(math.prod(kernel_shape[0:n_axis]))
+            shape2 = int(math.prod(kernel_shape[-n_features:]))
+            bits_reduce = qconfig.w_bits * 2
+            qweight_shape = kernel_shape[:-1] + (kernel_shape[-1] // bits_reduce,)
+            qweight = self.param(
+                "kernel", zero_init, qweight_shape, qconfig.w_dtype)
+            qweight = qweight.reshape(shape1, shape2 // bits_reduce)
+            zeros_shape = shape1 // qconfig.group_size, shape2
+            zeros = self.param(
+                "zeros", zero_init, zeros_shape, jnp.int8)
+            scales_shape = shape1 // qconfig.group_size, shape2
+            scales = self.param(
+                "scales", zero_init, scales_shape, qconfig.q_dtype or self.param_dtype)
+            kernel = qconfig.dequantize(
+                {"qweight": qweight, "zeros": zeros, "scales": scales})
+            kernel = kernel.reshape(kernel_shape)
+        kernel = kernel.astype(self.param_dtype)
 
         contract_ind = tuple(range(0, n_axis))
 
@@ -117,7 +124,7 @@ class DenseGeneral(nn.Module):
                 if isinstance(bias, meta.AxisMetadata):
                     return meta.replace_boxed(bias, jnp.reshape(bias.unbox(), shape))
                 return jnp.reshape(bias, shape)
-            bias = self.param("bias", bias_init_wrap, features, w_dtype)
+            bias = self.param("bias", bias_init_wrap, features, self.param_dtype)
         else:
             bias = None
 
@@ -131,6 +138,7 @@ class DenseGeneral(nn.Module):
         # dot_general output has shape [/group_dims] + [feature_dims]
         if self.use_bias:
             # expand bias shape to broadcast bias over batch dims.
+            expanded_batch_shape = tuple(1 for ax in range(inputs.ndim) if ax not in axis)
             bias = jnp.reshape(bias, expanded_batch_shape + features)
             out += bias
         return out

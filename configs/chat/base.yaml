@@ -12,7 +12,7 @@ hydra:
 seed: 0
 dtype: auto
 param_dtype: auto
-quantize: False
+qconfig: null
 mesh: auto
 
 max_len: null

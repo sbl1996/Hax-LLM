@@ -11,6 +11,7 @@ from haxllm.model.mixin import RematScanConfigMixin
 from haxllm.chat.setting import register_chat_setting
 from haxllm.model.llama import remap_state_dict as llama_remap_state_dict
 from haxllm.model.qwen import encode_message
+from haxllm.model.quantize import QConfig
 
 
 config_hub = {
@@ -103,7 +104,7 @@ class TransformerConfig(RematScanConfigMixin):
     decode: bool = False
     shard: bool = False
     shard_cache: bool = False
-    quantize: bool = False
+    qconfig: Optional[QConfig] = None
 
 
 def get_chat_setting(name=None):
@@ -148,7 +149,7 @@ class TransformerBlock(nn.Module):
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
-            quantize=config.quantize,
+            qconfig=config.qconfig,
             name="attn")(x, mask, padding_mask)
 
         x = x + inputs
@@ -163,7 +164,7 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
-            quantize=config.quantize,
+            qconfig=config.qconfig,
             name="mlp")(y)
 
         y = x + y

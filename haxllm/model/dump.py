@@ -1,6 +1,8 @@
 import os
 import json
-import argparse
+from typing import List, Optional
+from dataclasses import dataclass
+import tyro
 
 import importlib
 from pathlib import Path
@@ -14,6 +16,7 @@ import jax.numpy as jnp
 from flax.traverse_util import flatten_dict
 
 from haxllm.utils import has_bf16_in_safetensors
+from haxllm.model.quantize import QConfig
 
 
 def tensor_to_numpy(v):
@@ -29,7 +32,7 @@ def load_from_torch_bin_files(bin_files):
     tensors = {}
     import torch
     for f in bin_files:
-        print("Loading from {}".format(f))
+        print("Load from {}".format(f))
         d = torch.load(f, map_location="cpu")
         for k in list(d.keys()):
             if k in tensors:
@@ -42,7 +45,7 @@ def load_from_torch_bin_files(bin_files):
 def load_from_safetensors_files(files):
     tensors = {}
     for f in files:
-        print("Loading from {}".format(f))
+        print("Load from {}".format(f))
         if has_bf16_in_safetensors(f):
             np.bfloat16 = jnp.bfloat16
         with safe_open(f, framework="numpy", device='cpu') as f:
@@ -91,29 +94,36 @@ def check_safetensors_ckpt(model_dir):
 def check_torch_ckpt(model_dir):
     return check_ckpt(model_dir, "bin")
 
+@dataclass
+class Args:
+    model: str
+    """Model family available in haxllm.model"""
+    source: str
+    """Path to the model checkpoint file or directory, can be remote huggingface hub"""
+    output: str = "."
+    """Output path to save the dumped model"""
+    type: Optional[str] = None
+    """Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension"""
+    dim: Optional[int] = None
+    """Dimension of the head, if not specified, will try to infer from the model config"""
+    qconfig: Optional[str] = None
+    """Path to the qconfig file, if not specified, do not quantize the model"""
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--model-family", type=str, required=True,
-                        help="Model family available in haxllm.model")
-    parser.add_argument("-s", "--source", type=str, required=True,
-                        help="Path to the model checkpoint file or directory, can be remote huggingface hub")
-    parser.add_argument("-o", "--output", type=str, default=".",
-                        help="Output path to save the dumped model")
-    parser.add_argument("-t", "--type", type=str, default=None,
-                        help="Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension")
-    parser.add_argument("-d", "--dim", type=int, default=None,
-                        help="Dimension of the head, if not specified, will try to infer from the model config")
-    parser.add_argument("-q", "--quantize", default=False, action='store_true',
-                        help="Whether to quantize the model to int8, default is False")
-
-    args = parser.parse_args()
-    mod_name = "haxllm.model.{}".format(args.model_family)
+    args = tyro.cli(Args)
+    mod_name = "haxllm.model.{}".format(args.model)
     print("Using {}".format(mod_name))
     mod = importlib.import_module(mod_name)
 
     bin_files = None
     model_name = None
+
+    if args.qconfig:
+        with open(args.qconfig, 'r') as f:
+            qconfig = QConfig.from_json(f.read())
+    else:
+        qconfig = None
 
     source = args.source
     if not os.path.exists(os.path.expanduser(source)):
@@ -177,7 +187,9 @@ if __name__ == "__main__":
         assert not target.exists(), "Target file already exists: {}".format(target)
         save_path = target
 
-    tensors = mod.remap_state_dict(tensors, head_dim=args.dim, quantize=args.quantize)
+    if qconfig is not None:
+        print("Quantize model with {}".format(qconfig))
+    tensors = mod.remap_state_dict(tensors, head_dim=args.dim, qconfig=qconfig)
     tensors = flatten_dict(tensors, sep=".")
-    print("Saving to {}".format(save_path))
+    print("Save model to {}".format(save_path))
     save_file(tensors, save_path)

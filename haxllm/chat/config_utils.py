@@ -1,5 +1,6 @@
+from typing import Tuple
 import os
-import importlib
+import json
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -11,9 +12,10 @@ from transformers import AutoTokenizer
 from haxllm.pipeline.text_generation import ChatPipeline, TextGenerationPipeline
 from haxllm.config_utils import get_module
 from haxllm.model.utils import load_config as _load_config, load_model_cls
+from haxllm.model.quantize import QConfig
 
 
-def load_config(cfg: DictConfig, chat: bool = True):
+def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipeline, str, int]:
     model_name = getattr(cfg, "model", None)
     if model_name is None:
         raise ValueError("Model name not specified")
@@ -73,17 +75,20 @@ def load_config(cfg: DictConfig, chat: bool = True):
     parallel = mesh is not None
 
     peft = getattr(cfg, "peft", None)
-    quantize = getattr(cfg, "quantize", False)
+    qconfig = getattr(cfg, "qconfig", None)
     mod = get_module(template_config.pop("family"), peft)
 
-    if quantize:
-        print("Loading int8 model...")
+    if qconfig:
+        with open(qconfig, 'r') as f:
+            qconfig = f.read()
+        qconfig = QConfig.from_json(qconfig)
+        print(f"Load int8 model with qconfig {qconfig}")
     model_config = {"name": model_name, "dtype": dtype, "param_dtype": param_dtype, **template_config}
     config = _load_config(
         mod,
         **model_config,
         decode=True,
-        quantize=quantize,
+        qconfig=qconfig,
         shard=parallel,
         padding_left=tokenizer.padding_side == "left",
     )
@@ -101,6 +106,6 @@ def load_config(cfg: DictConfig, chat: bool = True):
     Pipeline = ChatPipeline if chat else TextGenerationPipeline
     pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,
-        temperature=temperature, top_p=top_p, top_k=top_k)
+        temperature=temperature, top_p=top_p, top_k=top_k, max_new_tokens=max_new_tokens)
     pipeline.init(transformer_weight=checkpoint, mesh=mesh)
     return pipeline, conv_template, max_new_tokens

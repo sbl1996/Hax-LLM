@@ -3,6 +3,8 @@ from typing import Union, List, Tuple
 import warnings
 from functools import partial
 
+from tokenizers import Tokenizer
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -34,7 +36,7 @@ def init_mesh(mesh):
 
 class TextGenerationPipeline:
 
-    def __init__(self, tokenizer, model, max_len=512, seed=None, rng=None,
+    def __init__(self, tokenizer: Tokenizer, model, max_len=512, seed=None, rng=None,
                  two_stage=False, pad_multiple=512, temperature=1.0, top_k=-1,
                  top_p=1.0, repetition_penalty=1.0,
                  max_new_tokens=None, stop_token_ids=None, verbose=True):

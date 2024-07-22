@@ -37,7 +37,9 @@ def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interva
     offset = len(input_ids)
     live_seq[:offset] = input_ids
 
-    max_new_tokens = int(params.get("max_new_tokens") or (max_len - input_echo_len - 8))
+    max_allowed = max_len - input_echo_len - 8
+    max_new_tokens = int(params.get("max_new_tokens") or max_allowed)
+    max_new_tokens = min(max_new_tokens, max_allowed)
 
     # TODO: why 8?
     max_src_len = max_len - max_new_tokens - 8

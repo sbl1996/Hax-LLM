@@ -126,6 +126,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         "repetition_penalty": repetition_penalty,
         "max_len": request.max_length or model.max_len,
         "stop_token_ids": conv.config.stop_token_ids,
+        "max_new_tokens": model.max_new_tokens,
     }
 
     if request.stream:
@@ -161,9 +162,14 @@ async def predict(prompt, gen_params, model_id: str):
 
     gen_params["prompt"] = prompt
     output_stream = generate_stream(model, gen_params)
-
+    
+    start = time.time()
+    times = []
     pre = 0
     for outputs in output_stream:
+        end = time.time()
+        times.append(end - start)
+        start = end
         output_text = outputs["text"]
         usage = outputs["usage"]
         # More fluent, but more requests, and more likely to be cut off
@@ -183,7 +189,15 @@ async def predict(prompt, gen_params, model_id: str):
             chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
             yield "{}".format(chunk.model_dump_json(exclude_unset=True))
             pre = now
-    print(f"prompt: {usage['prompt_tokens']}, completion: {usage['completion_tokens']}, total: {usage['total_tokens']}")
+    times = times[:-1]
+    prefill_time = times[0]
+    decode_time = sum(times[1:])
+    prefill_tps = usage['prompt_tokens'] / prefill_time
+    decode_tps = usage['completion_tokens'] / decode_time
+    print(
+        f"prompt: {usage['prompt_tokens']}/{prefill_time:.3f}/{prefill_tps:.2f}, "
+        f"completion: {usage['completion_tokens']}/{decode_time:.3f}/{decode_tps:.2f}, "
+        f"total: {usage['total_tokens']}")
     new_text = "".join(output_text[pre:])
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,

@@ -1,11 +1,12 @@
 from typing import Callable, Any, Optional
 
+import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.quantize import block_abs_max_int8_quantize
+from haxllm.model.quantize import QConfig, QuantMethod
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin
@@ -214,7 +215,7 @@ class TransformerModel(nn.Module):
             features=config.hidden_size,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            shard_axes={"embedding": (None, "Y")},
+            shard_axes={"embedding": ("X", "Y")},
             shard=config.shard,
             name="wte")(inputs)
 
@@ -263,10 +264,10 @@ class TransformerLMHeadModel(nn.Module):
             config=config, name="transformer")(inputs=input_ids, train=train)
 
         if config.decode:
-            shard_axes = {"kernel": ("Y", None)}
+            shard_axes = {"kernel": ("Y", "X")}
         else:
             # shard output in training to avoid out of memory
-            shard_axes = {'kernel': (None, 'Y')}
+            shard_axes = {'kernel': ("X", 'Y')}
 
         x = DenseGeneral(
             config.vocab_size,
@@ -280,7 +281,7 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, head_dim=None, quantize=False):
+def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
     rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
@@ -289,7 +290,20 @@ def remap_state_dict(state_dict, head_dim=None, quantize=False):
     elif head_dim is None:
         head_dim = 128
     n_heads = hidden_size  // head_dim
-    n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.weight'].shape[0] // head_dim
+    if qconfig and qconfig.method == QuantMethod.awq_q4:
+        q_key = 'model.layers.0.self_attn.q_proj.'
+        qweight = state_dict[q_key + 'qweight']
+        scales = state_dict[q_key + 'scales']
+        bits = scales.shape[-1] // qweight.shape[-1] // 2
+        assert qconfig.w_bits == bits
+        group_size = qweight.shape[0] // scales.shape[0]
+        assert qconfig.group_size == group_size
+        head_dim_q = head_dim // (bits * 2)
+        hidden_size_g = hidden_size // group_size
+        hidden_size_q = hidden_size // (bits * 2)
+        n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
+    else:
+        n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.weight'].shape[0] // head_dim
 
     root = {}
     root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight")}
@@ -298,51 +312,78 @@ def remap_state_dict(state_dict, head_dim=None, quantize=False):
         block_d = {}
         block_d["ln_1"] = {"scale": state_dict.pop(
             f"model.layers.{d}.input_layernorm.weight")}
-        block_d["attn"] = {
-            "query": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.q_proj.weight").T.reshape(hidden_size, n_heads, head_dim),
-            },
-            "key": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.k_proj.weight").T.reshape(hidden_size, n_kv_heads, head_dim),
-            },
-            "value": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.v_proj.weight").T.reshape(hidden_size, n_kv_heads, head_dim),
-            },
-            "out": {
-                "kernel": state_dict.pop(f"model.layers.{d}.self_attn.o_proj.weight").T.reshape(n_heads, head_dim, hidden_size),
-            },
-        }
-        for part_k, part in [("query", "q"), ("key", "k"), ("value", "v"), ("out", "o")]:
-            bias = state_dict.pop(f"model.layers.{d}.self_attn.{part}_proj.bias", None)
+        block_d["attn"] = {}
+        for part in ["query", "key", "value", "out"]:
+            if qconfig and qconfig.method == QuantMethod.awq_q4:
+                qweight = state_dict.pop(f"model.layers.{d}.self_attn.{part[0]}_proj.qweight")
+                qzeros = state_dict.pop(f"model.layers.{d}.self_attn.{part[0]}_proj.qzeros")
+                scales = state_dict.pop(f"model.layers.{d}.self_attn.{part[0]}_proj.scales")
+                if part == 'query':
+                    qweight = qweight.reshape(hidden_size, n_heads, head_dim_q)
+                    qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim_q)
+                    scales = scales.reshape(hidden_size_g, n_heads*head_dim)
+                elif part in ['key', 'value']:
+                    qweight = qweight.reshape(hidden_size, n_kv_heads, head_dim_q)
+                    qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim_q)
+                    scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
+                else:
+                    qweight = qweight.reshape(n_heads, head_dim, hidden_size_q)
+                    qzeros = qzeros.reshape(hidden_size_g, hidden_size_q)
+                    scales = scales.reshape(hidden_size_g, hidden_size)
+                params = {"kernel": qweight, "zeros": qzeros, "scales": scales}
+            else:
+                kernel = state_dict.pop(f"model.layers.{d}.self_attn.{part[0]}_proj.weight").T
+                if part == 'query':
+                    kernel = kernel.reshape(hidden_size, n_heads, head_dim)
+                elif part in ['key', 'value']:
+                    kernel = kernel.reshape(hidden_size, n_kv_heads, head_dim)
+                else:
+                    kernel = kernel.reshape(n_heads, head_dim, hidden_size)
+                params = {"kernel": kernel}
+
+            bias = state_dict.pop(f"model.layers.{d}.self_attn.{part[0]}_proj.bias", None)
             if bias is not None:
-                if part == 'q':
+                if part == 'query':
                     bias = bias.reshape(n_heads, head_dim)
-                elif part in ['k', 'v']:
+                elif part in ['key', 'value']:
                     bias = bias.reshape(n_kv_heads, head_dim)
                 else:
                     bias = bias.reshape(hidden_size)
-                block_d["attn"][part_k]["bias"] = bias
+                params["bias"] = bias
+
+            block_d["attn"][part] = params
         block_d["ln_2"] = {"scale": state_dict.pop(
             f"model.layers.{d}.post_attention_layernorm.weight")}
-        block_d["mlp"] = {
-            "gate": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.gate_proj.weight").T},
-            "up": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.up_proj.weight").T},
-            "down": {"kernel": state_dict.pop(f"model.layers.{d}.mlp.down_proj.weight").T},
-        }
+        block_d["mlp"] = {}
         for part in ["gate", "up", "down"]:
+            if qconfig and qconfig.method == QuantMethod.awq_q4:
+                qweight = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.qweight")
+                qzeros = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.qzeros")
+                scales = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.scales")
+                params = {"kernel": qweight, "zeros": qzeros, "scales": scales}
+            else:
+                kernel = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.weight").T
+                params = {"kernel": kernel}
             bias = state_dict.pop(f"model.layers.{d}.mlp.{part}_proj.bias", None)
             if bias is not None:
-                block_d["mlp"][part]["bias"] = bias
+                params["bias"] = bias
+            block_d["mlp"][part] = params
 
-        if quantize:
-            to_quantize = ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]
-            for l in to_quantize:
-                l1, l2 = l.split(".")
-                dense = block_d[l1][l2]
-                w = dense["kernel"]
-                w, qscale = block_abs_max_int8_quantize(w)
-                dense["kernel"] = w
-                dense["qscale"] = qscale
+        if qconfig:
+            if qconfig.method == QuantMethod.gptq_q8_0:
+                for l in qconfig.q_layers:
+                    l1, l2 = l.split(".")
+                    dense = block_d[l1][l2]
+                    q_results = qconfig.quantize(dense["kernel"])
+                    for k, v in q_results.items():
+                        dense[k] = v
+            elif qconfig.method == QuantMethod.awq_q4:
+                for l in qconfig.q_layers:
+                    l1, l2 = l.split(".")
+                    dense = block_d[l1][l2]
+                    q_results = qconfig.requantize(dense["kernel"], dense["zeros"])
+                    for k, v in q_results.items():
+                        dense[k] = v
         root[f"h_{d}"] = block_d
 
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
