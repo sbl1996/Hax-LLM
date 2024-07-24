@@ -90,16 +90,21 @@ class DenseGeneral(nn.Module):
 
         if qconfig is None:
             kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
-        elif qconfig.method == QuantMethod.rtn_q8_0:
-            kernel = self.param("kernel", kernel_init_wrap, kernel_shape, qconfig.w_dtype)
-            scales_shape = kernel_shape[:-1] + (kernel_shape[-1] // qconfig.block_size,)
-            scales = self.param(
-                "scales", nn.initializers.ones, scales_shape, qconfig.q_dtype or self.param_dtype)
-            kernel = qconfig.dequantize({"kernel": kernel, "scales": scales})
-        elif qconfig.method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
+        # elif qconfig.method == QuantMethod.rtn_q8_0:
+        #     shape1 = int(math.prod(kernel_shape[0:n_axis]))
+        #     shape2 = int(math.prod(kernel_shape[-n_features:]))
+        #     qweight = self.param("kernel", zero_init, kernel_shape, qconfig.w_dtype)
+        #     qweight = qweight.reshape(shape1, shape2)
+        #     scales_shape = shape1 // qconfig.group_size, shape2
+        #     scales = self.param(
+        #         "scales", zero_init, scales_shape, qconfig.q_dtype or self.param_dtype)
+        #     q_params = {"qweight": qweight, "scales": scales}
+        #     kernel = qconfig.dequantize(q_params)
+        #     kernel = kernel.reshape(kernel_shape)
+        elif qconfig.method in [QuantMethod.awq_q4, QuantMethod.gptq_q4, QuantMethod.rtn_q8_0]:
             shape1 = int(math.prod(kernel_shape[0:n_axis]))
             shape2 = int(math.prod(kernel_shape[-n_features:]))
-            bits_reduce = qconfig.w_bits * 2
+            bits_reduce = qconfig.w_bits // qconfig.q_bits
             qweight_shape = kernel_shape[:-1] + (kernel_shape[-1] // bits_reduce,)
             qweight = self.param(
                 "kernel", zero_init, qweight_shape, qconfig.w_dtype)

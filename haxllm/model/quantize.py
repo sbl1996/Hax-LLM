@@ -15,11 +15,17 @@ class QuantMethod(enum.Enum):
     awq_q4 = 1
     gptq_q4 = 2
 
+dtype_to_bits = {
+    jnp.float32: 32,
+    jnp.float16: 16,
+    jnp.bfloat16: 16,
+    jnp.int8: 8,
+    jnp.int32: 32,
+}
 
 @dataclass
 class QConfig:
     method: QuantMethod = QuantMethod.rtn_q8_0
-    block_size: int = 32
     group_size: int = 128
     sym: bool = False
     q_dtype: Optional[jnp.dtype] = None
@@ -34,7 +40,7 @@ class QConfig:
             assert not self.sym
 
     @property
-    def w_bits(self):
+    def q_bits(self):
         if self.method == QuantMethod.rtn_q8_0:
             return 8
         elif self.method == QuantMethod.awq_q4:
@@ -43,6 +49,10 @@ class QConfig:
             return 4
         else:
             raise NotImplementedError
+
+    @property
+    def w_bits(self):
+        return dtype_to_bits[self.w_dtype]
 
     @property
     def w_dtype(self):
@@ -58,14 +68,14 @@ class QConfig:
     def quantize(self, *args):
         if self.method == QuantMethod.rtn_q8_0:
             w, = args
-            w, scale = block_abs_max_int8_quantize(w, block_size=self.block_size, q_dtype=self.q_dtype)
+            w, scale = group_abs_max_int8_quantize(w, group_size=self.group_size, q_dtype=self.q_dtype)
             return w, scale
         else:
             raise NotImplementedError
 
     def dequantize(self, q):
         if self.method == QuantMethod.rtn_q8_0:
-            return block_dequantize(q["kernel"], q["scales"])
+            return group_dequantize(q["qweight"], 0, q["scales"])
         elif self.method == QuantMethod.awq_q4:
             return dequantize2(q["qweight"], q["zeros"][:, None], q["scales"])
         elif self.method == QuantMethod.gptq_q4:
@@ -91,7 +101,7 @@ class QConfig:
 
     def __str__(self):
         if self.method == QuantMethod.rtn_q8_0:
-            return f"QConfig(method={self.method}, block_size={self.block_size}, sym={self.sym}, q_dtype={self.q_dtype}), q_layers={self.q_layers}"
+            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}), q_layers={self.q_layers}"
         elif self.method == QuantMethod.awq_q4:
             return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
         elif self.method == QuantMethod.gptq_q4:
@@ -104,7 +114,6 @@ class QConfig:
             {
                 "method": self.method.name,
                 "sym": self.sym,
-                "block_size": self.block_size,
                 "group_size": self.group_size,
                 "q_dtype": self.q_dtype.dtype.name if self.q_dtype is not None else None,
                 "q_layers": self.q_layers,
@@ -120,21 +129,9 @@ class QConfig:
             q_dtype=jnp.dtype(data["q_dtype"]) if data["q_dtype"] is not None else None,
             q_layers=tuple(data["q_layers"]),
         )
-        if "block_size" in data:
-            kwargs["block_size"] = data["block_size"]
         if "group_size" in data:
             kwargs["group_size"] = data["group_size"]
         return cls(**kwargs)
-
-
-def block_dequantize(x, scale):
-    n_blocks = scale.shape[-1]
-    block_size = x.shape[-1] // scale.shape[-1]
-    original_shape = x.shape
-    x = x.reshape(*x.shape[:-1], n_blocks, block_size)
-    scale = jnp.expand_dims(scale, axis=-1)
-    x = x.astype(scale.dtype) * scale
-    return x.reshape(*original_shape)
 
 
 def np_roundf(n):
@@ -144,8 +141,8 @@ def np_roundf(n):
     return jnp.sign(n) * b
 
 
-@jax.jit
-def jit_abs_max_int8_quantize(x):
+@partial(jax.jit, static_argnums=(1,))
+def abs_max_int8_quantize(x, axis=-1):
     """
     Perform abs max int8 quantization on the input array.
     
@@ -156,22 +153,22 @@ def jit_abs_max_int8_quantize(x):
     tuple: Quantized array (int8), scale factor (float)
     """
     x = x.astype(jnp.float32, copy=False)
-    d = jnp.abs(x).max(axis=-1, keepdims=True) / 127
+    d = jnp.abs(x).max(axis=axis, keepdims=True) / 127
     id = jnp.where(d == 0, 0, 1 / d)
     qs = np_roundf(x * id)
     qs = qs.astype(jnp.int8)
-    return qs, d.squeeze(-1)
+    return qs, d.squeeze(axis)
 
 
-def block_abs_max_int8_quantize(x, block_size, q_dtype):
+def group_abs_max_int8_quantize(x, group_size, q_dtype):
     if q_dtype is None:
         q_dtype = x.dtype
-    x = x.reshape(*x.shape[:-1], -1, block_size)
+    x = x.reshape(-1, group_size, *x.shape[1:])
     x = jnp.array(x)
-    x, scale = jit_abs_max_int8_quantize(x)
+    x, scale = abs_max_int8_quantize(x, axis=1)
     x = np.array(x)
     scale = np.array(scale, dtype=q_dtype)
-    x = x.reshape(*x.shape[:-2], -1)
+    x = x.reshape(-1, *x.shape[2:])
     return x, scale
 
 

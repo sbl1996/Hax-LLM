@@ -302,15 +302,16 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
         half_dtype = scales.dtype
         # bits = scales.shape[-1] // qweight.shape[-1] // 2
         bits = 4
-        assert qconfig.w_bits == bits
+        assert qconfig.q_bits == bits
+        bits_reduce = qconfig.w_bits // qconfig.q_bits
         if q_method == QuantMethod.awq_q4:
             group_size = qweight.shape[0] // scales.shape[0]
         else:
-            group_size = qweight.shape[0] * (bits * 2) // scales.shape[0]
+            group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
         assert qconfig.group_size == group_size
-        head_dim_q = head_dim // (bits * 2)
+        head_dim_q = head_dim // bits_reduce
         hidden_size_g = hidden_size // group_size
-        hidden_size_q = hidden_size // (bits * 2)
+        hidden_size_q = hidden_size // bits_reduce
         n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
     assert half_dtype in [jnp.bfloat16, jnp.float16]
 
@@ -326,14 +327,15 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
         for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
             dst_l, part = name.split('.')
             if dst_l == 'attn':
-                src_l = "self_attn"
-                src_l2 = part[0]
+                src_l, src_l2 = "self_attn", part[0]
             else:
-                src_l = "mlp"
-                src_l2 = part
+                src_l, src_l2 = "mlp", part
             prefix = f"model.layers.{d}.{src_l}.{src_l2}_proj"
             if q_method is None or q_method == QuantMethod.rtn_q8_0:
                 kernel = state_dict.pop(f"{prefix}.weight").T
+                quantize = q_method == QuantMethod.rtn_q8_0 and name in qconfig.q_layers
+                if quantize:
+                    kernel, scales = qconfig.quantize(kernel)
                 if part == 'query':
                     kernel = kernel.reshape(hidden_size, n_heads, head_dim)
                 elif part in ['key', 'value']:
@@ -341,9 +343,8 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
                 elif part == 'out':
                     kernel = kernel.reshape(n_heads, head_dim, hidden_size)
                 params = {"kernel": kernel}
-                if q_method == QuantMethod.rtn_q8_0 and name in qconfig.q_layers:
-                    kernel, scales = qconfig.quantize(kernel)
-                    params = {"kernel": kernel, "scales": scales}
+                if quantize:
+                    params['scales'] = scales
             elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
                 qweight = state_dict.pop(f"{prefix}.qweight")
                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
