@@ -9,84 +9,103 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+
 class QuantMethod(enum.Enum):
-    gptq_q8_0 = 0
+    rtn_q8_0 = 0
     awq_q4 = 1
+    gptq_q4 = 2
 
 
 @dataclass
 class QConfig:
-    method: QuantMethod = QuantMethod.gptq_q8_0
+    method: QuantMethod = QuantMethod.rtn_q8_0
     block_size: int = 32
     group_size: int = 128
+    sym: bool = False
     q_dtype: Optional[jnp.dtype] = None
     q_layers: Sequence[str] = ("attn.out", "mlp.gate", "mlp.up", "mlp.down")
 
     def __post_init__(self):
         for l in self.q_layers:
             assert l in ("attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"), f"Invalid layer: {l}"
+        if self.method in [QuantMethod.rtn_q8_0, QuantMethod.gptq_q4]:
+            assert self.sym
+        elif self.method in [QuantMethod.awq_q4]:
+            assert not self.sym
 
     @property
     def w_bits(self):
-        if self.method == QuantMethod.gptq_q8_0:
+        if self.method == QuantMethod.rtn_q8_0:
             return 8
         elif self.method == QuantMethod.awq_q4:
+            return 4
+        elif self.method == QuantMethod.gptq_q4:
             return 4
         else:
             raise NotImplementedError
 
     @property
     def w_dtype(self):
-        if self.method == QuantMethod.gptq_q8_0:
+        if self.method == QuantMethod.rtn_q8_0:
             return jnp.int8
         elif self.method == QuantMethod.awq_q4:
+            return jnp.int32
+        elif self.method == QuantMethod.gptq_q4:
             return jnp.int32
         else:
             raise NotImplementedError
     
-    def quantize(self, w):
-        if self.method == QuantMethod.gptq_q8_0:
+    def quantize(self, *args):
+        if self.method == QuantMethod.rtn_q8_0:
+            w, = args
             w, scale = block_abs_max_int8_quantize(w, block_size=self.block_size, q_dtype=self.q_dtype)
-            return {
-                "kernel": w,
-                "qscale": scale
-            }
+            return w, scale
         else:
             raise NotImplementedError
 
     def dequantize(self, q):
-        if self.method == QuantMethod.gptq_q8_0:
-            return block_dequantize(q["kernel"], q["qscale"])
-        if self.method == QuantMethod.awq_q4:
-            return awq_dequantize(q["qweight"], q["zeros"], q["scales"])
+        if self.method == QuantMethod.rtn_q8_0:
+            return block_dequantize(q["kernel"], q["scales"])
+        elif self.method == QuantMethod.awq_q4:
+            return dequantize2(q["qweight"], q["zeros"][:, None], q["scales"])
+        elif self.method == QuantMethod.gptq_q4:
+            return dequantize2(q["qweight"], 8, q["scales"])
         else:
             raise NotImplementedError
 
-    def requantize(self, qweight, qzeros):
+    def requantize(self, *args):
         if self.method == QuantMethod.awq_q4:
+            qweight, qzeros = args
             weight, zeros = jax.tree.map(
                 lambda x: unpack(jnp.array(x)), (qweight, qzeros))
-            weight = pack2(weight)
-            weight = np.array(weight)
+            weight = np.array(pack2(weight))
             zeros = np.array(zeros)
-            return {
-                "kernel": weight,
-                "zeros": zeros,
-            }
+            return weight, zeros
+        elif self.method == QuantMethod.gptq_q4:
+            qweight, qzeros = args
+            weight = unpack(jnp.array(qweight), 4, 'gptq')
+            weight = np.array(pack2(weight))
+            return weight, qzeros
         else:
             raise NotImplementedError
 
     def __str__(self):
-        if self.method == QuantMethod.gptq_q8_0:
-            return f"QConfig(method={self.method}, block_size={self.block_size}, q_dtype={self.q_dtype}), q_layers={self.q_layers}"
+        if self.method == QuantMethod.rtn_q8_0:
+            return f"QConfig(method={self.method}, block_size={self.block_size}, sym={self.sym}, q_dtype={self.q_dtype}), q_layers={self.q_layers}"
         elif self.method == QuantMethod.awq_q4:
-            return f"QConfig(method={self.method}, group_size={self.group_size}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
+            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
+        elif self.method == QuantMethod.gptq_q4:
+            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
+        else:
+            raise NotImplementedError
 
     def to_json(self):
         return json.dumps(
             {
                 "method": self.method.name,
+                "sym": self.sym,
                 "block_size": self.block_size,
+                "group_size": self.group_size,
                 "q_dtype": self.q_dtype.dtype.name if self.q_dtype is not None else None,
                 "q_layers": self.q_layers,
             }, indent=2,
@@ -97,6 +116,7 @@ class QConfig:
         data = json.loads(json_str)
         kwargs = dict(
             method=QuantMethod[data["method"]],
+            sym=data["sym"],
             q_dtype=jnp.dtype(data["q_dtype"]) if data["q_dtype"] is not None else None,
             q_layers=tuple(data["q_layers"]),
         )
@@ -170,21 +190,34 @@ def reverse_awq_order(iweights, izeros, bits: int):
     return iweights, izeros
 
 
-@partial(jax.jit, static_argnums=(1,))
-def unpack(x, bits=4):
+@partial(jax.jit, static_argnums=(1, 2))
+def unpack(x, bits=4, variant='awq'):
     shifts = jnp.arange(0, 32, bits, dtype=x.dtype)
-    for i in range(x.ndim):
-        shifts = jnp.expand_dims(shifts, axis=0)
-    x = jnp.bitwise_right_shift(x[..., None], shifts).astype(jnp.int8)
-    x = x.reshape(*x.shape[:-2], -1)
-    x = reverse_awq_order(x, None, bits)[0]
+    if variant == 'awq':
+        for i in range(x.ndim):
+            shifts = jnp.expand_dims(shifts, axis=0)
+        axis = -1
+    elif variant == 'gptq':
+        shifts = shifts[None, :]
+        for i in range(x.ndim - 1):
+            shifts = jnp.expand_dims(shifts, axis=-1)
+        axis = 1
+    x = jnp.expand_dims(x, axis=axis)
+    x = jnp.bitwise_right_shift(x, shifts).astype(jnp.int8)
+    if variant == 'awq':
+        x = x.reshape(*x.shape[:-2], -1)
+        x = reverse_awq_order(x, None, bits)[0]
+    else:
+        x = x.reshape(-1, *x.shape[2:])
     x = jnp.bitwise_and(x, (2**bits)-1)
     return x
+
 
 @partial(jax.jit, static_argnums=(1,))
 def pack2(x, bits=4):
     assert bits == 4
     return (x[..., ::2] * 16 + x[..., 1::2]).view(jnp.int32)
+
 
 @partial(jax.jit, static_argnums=(1,))
 def unpack2(x, bits=4):
@@ -195,6 +228,20 @@ def unpack2(x, bits=4):
     x = x.reshape(*x.shape[:-2], -1)
     x = x.view(jnp.int8)
     return x
+
+
+def group_dequantize(qweight, qzeros, scales):
+    group_size = qweight.shape[0] // scales.shape[0]
+    qweight = qweight.reshape(-1, group_size, *qweight.shape[1:])
+    weight = (qweight - qzeros) * scales[:, None]
+    weight = weight.reshape(-1, *weight.shape[2:])
+    return weight
+
+
+def dequantize2(iweight, qzeros, scales):
+    bits = scales.shape[-1] // iweight.shape[-1] // 2
+    qweight = unpack2(iweight, bits)
+    return group_dequantize(qweight, qzeros, scales)
 
 
 # def unpack_awq(qweight, qzeros, bits: int):
@@ -233,21 +280,3 @@ def unpack2(x, bits=4):
 #     iweight = iweight.reshape(-1, *iweight.shape[2:])
 
 #     return iweight
-
-
-def awq_dequantize(iweight, qzeros, scales):
-    bits = scales.shape[-1] // iweight.shape[-1] // 2
-    qweight = unpack2(iweight, bits)
-    # qweight = unpack(iweight, bits)
-    # qweight = unpack2(pack2(qweight), bits)
-
-    group_size = qweight.shape[0] // scales.shape[0]
-    qzeros = jnp.repeat(qzeros, group_size, axis=0)
-    scales = jnp.repeat(scales, group_size, axis=0)
-    weight = (qweight - qzeros) * scales
-
-    # qweight = qweight.reshape(-1, group_size, *qweight.shape[1:])
-    # qweight = (qweight - qzeros[:, None]) * scales[:, None]
-    # qweight = qweight.reshape(-1, *qweight.shape[2:])
-
-    return weight

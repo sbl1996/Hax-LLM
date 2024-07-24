@@ -9,10 +9,14 @@ DESCRIPTION = "Hastur's experiments in scaling LLM to 10B+ parameters with JAX a
 URL = 'https://github.com/sbl1996/Hax-LLM'
 EMAIL = 'sbl1996@126.com'
 AUTHOR = 'Hastur'
-REQUIRES_PYTHON = '>=3.8.0'
+REQUIRES_PYTHON = '>=3.10.0'
 VERSION = None
 
 REQUIRED = [
+    "hydra-core",
+    "transformers",
+    "sse_starlette",
+    "safetensors",
 ]
 
 here = os.path.dirname(os.path.abspath(__file__))

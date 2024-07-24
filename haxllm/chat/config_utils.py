@@ -82,7 +82,7 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
         with open(qconfig, 'r') as f:
             qconfig = f.read()
         qconfig = QConfig.from_json(qconfig)
-        print(f"Load int8 model with qconfig {qconfig}")
+        print(f"Load quantized model with qconfig {qconfig}")
     model_config = {"name": model_name, "dtype": dtype, "param_dtype": param_dtype, **template_config}
     config = _load_config(
         mod,
