@@ -90,25 +90,25 @@ class DenseGeneral(nn.Module):
 
         if qconfig is None:
             kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
-        # elif qconfig.method == QuantMethod.rtn_q8_0:
-        #     shape1 = int(math.prod(kernel_shape[0:n_axis]))
-        #     shape2 = int(math.prod(kernel_shape[-n_features:]))
-        #     qweight = self.param("kernel", zero_init, kernel_shape, qconfig.w_dtype)
-        #     qweight = qweight.reshape(shape1, shape2)
-        #     scales_shape = shape1 // qconfig.group_size, shape2
-        #     scales = self.param(
-        #         "scales", zero_init, scales_shape, qconfig.q_dtype or self.param_dtype)
-        #     q_params = {"qweight": qweight, "scales": scales}
-        #     kernel = qconfig.dequantize(q_params)
-        #     kernel = kernel.reshape(kernel_shape)
         elif qconfig.method in [QuantMethod.awq_q4, QuantMethod.gptq_q4, QuantMethod.rtn_q8_0]:
             shape1 = int(math.prod(kernel_shape[0:n_axis]))
             shape2 = int(math.prod(kernel_shape[-n_features:]))
-            bits_reduce = qconfig.w_bits // qconfig.q_bits
-            qweight_shape = kernel_shape[:-1] + (kernel_shape[-1] // bits_reduce,)
+            if qconfig.w_bits == qconfig.q_bits:
+                div1 = div2 = 1
+            elif qconfig.pack == 1:
+                div1, div2 = 1, 8
+            elif qconfig.pack == 2:
+                div1, div2 = 2, 4
+            elif qconfig.pack == 3:
+                div1, div2 = 8, 1
+            if qconfig.pack == 3 and len(kernel_shape) == 3 and kernel_shape[0] < kernel_shape[1]:
+                # TODO: HACK, out_proj (n_heads, head_dim, hidden_size)
+                qweight_shape = (kernel_shape[0], kernel_shape[1] // div1, kernel_shape[2] // div2)
+            else:
+                qweight_shape = (kernel_shape[0] // div1, *kernel_shape[1:-1], kernel_shape[-1] // div2)
             qweight = self.param(
                 "kernel", zero_init, qweight_shape, qconfig.w_dtype)
-            qweight = qweight.reshape(shape1, shape2 // bits_reduce)
+            qweight = qweight.reshape(shape1 // div1, shape2 // div2)
             scales_shape = shape1 // qconfig.group_size, shape2
             scales = self.param(
                 "scales", zero_init, scales_shape, qconfig.q_dtype or self.param_dtype)
@@ -118,7 +118,10 @@ class DenseGeneral(nn.Module):
                 zeros = self.param(
                     "zeros", zero_init, zeros_shape, jnp.int8)
                 q_params["zeros"] = zeros
+            # jax.debug.inspect_array_sharding(qweight, callback=lambda x: print(self.name, x))
+            # print(qweight.shape, scales.shape, kernel_shape)
             kernel = qconfig.dequantize(q_params)
+            # jax.debug.inspect_array_sharding(kernel, callback=lambda x: print(self.name, x))
             kernel = kernel.reshape(kernel_shape)
         kernel = kernel.astype(self.param_dtype)
 

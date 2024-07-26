@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
+from haxllm.model.quantize import QConfig
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin
@@ -146,6 +147,8 @@ class TransformerBlock(nn.Module):
             rope_theta=config.rope_theta,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
+            kv_shard_axes=("X", "Y", None),
+            kv_cache_shard_axes=(None, "X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
@@ -195,7 +198,7 @@ class TransformerModel(nn.Module):
             features=config.hidden_size,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            shard_axes={"embedding": (None, "Y")},
+            shard_axes={"embedding": ("X", "Y")},
             shard=config.shard,
             name="wte")(inputs)
 
@@ -244,10 +247,10 @@ class TransformerLMHeadModel(nn.Module):
             config=config, name="transformer")(inputs=input_ids, train=train)
 
         if config.decode:
-            shard_axes = {"kernel": ("Y", None)}
+            shard_axes = {"kernel": ("Y", "X")}
         else:
             # shard output in training to avoid out of memory
-            shard_axes = {'kernel': (None, 'Y')}
+            shard_axes = {'kernel': ("X", 'Y')}
 
         x = DenseGeneral(
             config.vocab_size,

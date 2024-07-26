@@ -11,7 +11,6 @@ import jax.numpy as jnp
 from jax import random
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
-from jax.experimental.pjit import pjit
 
 from flax.core.frozen_dict import unfreeze, freeze
 from flax.traverse_util import unflatten_dict, flatten_dict
@@ -126,7 +125,7 @@ class TextGenerationPipeline:
                 partial(init_fn, model=self.model), init_rng, input_ids)
             cache_spec = nn.get_partition_spec(abs_cache)
 
-            p_init_fn = pjit(
+            p_init_fn = jax.jit(
                 partial(init_fn, model=self.model), out_shardings=cache_spec)
             with mesh:
                 cache = p_init_fn(init_rng, input_ids)
@@ -158,9 +157,11 @@ class TextGenerationPipeline:
         self._rng, init_rng = random.split(self._rng)
         input_ids = jnp.zeros((1, self.max_len), dtype=jnp.int32)
 
-        def init_fn(init_rng, input_ids, model):
+        def init_fn(init_rng, input_ids, model, cache_only):
             state = model.init(init_rng, input_ids=input_ids)
             state = freeze(state)
+            if cache_only:
+                return state['cache']
             return state['params'], state['cache']
 
         mesh = init_mesh(mesh)
@@ -170,18 +171,18 @@ class TextGenerationPipeline:
             self.print("Init model on {}".format(mesh))
 
             abs_params, abs_cache = jax.eval_shape(
-                partial(init_fn, model=self.model), init_rng, input_ids)
-            params_spec = nn.get_partition_spec(abs_params)
-            cache_spec = nn.get_partition_spec(abs_cache)
+                partial(init_fn, model=self.model, cache_only=False), init_rng, input_ids)
+            cache_sharding = nn.get_sharding(abs_cache, mesh)
 
-            p_init_fn = pjit(
-                partial(init_fn, model=self.model), out_shardings=(params_spec, cache_spec))
+            p_init_fn = jax.jit(
+                partial(init_fn, model=self.model, cache_only=True), out_shardings=cache_sharding)
             with mesh:
-                params, cache = p_init_fn(init_rng, input_ids)
+                cache = p_init_fn(init_rng, input_ids)
+            params = abs_params
         else:
             self.print("Init model on CPU")
             load_device = 'cpu'
-            p_init_fn = jax.jit(partial(init_fn, model=self.model))
+            p_init_fn = jax.jit(partial(init_fn, model=self.model, cache_only=False))
 
             with jax.default_device(jax.devices("cpu")[0]):
                 params, cache = p_init_fn(init_rng, input_ids)

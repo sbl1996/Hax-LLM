@@ -191,6 +191,7 @@ class SelfAttention(ShardModule):
     memory_efficient_mask_mode: str = "causal"
     query_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     kv_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis]] = None
+    kv_cache_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis, ShardAxis]] = None
     out_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("Y", None, "X")
     shard: bool = True
     shard_cache: bool = False
@@ -231,6 +232,7 @@ class SelfAttention(ShardModule):
 
         multi_query = self.multi_query_groups is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
+
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
@@ -264,7 +266,6 @@ class SelfAttention(ShardModule):
         else:
             kv_dense_shard_axes = {"kernel": kv_shard_axes}
 
-
         kv_dense = [
             functools.partial(
                 cls,
@@ -285,13 +286,6 @@ class SelfAttention(ShardModule):
         value = kv_dense[1](
             qconfig=get_qconfig("attn.value"), name="value")(x)
 
-        # TODO: we can cache untiled key and value for memory efficiency
-        # If we shard at the last axis, it may be padded to meet 8x128 layout which results 8x expansion of memory.
-        if multi_query:
-            # GSPMD automatically recognize it to (X, None, Y, None)
-            key = replicate_for_multi_query(key, self.num_heads)
-            value = replicate_for_multi_query(value, self.num_heads)
-
         if self.rope:
             add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, self.rope_theta, variant=2 if self.rope == 2 else 1)
         else:
@@ -305,7 +299,8 @@ class SelfAttention(ShardModule):
             query, key = add_pos(query, key, position_ids)
         else:
             assert mask is None, "Mask is not needed for decoding, we infer it from cache."
-            is_initialized, cached_key, cached_value, cache_index = init_decode_cache(self, key, value, kv_shard_axes)
+            kv_cache_shard_axes = self.kv_cache_shard_axes or (key.ndim - 2) * (None,) + kv_shard_axes[-2:]
+            is_initialized, cached_key, cached_value, cache_index = init_decode_cache(self, key, value, kv_cache_shard_axes)
             if self.padding_left:
                 cache_position = self.variable(
                     "cache", "cache_position", lambda: jnp.zeros(key.shape[0], dtype=jnp.int32)
@@ -319,6 +314,11 @@ class SelfAttention(ShardModule):
                     query, key, value, mask = decode_for_padding_right(
                         add_pos, query, key, value, cache_index, cached_key, cached_value)
 
+        # If we shard at the last axis, it may be padded to meet 8x128 layout which results 8x expansion of memory.
+        if multi_query:
+            # GSPMD automatically recognize it to (X, None, Y, None)
+            key = replicate_for_multi_query(key, self.num_heads)
+            value = replicate_for_multi_query(value, self.num_heads)
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:

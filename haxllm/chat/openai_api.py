@@ -2,16 +2,17 @@ import time
 import os
 import re
 
-from typing import List, Literal, Optional, Union
-
+from typing import List, Literal, Optional
+import shortuuid
 import hydra
 from omegaconf import DictConfig
 
 import uvicorn
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
+from asyncio import sleep
 
 from haxllm.chat.conversation import get_conv_template
 from haxllm.chat.inference import generate_stream
@@ -44,25 +45,27 @@ class ModelList(BaseModel):
     data: List[ModelCard] = []
 
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+    completion_tokens: Optional[int] = 0
+
+
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: str
 
 
-class DeltaMessage(BaseModel):
-    role: Optional[Literal["user", "assistant", "system"]] = None
-    content: Optional[str] = None
-
-
 class ChatCompletionRequest(BaseModel):
-    model: str
     messages: List[ChatMessage]
-    temperature: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    max_length: Optional[int] = None
     stream: Optional[bool] = False
+    model: str
+    temperature: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    top_p: Optional[float] = None
+    # top_k: Optional[int] = None
+    max_tokens: Optional[int] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -71,17 +74,32 @@ class ChatCompletionResponseChoice(BaseModel):
     finish_reason: Literal["stop", "length"]
 
 
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{shortuuid.random()}")
+    model: str
+    object: str = "chat.completion"
+    choices: List[ChatCompletionResponseChoice]
+    created: Optional[int] = Field(default_factory=lambda: int(time.time()))
+    usage: UsageInfo
+
+
+class DeltaMessage(BaseModel):
+    role: Optional[Literal["user", "assistant", "system"]] = None
+    content: Optional[str] = None
+
+
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    finish_reason: Optional[Literal["stop", "length"]]
+    finish_reason: Optional[Literal["stop", "length"]] = None
 
 
-class ChatCompletionResponse(BaseModel):
+class ChatCompletionStreamResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{shortuuid.random()}")
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    object: Literal["chat.completion", "chat.completion.chunk"]
-    choices: List[Union[ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice]]
-    created: Optional[int] = Field(default_factory=lambda: int(time.time()))
+    choices: List[ChatCompletionResponseStreamChoice]
 
 
 @app.get("/v1/models", response_model=ModelList)
@@ -121,17 +139,17 @@ async def create_chat_completion(request: ChatCompletionRequest):
         repetition_penalty = request.frequency_penalty + 1.0
     gen_params = {
         "temperature": request.temperature or model.temperature,
-        "top_k": request.top_k or model.top_k,
+        # "top_k": request.top_k or model.top_k,
         "top_p": request.top_p or model.top_p,
         "repetition_penalty": repetition_penalty,
-        "max_len": request.max_length or model.max_len,
+        "max_len": request.max_tokens or model.max_len,
         "stop_token_ids": conv.config.stop_token_ids,
         "max_new_tokens": model.max_new_tokens,
     }
 
     if request.stream:
-        generate = predict(prompt, gen_params, request.model)
-        return EventSourceResponse(generate, media_type="text/event-stream")
+        generator = chat_completion_stream_generator(prompt, gen_params, request.model)
+        return StreamingResponse(generator, media_type="text/event-stream")
 
     input_ids = tokenizer(prompt, return_tensors="np")["input_ids"][0]
     input_echo_len = len(input_ids)
@@ -146,17 +164,24 @@ async def create_chat_completion(request: ChatCompletionRequest):
         finish_reason="stop"
     )
 
-    return ChatCompletionResponse(model=request.model, choices=[choice_data], object="chat.completion")
+    id = f"chatcmpl-{shortuuid.random()}"
+    return ChatCompletionResponse(id=id, model=request.model, choices=[choice_data])
 
 
-async def predict(prompt, gen_params, model_id: str):
+def wrap_sse(chunk):
+    return f"event: chunk\nid: {chunk.id}\ndata: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+
+
+async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
+    id = f"chatcmpl-{shortuuid.random()}"
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(role="assistant"),
         finish_reason=None
     )
-    chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+    chunk = ChatCompletionStreamResponse(
+        id=id, model=model_id, choices=[choice_data])
+    yield wrap_sse(chunk)
 
     model.reset_chat_state()
 
@@ -186,9 +211,12 @@ async def predict(prompt, gen_params, model_id: str):
                 delta=DeltaMessage(content=new_text),
                 finish_reason=None
             )
-            chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-            yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+            chunk = ChatCompletionStreamResponse(id=id, model=model_id, choices=[choice_data])
+            yield wrap_sse(chunk)
             pre = now
+
+            # HACK: without this, SSE won't work for NextChat
+            await sleep(0.001)
     times = times[:-1]
     prefill_time = times[0]
     decode_time = sum(times[1:])
@@ -198,23 +226,26 @@ async def predict(prompt, gen_params, model_id: str):
         f"prompt: {usage['prompt_tokens']}/{prefill_time:.3f}/{prefill_tps:.2f}, "
         f"completion: {usage['completion_tokens']}/{decode_time:.3f}/{decode_tps:.2f}, "
         f"total: {usage['total_tokens']}")
+
     new_text = "".join(output_text[pre:])
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(content=new_text),
         finish_reason=None
     )
-    chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+    chunk = ChatCompletionStreamResponse(
+        id=id, model=model_id, choices=[choice_data])
+    yield wrap_sse(chunk)
 
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(),
         finish_reason="stop"
     )
-    chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
-    yield '[DONE]'
+    chunk = ChatCompletionStreamResponse(
+        id=id, model=model_id, choices=[choice_data])
+    yield wrap_sse(chunk)
+    yield f"event: chunk\nid: {id}\ndata: [DONE]\n\n"
 
 
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")

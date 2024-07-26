@@ -15,7 +15,7 @@ VERSION = None
 REQUIRED = [
     "hydra-core",
     "transformers",
-    "sse_starlette",
+    "shortuuid",
     "safetensors",
 ]
 

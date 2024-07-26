@@ -10,8 +10,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P, NamedSharding, Mesh
-from jax.experimental.pjit import pjit
+from jax.sharding import PartitionSpec as P, NamedSharding
 
 import optax
 
@@ -377,7 +376,7 @@ class MPTrainer(TrainerBase):
             self.mesh, partial(init_fn, model=self.model, tx=self.tx), init_rng, input_ids
         )
 
-        jit_init_fn = pjit(
+        jit_init_fn = jax.jit(
             partial(init_fn, model=self.model, tx=self.tx),
             out_shardings=out_shardings,
         )
@@ -396,17 +395,17 @@ class MPTrainer(TrainerBase):
 
         none_sharding = out_shardings[-1]
         if self.dynamic_scale:
-            p_train_step = pjit(
+            p_train_step = jax.jit(
                 partial(train_step_dynamic_scale, model=self.model, tx=self.tx, cast=self.cast),
                 out_shardings=out_shardings + (none_sharding,) * 2,
                 donate_argnums=(0, 1, 2))
         else:
-            p_train_step = pjit(
+            p_train_step = jax.jit(
                 partial(train_step, model=self.model, tx=self.tx, cast=self.cast),
                 out_shardings=out_shardings + (none_sharding,),
                 donate_argnums=(0, 1, 2))
 
-        p_eval_step = pjit(
+        p_eval_step = jax.jit(
             partial(eval_step, model=self.model))
         
         self._p_train_step = p_train_step

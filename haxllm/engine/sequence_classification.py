@@ -4,7 +4,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pjit import pjit
 
 import optax
 
@@ -236,7 +235,7 @@ class MPTrainer(Trainer):
             self.mesh, partial(init_fn, model=self.model, tx=self.tx), init_rng, inputs, attn_mask
         )
 
-        jit_init_fn = pjit(
+        jit_init_fn = jax.jit(
             partial(init_fn, model=self.model, tx=self.tx),
             out_shardings=out_shardings,
         )
@@ -253,11 +252,11 @@ class MPTrainer(Trainer):
         self._opt_state = opt_state
         self._global_step = global_step
 
-        p_train_step = pjit(
+        p_train_step = jax.jit(
             partial(train_step, model=self.model, tx=self.tx, cast=self.cast_params_bf16),
             out_shardings=out_shardings + out_shardings[-1:],
             donate_argnums=(0, 1, 2))
-        p_eval_step = pjit(
+        p_eval_step = jax.jit(
             partial(eval_step, model=self.model))
         
         self._p_train_step = p_train_step

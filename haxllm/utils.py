@@ -155,9 +155,7 @@ def inspect_tree(tree):
 
 def get_sharding(mesh, fun, *args, **kwargs):
     xs = jax.eval_shape(fun, *args, **kwargs)
-    spec = nn.get_partition_spec(xs)
-    sharding = jax.tree_map(lambda p: NamedSharding(mesh, p), spec)
-    return sharding
+    return nn.get_sharding(xs, mesh)
 
 
 def parse_safetensors_header(fp):
@@ -248,12 +246,8 @@ def load_transformer_params(params, path: str, device, lm_head=False, verbose=Fa
         elif mesh is None:
             x = jax.device_put(x)
         else:
-            if isinstance(p, nn.Partitioned):
-                spec = p.get_partition_spec()
-            else:
-                spec = p.sharding.spec
             with mesh:
-                x = jax.device_put(x, NamedSharding(mesh, spec))
+                x = jax.device_put(x, nn.get_sharding(p, mesh))
         if isinstance(p, nn.Partitioned):
             params[full_key] = p.replace_boxed(x)
         else:

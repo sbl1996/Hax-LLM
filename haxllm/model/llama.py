@@ -1,6 +1,5 @@
 from typing import Callable, Any, Optional
 
-import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -82,6 +81,17 @@ config_hub = {
         vocab_size=64000,
         rope_theta=5000000.0,
     ),
+    "yi-1.5-34b": dict(
+        hidden_size=7168,
+        intermediate_size=20480,
+        n_heads=56,
+        n_kv_heads=8,
+        n_layers=60,
+        rms_norm_eps=1e-6,
+        n_positions=4096,
+        vocab_size=64000,
+        rope_theta=5000000.0,
+    ),
     "llama3-8b": dict(
         hidden_size=4096,
         intermediate_size=14336,
@@ -122,6 +132,7 @@ class TransformerConfig(RematScanConfigMixin):
     decode: bool = False
     shard: bool = False
     shard_cache: bool = False
+    qconfig: Optional[QConfig] = None
 
 
 def get_chat_setting(name=None):
@@ -168,9 +179,12 @@ class TransformerBlock(nn.Module):
             rope_theta=config.rope_theta,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
+            kv_shard_axes=("X", "Y", None),
+            kv_cache_shard_axes=(None, "X", "Y", None),
             out_shard_axes=("Y", None, "X"),
             shard=config.shard,
             shard_cache=config.shard_cache,
+            qconfig=config.qconfig,
             name="attn")(x, mask, padding_mask)
 
         x = x + inputs
@@ -185,6 +199,7 @@ class TransformerBlock(nn.Module):
             shard_axes1=("X", "Y"),
             shard_axes2=("Y", "X"),
             shard=config.shard,
+            qconfig=config.qconfig,
             name="mlp")(y)
 
         y = x + y
@@ -309,9 +324,7 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
         else:
             group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
         assert qconfig.group_size == group_size
-        head_dim_q = head_dim // bits_reduce
         hidden_size_g = hidden_size // group_size
-        hidden_size_q = hidden_size // bits_reduce
         n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
     assert half_dtype in [jnp.bfloat16, jnp.float16]
 
@@ -350,18 +363,28 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
                 scales = state_dict.pop(f"{prefix}.scales")
                 qweight, qzeros = qconfig.requantize(qweight, qzeros)
+                if qconfig.pack == 1:
+                    div1, div2 = 1, 8
+                elif qconfig.pack == 2:
+                    div1, div2 = 2, 4
+                elif qconfig.pack == 3:
+                    div1, div2 = 8, 1
                 if part == 'query':
-                    qweight = qweight.reshape(hidden_size, n_heads, head_dim_q)
+                    qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
                     scales = scales.reshape(hidden_size_g, n_heads*head_dim)
                     if not qconfig.sym:
                         qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim)
                 elif part in ['key', 'value']:
-                    qweight = qweight.reshape(hidden_size, n_kv_heads, head_dim_q)
+                    qweight = qweight.reshape(hidden_size // div1, n_kv_heads, head_dim // div2)
                     scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
                     if not qconfig.sym:
                         qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
                 elif part == 'out':
-                    qweight = qweight.reshape(n_heads, head_dim, hidden_size_q)
+                    # HACK
+                    if qconfig.pack == 3:
+                        qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
+                    else:
+                        qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
                     scales = scales.reshape(hidden_size_g, hidden_size)
                     if not qconfig.sym:
                         qzeros = qzeros.reshape(hidden_size_g, hidden_size)

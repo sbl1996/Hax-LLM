@@ -265,12 +265,11 @@ def decode_for_padding_right(add_pos, query, key, value, cache_index, cached_key
     return query, key, value, mask
 
 
-def init_decode_cache(mod, key, value, kv_shard_axes=None):
+def init_decode_cache(mod, key, value, kv_cache_shard_axes=None):
     is_initialized = mod.has_variable("cache", "cached_key")
     init_fn = jnp.zeros
     if mod.shard and mod.shard_cache:
-        shard_axes = (key.ndim - 2) * (None,) + kv_shard_axes[-2:]
-        init_fn = nn.with_partitioning(init_fn, shard_axes)
+        init_fn = nn.with_partitioning(init_fn, kv_cache_shard_axes)
     cached_key = mod.variable(
         "cache", "cached_key", init_fn, key.shape, key.dtype
     )

@@ -30,6 +30,7 @@ class QConfig:
     sym: bool = False
     q_dtype: Optional[jnp.dtype] = None
     q_layers: Sequence[str] = ("attn.out", "mlp.gate", "mlp.up", "mlp.down")
+    pack: int = 2
 
     def __post_init__(self):
         for l in self.q_layers:
@@ -75,11 +76,33 @@ class QConfig:
 
     def dequantize(self, q):
         if self.method == QuantMethod.rtn_q8_0:
-            return group_dequantize(q["qweight"], 0, q["scales"])
+            return group_dequantize(q["qweight"], None, q["scales"])
         elif self.method == QuantMethod.awq_q4:
-            return dequantize2(q["qweight"], q["zeros"][:, None], q["scales"])
+            qweight = self._unpack(q["qweight"])
+            return group_dequantize(qweight, q["zeros"][:, None], q["scales"])
         elif self.method == QuantMethod.gptq_q4:
-            return dequantize2(q["qweight"], 8, q["scales"])
+            qweight = self._unpack(q["qweight"])
+            return group_dequantize(qweight, 8, q["scales"])
+        else:
+            raise NotImplementedError
+
+    def _pack(self, w):
+        if self.pack == 1:
+            return pack1(w)
+        elif self.pack == 2:
+            return pack2(w)
+        elif self.pack == 3:
+            return pack_int(w)
+        else:
+            raise NotImplementedError
+    
+    def _unpack(self, w):
+        if self.pack == 1:
+            return unpack1(w)
+        elif self.pack == 2:
+            return unpack2(w)
+        elif self.pack == 3:
+            return int_unpack(w, 4, "gptq")
         else:
             raise NotImplementedError
 
@@ -87,27 +110,22 @@ class QConfig:
         if self.method == QuantMethod.awq_q4:
             qweight, qzeros = args
             weight, zeros = jax.tree.map(
-                lambda x: unpack(jnp.array(x)), (qweight, qzeros))
-            weight = np.array(pack2(weight))
+                lambda x: int_unpack(jnp.array(x)), (qweight, qzeros))
+            weight = np.array(self._pack(weight))
             zeros = np.array(zeros)
             return weight, zeros
         elif self.method == QuantMethod.gptq_q4:
             qweight, qzeros = args
-            weight = unpack(jnp.array(qweight), 4, 'gptq')
-            weight = np.array(pack2(weight))
+            weight = int_unpack(jnp.array(qweight), 4, 'gptq')
+            weight = np.array(self._pack(weight))
             return weight, qzeros
         else:
             raise NotImplementedError
 
     def __str__(self):
-        if self.method == QuantMethod.rtn_q8_0:
-            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}), q_layers={self.q_layers}"
-        elif self.method == QuantMethod.awq_q4:
-            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
-        elif self.method == QuantMethod.gptq_q4:
-            return f"QConfig(method={self.method}, group_size={self.group_size}, sym={self.sym}, q_dtype={self.q_dtype}, q_layers={self.q_layers})"
-        else:
-            raise NotImplementedError
+        return f"QConfig(method={self.method}, " \
+               f"group_size={self.group_size}, " \
+               f"sym={self.sym}, q_dtype={self.q_dtype}, pack={self.pack}, q_layers={self.q_layers})"
 
     def to_json(self):
         return json.dumps(
@@ -117,6 +135,7 @@ class QConfig:
                 "group_size": self.group_size,
                 "q_dtype": self.q_dtype.dtype.name if self.q_dtype is not None else None,
                 "q_layers": self.q_layers,
+                "pack": self.pack,
             }, indent=2,
         )
 
@@ -131,6 +150,8 @@ class QConfig:
         )
         if "group_size" in data:
             kwargs["group_size"] = data["group_size"]
+        if "pack" in data:
+            kwargs["pack"] = data["pack"]
         return cls(**kwargs)
 
 
@@ -188,7 +209,7 @@ def reverse_awq_order(iweights, izeros, bits: int):
 
 
 @partial(jax.jit, static_argnums=(1, 2))
-def unpack(x, bits=4, variant='awq'):
+def int_unpack(x, bits=4, variant='awq'):
     shifts = jnp.arange(0, 32, bits, dtype=x.dtype)
     if variant == 'awq':
         for i in range(x.ndim):
@@ -211,13 +232,45 @@ def unpack(x, bits=4, variant='awq'):
 
 
 @partial(jax.jit, static_argnums=(1,))
+def pack_int(x, bits=4):
+    assert bits == 4
+    shifts = jnp.arange(0, 32, bits, dtype=jnp.int32)
+    shifts = shifts[None, :]
+    for i in range(x.ndim - 1):
+        shifts = jnp.expand_dims(shifts, axis=-1)
+    x = x.reshape(-1, shifts.shape[1], *x.shape[1:])
+    x = x.astype(jnp.int32)
+    x = jnp.bitwise_left_shift(x, shifts)
+    x0 = x[:, 0]
+    for i in range(1, x.shape[1]):
+        x0 = jnp.bitwise_or(x0, x[:, i])
+    return x0
+
+
+@partial(jax.jit, static_argnums=(1,))
 def pack2(x, bits=4):
+    assert bits == 4
+    n = x.shape[0]
+    return (x[:n//2] * 16 + x[n//2:]).view(jnp.int32)
+
+
+def unpack2(x, bits=4):
+    assert bits == 4
+    x = x.view(jnp.uint8)
+    x1 = x >> 4
+    x2 = x & 0xf
+    x = jnp.concatenate([x1, x2], axis=0)
+    x = x.view(jnp.int8)
+    return x
+
+
+@partial(jax.jit, static_argnums=(1,))
+def pack1(x, bits=4):
     assert bits == 4
     return (x[..., ::2] * 16 + x[..., 1::2]).view(jnp.int32)
 
 
-@partial(jax.jit, static_argnums=(1,))
-def unpack2(x, bits=4):
+def unpack1(x, bits=4):
     assert bits == 4
     x = x.view(jnp.uint8)
     x1, x2 = jnp.divmod(x, 16)
@@ -230,15 +283,11 @@ def unpack2(x, bits=4):
 def group_dequantize(qweight, qzeros, scales):
     group_size = qweight.shape[0] // scales.shape[0]
     qweight = qweight.reshape(-1, group_size, *qweight.shape[1:])
-    weight = (qweight - qzeros) * scales[:, None]
+    if qzeros is not None:
+        qweight = qweight - qzeros
+    weight = qweight * scales[:, None]
     weight = weight.reshape(-1, *weight.shape[2:])
     return weight
-
-
-def dequantize2(iweight, qzeros, scales):
-    bits = scales.shape[-1] // iweight.shape[-1] // 2
-    qweight = unpack2(iweight, bits)
-    return group_dequantize(qweight, qzeros, scales)
 
 
 # def unpack_awq(qweight, qzeros, bits: int):
