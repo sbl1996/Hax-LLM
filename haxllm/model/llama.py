@@ -105,6 +105,32 @@ config_hub = {
         bos_token_id=128000,
         eos_token_id=128009,
     ),
+    "mistral-7b-v0.3": dict(
+        hidden_size=4096,
+        intermediate_size=14336,
+        n_heads=32,
+        n_kv_heads=8,
+        n_layers=32,
+        rms_norm_eps=1e-5,
+        n_positions=8192,
+        vocab_size=32768,
+        rope_theta=1000000.0,
+        bos_token_id=1,
+        eos_token_id=2,
+    ),
+    "codestrac-22b-v0.1": dict(
+        hidden_size=6144,
+        intermediate_size=16384,
+        n_heads=48,
+        n_kv_heads=8,
+        n_layers=56,
+        rms_norm_eps=1e-5,
+        n_positions=8192,
+        vocab_size=32768,
+        rope_theta=1000000.0,
+        bos_token_id=1,
+        eos_token_id=2,
+    ),
 }
 
 
@@ -457,6 +483,36 @@ class YiChatSetting:
 
 
 @register_chat_setting()
+class LLaMA31InstructSetting:
+    name = "llama31-instruct"
+    system = ""
+    roles = ("user", "assistant")
+    stop_token_ids = (128001, 128009,)
+
+    def get_prompt(self, messages):
+        boh = "<|start_header_id|>"
+        eoh = "<|end_header_id|>"
+        eos = "<|eot_id|>"
+        # ret = "<|begin_of_text|>"
+        ret = ""
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        if system:
+            ret += f"{boh}system{eoh}\n\n" \
+                   f"Cutting Knowledge Date: December 2023\n" \
+                   f"Today Date: {datetime.now().strftime('%d %b %Y')}\n\n" \
+                   f"{system}{eos}"
+        for i, (role, message) in enumerate(messages):
+            ret += f"{boh}{role}{eoh}\n\n"
+            if message:
+                ret += message.strip() + eos
+        return ret
+
+
+@register_chat_setting()
 class LLaMA3ChatSetting:
     name = "llama3-chat"
     system = "You are a helpful assistant."
@@ -467,7 +523,8 @@ class LLaMA3ChatSetting:
         boh = "<|start_header_id|>"
         eoh = "<|end_header_id|>"
         eos = "<|eot_id|>"
-        ret = "<|begin_of_text|>"
+        # ret = "<|begin_of_text|>"
+        ret = ""
         system = self.system
         if messages[0][0] == "system":
             system = messages[0][1]
@@ -546,4 +603,38 @@ class LLaMA2ChatSetting:
         ), f"Last message must be from user, got {dialog[-1]['role']}"
         if append:
             ret += f"{BOS}{B_INST} {(dialog[-1]['content']).strip()} {E_INST}"
+        return ret
+
+
+@register_chat_setting()
+class MistralInstructSetting:
+    name = "mistral-instruct"
+    system = ""
+    roles = ("user", "assistant")
+    stop_token_ids = (2,)
+
+    def get_prompt(self, messages):
+        B_INST, E_INST = "[INST]", "[/INST]"
+        eos = "</s>"
+        # ret = "<s>"
+        ret = ""
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        n = len(messages)
+        for i, (role, content) in enumerate(messages):
+            if role == self.roles[0]:
+                if i % 2 != 0:
+                    raise ValueError(f"After the optional system message, conversation roles must alternate user/assistant/user/assistant/...")
+                if system and i in [n - 1, n - 2]:
+                    ret += f"{B_INST} {system}\n\n{content}{E_INST}"
+                else:
+                    ret += f"{B_INST} {content}{E_INST}"
+            else:
+                if content:
+                    ret += f" {content}{eos}"
+                else:
+                    ret += f" "
         return ret

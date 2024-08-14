@@ -2,4 +2,4 @@ family: llama
 tokenizer: meta-llama/Meta-Llama-3.1-8B-Instruct
 remat: False
 scan: False
-conv_template: llama3-chat
+conv_template: llama31-instruct

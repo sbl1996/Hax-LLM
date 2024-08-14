@@ -1,0 +1,5 @@
+family: llama
+tokenizer: mistralai/Mistral-7B-Instruct-v0.3
+remat: False
+scan: False
+conv_template: mistral-instruct
