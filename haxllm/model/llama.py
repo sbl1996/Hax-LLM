@@ -8,7 +8,7 @@ from flax import struct
 from haxllm.model.quantize import QConfig, QuantMethod
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
-from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfigMixin
 from haxllm.chat.setting import register_chat_setting, ChatSetting
 
 
@@ -104,6 +104,13 @@ config_hub = {
         rope_theta=500000.0,
         bos_token_id=128000,
         eos_token_id=128009,
+        rope_scaling=dict(
+            rope_type="llama3",
+            factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            max_position_embeddings=8192,
+        )
     ),
     "mistral-7b-v0.3": dict(
         hidden_size=4096,
@@ -135,7 +142,7 @@ config_hub = {
 
 
 @struct.dataclass
-class TransformerConfig(RematScanConfigMixin):
+class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     vocab_size: int = 32000
     num_labels: int = 2
     dtype: Any = jnp.float32
@@ -203,6 +210,7 @@ class TransformerBlock(nn.Module):
             decode=config.decode,
             rope=True,
             rope_theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             kv_shard_axes=("X", "Y", None),

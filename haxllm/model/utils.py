@@ -4,6 +4,7 @@ from enum import Enum, auto
 import jax
 import jax.numpy as jnp
 
+from haxllm.model.mixin import RoPEScalingConfig
 
 class ModelTask(Enum):
     SequenceClassification = auto()
@@ -49,6 +50,11 @@ def load_config(module, name, **kwargs):
 def _load_config1(cls, base_config, **kwargs):
     d = {**base_config}
     kwargs = {**kwargs}
+
+    rope_scaling = d.get("rope_scaling", None)
+    if rope_scaling is not None:
+        assert isinstance(rope_scaling, dict)
+        d["rope_scaling"] = RoPEScalingConfig(**rope_scaling)
 
     remat_scan = kwargs.get("remat_scan", False)
     remat = kwargs.get("remat", False)

@@ -22,6 +22,7 @@ from haxllm.gconfig import get as get_gconfig
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
 from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache
 from haxllm.model.quantize import QConfig
+from haxllm.model.mixin import RoPEScalingConfig
 
 default_kernel_init = initializers.lecun_normal()
 
@@ -186,6 +187,7 @@ class SelfAttention(ShardModule):
     decode: bool = False
     rope: bool = False
     rope_theta: float = 10000.0
+    rope_scaling: Optional[RoPEScalingConfig] = None
     padding_left: bool = False
     memory_efficient: bool = False
     memory_efficient_mask_mode: str = "causal"
@@ -287,7 +289,7 @@ class SelfAttention(ShardModule):
             qconfig=get_qconfig("attn.value"), name="value")(x)
 
         if self.rope:
-            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, self.rope_theta, variant=2 if self.rope == 2 else 1)
+            add_pos = make_apply_rope(head_dim, self.max_len, self.dtype, self.rope_theta, self.rope_scaling)
         else:
             add_pos = lambda q, k, p=None: (q, k)
 

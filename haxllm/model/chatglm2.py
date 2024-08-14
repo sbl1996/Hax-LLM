@@ -8,7 +8,7 @@ from flax import struct
 
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
-from haxllm.model.mixin import RematScanConfigMixin
+from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfig
 from haxllm.chat.setting import register_chat_setting
 
 
@@ -43,6 +43,7 @@ class TransformerConfig(RematScanConfigMixin):
     n_layers: int = 28
     num_groups: int = 2
     rms_norm_eps: float = 1e-5
+    rope_scaling: RoPEScalingConfig = RoPEScalingConfig(rope_type="chatglm2")
     n_positions: int = 32768
     pad_token_id: int = 0
     eos_token_id: int = 2
@@ -94,7 +95,8 @@ class TransformerBlock(nn.Module):
             qkv_bias=True,
             out_bias=False,
             decode=config.decode,
-            rope=2,
+            rope=True,
+            rope_scaling=config.rope_scaling,
             padding_left=config.padding_left,
             query_shard_axes=("X", "Y", None),
             out_shard_axes=("Y", None, "X"),

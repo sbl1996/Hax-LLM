@@ -1,17 +1,44 @@
+from typing import Optional
+import math
 import numpy as np
 
 import jax.numpy as jnp
 from jax import lax
 
 import flax.linen as nn
+from haxllm.model.mixin import RoPEScalingConfig
 
 
-def precompute_freqs_cis(
-    dim: int, end: int, theta = 10000.0, dtype = jnp.float32
-):
+def compute_inv_freq(dim: int, theta = 10000.0):
+    return 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
+
+
+def compute_llama3_inv_freq(
+    dim: int, theta = 10000.0, factor: float = 8.0,
+    low_freq_factor: float = 1.0, high_freq_factor: float = 4.0,
+    max_position_embeddings: int = 8192):
+    inv_freq = compute_inv_freq(dim, theta)
+    old_context_len = max_position_embeddings
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    wavelen = 2 * math.pi / inv_freq
+    # wavelen < high_freq_wavelen: do nothing
+    # wavelen > low_freq_wavelen: divide by factor
+    inv_freq_llama = np.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    # otherwise: interpolate between the two, using a smooth factor
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    inv_freq_llama = np.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+    return inv_freq_llama
+
+
+def precompute_freqs_cis(inv_freq, end, dtype = jnp.float32):
     # returns:
     #   cos, sin: (end, dim)
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
+    freqs = inv_freq
     t = np.arange(end, dtype=np.float32)  # type: ignore
     freqs = np.outer(t, freqs)  # type: ignore
     freqs = np.concatenate((freqs, freqs), axis=-1)
@@ -71,13 +98,10 @@ def apply_rotary_pos_emb_index(q, k, cos, sin, position_id=None):
 
 
 # from chatglm2, different from original rope
-
-def precompute_freqs_cis2(
-    dim: int, end: int, theta: float = 10000.0, dtype = jnp.float32
-):
+def precompute_freqs_cis2(inv_freq, end: int, dtype = jnp.float32):
     # returns:
     #   cos, sin: (end, dim)
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
+    freqs = inv_freq
     t = np.arange(end, dtype=np.float32)  # type: ignore
     freqs = np.outer(t, freqs)  # type: ignore
     cos, sin = np.cos(freqs), np.sin(freqs)
@@ -93,27 +117,6 @@ def apply_cos_sin(x, cos, sin):
     x1 = x1.reshape(x2.shape)
     x = jnp.concatenate((x1, x2), axis=-1)
     return x
-
-
-def apply_rotary_pos_emb2(q, k, cos, sin):
-    # inputs:
-    #   x: (batch_size, seq_len, num_heads, head_dim)
-    #   cos, sin: (seq_len, head_dim // 2)
-    # returns:
-    #   q, k: (batch_size, seq_len, num_heads, head_dim)
-    q_len = q.shape[1]
-    kv_len = k.shape[1]
-    prefix_len = kv_len - q_len
-
-    cos_k = cos[None, :kv_len, None, :]
-    sin_k = sin[None, :kv_len, None, :]
-
-    cos_q = cos_k[:, prefix_len:]
-    sin_q = sin_k[:, prefix_len:]
-
-    q = apply_cos_sin(q, cos_q, sin_q)
-    k = apply_cos_sin(k, cos_k, sin_k)
-    return q, k
 
 
 def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id=None):
@@ -140,26 +143,21 @@ def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id=None):
     return q, k
 
 
-def apply_glm_rotary_pos_emb(q, k, cos, sin, position_ids):
-    q1, q2 = jnp.array_split(q, 2, axis=-1)
-    k1, k2 = jnp.array_split(k, 2, axis=-1)
-    block_position_ids = position_ids[:, 1, :]
-    position_ids = position_ids[:, 0, :]
-    q1, k1 = apply_rotary_pos_emb_index(q1, k1, cos, sin, position_ids)
-    q2, k2 = apply_rotary_pos_emb_index(q2, k2, cos, sin, block_position_ids)
-    q = jnp.concatenate([q1, q2], axis=-1)
-    k = jnp.concatenate([k1, k2], axis=-1)
-    return q, k
-
-
-def make_apply_rope(head_dim, max_len, dtype, theta=10000.0, variant=1):
-    if variant == 2:
-        cos, sin = precompute_freqs_cis2(
-            dim=head_dim // 2, end=max_len, dtype=dtype, theta=theta)
+def make_apply_rope(head_dim, max_len, dtype, theta=10000.0, scaling: Optional[RoPEScalingConfig] = None):
+    rope_type = "default" if scaling is None else scaling.rope_type
+    if rope_type == "default":
+        inv_freq = compute_inv_freq(head_dim, theta)
+        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
+        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+    elif rope_type == "chatglm2":
+        inv_freq = compute_inv_freq(head_dim // 2, theta)
+        cos, sin = precompute_freqs_cis2(inv_freq, max_len, dtype=dtype)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
-    else:
-        cos, sin = precompute_freqs_cis(
-            dim=head_dim, end=max_len, dtype=dtype, theta=theta)
+    elif rope_type == "llama3":
+        inv_freq = compute_llama3_inv_freq(
+            head_dim, theta, scaling.factor, scaling.low_freq_factor, scaling.high_freq_factor,
+            scaling.max_position_embeddings)
+        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     return add_pos
 
