@@ -1,4 +1,4 @@
-family: qwen
+family: llama
 tokenizer: Qwen/Qwen-7B-Chat
 remat: False
 scan: True

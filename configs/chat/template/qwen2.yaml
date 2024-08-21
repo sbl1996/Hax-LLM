@@ -1,4 +1,4 @@
-family: qwen2
+family: llama
 tokenizer: Qwen/Qwen2-7B-Instruct
 remat: False
 scan: False

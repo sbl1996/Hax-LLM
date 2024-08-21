@@ -1,5 +1,7 @@
 from typing import Callable, Any, Optional
 
+from datetime import datetime
+
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -9,134 +11,313 @@ from haxllm.model.quantize import QConfig, QuantMethod
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfigMixin
-from haxllm.chat.setting import register_chat_setting, ChatSetting
+from haxllm.chat.setting import register_chat_setting
 
 
-config_hub = {
-    "llama-t": dict(
-        hidden_size=1024,
-        intermediate_size=2816,
-        n_heads=8,
-        n_layers=2,
-    ),
-    "llama-7b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_layers=32,
-    ),
-    "llama-13b": dict(
-        hidden_size=5120,
-        intermediate_size=13824,
-        n_heads=40,
-        n_layers=40,
-    ),
-    "llama-30b": dict(
-        hidden_size=6656,
-        intermediate_size=17920,
-        n_heads=52,
-        n_layers=60,
-    ),
-    "llama-65b": dict(
-        hidden_size=8192,
-        intermediate_size=22016,
-        n_heads=64,
-        n_layers=80,
-    ),
-    "llama2-7b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_layers=32,
+def QwenConfig(**kwargs):
+    base = dict(
+        vocab_size=151936,
+        qkv_bias=True,
+        pad_token_id=151643,
+        bos_token_id=151643,
+        eos_token_id=151645,
+        rope_theta=10000.0,
+    )
+    return {**base, **kwargs}
+
+
+def Qwen2Config(**kwargs):
+    base = dict(
+        vocab_size=151936,
+        qkv_bias=True,
+        pad_token_id=151643,
+        bos_token_id=151643,
+        eos_token_id=151645,
+        rope_theta=1000000.0,
+    )
+    return {**base, **kwargs}
+
+
+def LlamaConfig(**kwargs):
+    base = dict(
+        vocab_size=32000,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=10000.0,
+    )
+    return {**base, **kwargs}
+
+
+def Llama2Config(**kwargs):
+    base = dict(
+        vocab_size=32000,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=10000.0,
         rms_norm_eps=1e-5,
-        n_positions=4096,
-    ),
-    "llama2-13b": dict(
-        hidden_size=5120,
-        intermediate_size=13824,
-        n_heads=40,
-        n_layers=40,
+    )
+    return {**base, **kwargs}
+
+
+def InternLMConfig(**kwargs):
+    base = dict(
+        vocab_size=103168,
+        qkv_bias=True,
+        out_bias=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    return {**base, **kwargs}
+
+
+def ChatGLM2Config(**kwargs):
+    base = dict(
+        vocab_size=65024,
+        qkv_bias=True,
+        out_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
         rms_norm_eps=1e-5,
-        n_positions=4096,
-    ),
-    "yi-6b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_kv_heads=4,
-        n_layers=32,
-        rms_norm_eps=1e-5,
-        n_positions=4096,
+        rope_scaling=dict(
+            rope_type="chatglm2",
+        )
+    )
+    return {**base, **kwargs}
+
+
+def YiConfig(**kwargs):
+    base = dict(
         vocab_size=64000,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
         rope_theta=5000000.0,
-    ),
-    "yi-1.5-9b": dict(
-        hidden_size=4096,
-        intermediate_size=11008,
-        n_heads=32,
-        n_kv_heads=4,
-        n_layers=48,
+        rms_norm_eps=1e-5,
+    )
+    return {**base, **kwargs}
+
+
+def Yi1_5Config(**kwargs):
+    base = dict(
+        vocab_size=64000,
+        qkv_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=5000000.0,
         rms_norm_eps=1e-6,
-        n_positions=4096,
-        vocab_size=64000,
-        rope_theta=5000000.0,
-    ),
-    "yi-1.5-34b": dict(
-        hidden_size=7168,
-        intermediate_size=20480,
-        n_heads=56,
-        n_kv_heads=8,
-        n_layers=60,
-        rms_norm_eps=1e-6,
-        n_positions=4096,
-        vocab_size=64000,
-        rope_theta=5000000.0,
-    ),
-    "llama3-8b": dict(
-        hidden_size=4096,
-        intermediate_size=14336,
-        n_heads=32,
-        n_kv_heads=8,
-        n_layers=32,
-        rms_norm_eps=1e-5,
-        n_positions=8192,
+    )
+    return {**base, **kwargs}
+
+
+def Llama3Config(**kwargs):
+    base = dict(
         vocab_size=128256,
-        rope_theta=500000.0,
+        qkv_bias=False,
+        pad_token_id=0,
         bos_token_id=128000,
         eos_token_id=128009,
+        rope_theta=500000.0,
+        rms_norm_eps=1e-5,
         rope_scaling=dict(
             rope_type="llama3",
             factor=8.0,
             low_freq_factor=1.0,
             high_freq_factor=4.0,
             max_position_embeddings=8192,
-        )
+        ),
+    )
+    return {**base, **kwargs}
+
+
+def MistralConfig(**kwargs):
+    base = dict(
+        vocab_size=32768,
+        qkv_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=1000000.0,
+        rms_norm_eps=1e-5,
+    )
+    return {**base, **kwargs}
+
+
+config_hub = {
+    "qwen-7b": QwenConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
     ),
-    "mistral-7b-v0.3": dict(
+    "qwen-14b": QwenConfig(
+        hidden_size=5120,
+        intermediate_size=13696,
+        n_heads=40,
+        n_layers=40,
+    ),
+    "qwen1.5-0.5b": Qwen2Config(
+        hidden_size=1024,
+        intermediate_size=2816,
+        n_heads=16,
+        n_layers=24,
+    ),
+    "qwen1.5-1.8b": Qwen2Config(
+        hidden_size=2048,
+        intermediate_size=5504,
+        n_heads=16,
+        n_layers=24,
+    ),
+    "qwen1.5-4b": Qwen2Config(
+        hidden_size=2560,
+        intermediate_size=6912,
+        n_heads=20,
+        n_layers=40,
+    ),
+    "qwen1.5-7b": Qwen2Config(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+    ),
+    "qwen1.5-14b": Qwen2Config(
+        hidden_size=5120,
+        intermediate_size=13696,
+        n_heads=40,
+        n_layers=40,
+        vocab_size=152064,
+    ),
+    "qwen1.5-32b": Qwen2Config(
+        hidden_size=5120,
+        intermediate_size=27392,
+        n_heads=40,
+        n_kv_heads=8,
+        n_layers=64,
+        vocab_size=152064,
+    ),
+    "qwen1.5-72b": Qwen2Config(
+        hidden_size=8192,
+        intermediate_size=24576,
+        n_heads=64,
+        n_kv_heads=64,
+        n_layers=80,
+        vocab_size=152064,
+    ),
+    "qwen2-1.5b": Qwen2Config(
+        hidden_size=1536,
+        intermediate_size=8960,
+        n_heads=12,
+        n_layers=28,
+        n_kv_heads=2,
+    ),
+    "qwen2-7b": Qwen2Config(
+        hidden_size=3584,
+        intermediate_size=18944,
+        n_heads=28,
+        n_layers=28,
+        n_kv_heads=4,
+        vocab_size=152064,
+    ),
+    "llama-t": LlamaConfig(
+        hidden_size=1024,
+        intermediate_size=2816,
+        n_heads=8,
+        n_layers=2,
+    ),
+    "llama-7b": LlamaConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+    ),
+    "llama-13b": LlamaConfig(
+        hidden_size=5120,
+        intermediate_size=13824,
+        n_heads=40,
+        n_layers=40,
+    ),
+    "llama-30b": LlamaConfig(
+        hidden_size=6656,
+        intermediate_size=17920,
+        n_heads=52,
+        n_layers=60,
+    ),
+    "llama-65b": LlamaConfig(
+        hidden_size=8192,
+        intermediate_size=22016,
+        n_heads=64,
+        n_layers=80,
+    ),
+    "llama2-7b": Llama2Config(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+    ),
+    "llama2-13b": Llama2Config(
+        hidden_size=5120,
+        intermediate_size=13824,
+        n_heads=40,
+        n_layers=40,
+    ),
+    "internlm-7b": InternLMConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_layers=32,
+    ),
+    "chatglm2-6b": ChatGLM2Config(
+        hidden_size=4096,
+        intermediate_size=13696,
+        n_heads=32,
+        n_layers=28,
+        n_kv_heads=2,
+    ),
+    "yi-6b": YiConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_kv_heads=4,
+        n_layers=32,
+    ),
+    "yi-1.5-9b": Yi1_5Config(
+        hidden_size=4096,
+        intermediate_size=11008,
+        n_heads=32,
+        n_kv_heads=4,
+        n_layers=48,
+    ),
+    "yi-1.5-34b": Yi1_5Config(
+        hidden_size=7168,
+        intermediate_size=20480,
+        n_heads=56,
+        n_kv_heads=8,
+        n_layers=60,
+    ),
+    "llama3-8b": Llama3Config(
         hidden_size=4096,
         intermediate_size=14336,
         n_heads=32,
         n_kv_heads=8,
         n_layers=32,
-        rms_norm_eps=1e-5,
-        n_positions=8192,
-        vocab_size=32768,
-        rope_theta=1000000.0,
-        bos_token_id=1,
-        eos_token_id=2,
     ),
-    "codestrac-22b-v0.1": dict(
+    "mistral-7b-v0.3": MistralConfig(
+        hidden_size=4096,
+        intermediate_size=14336,
+        n_heads=32,
+        n_kv_heads=8,
+        n_layers=32,
+    ),
+    "codestral-22b-v0.1": MistralConfig(
         hidden_size=6144,
         intermediate_size=16384,
         n_heads=48,
         n_kv_heads=8,
         n_layers=56,
-        rms_norm_eps=1e-5,
-        n_positions=8192,
-        vocab_size=32768,
-        rope_theta=1000000.0,
-        bos_token_id=1,
-        eos_token_id=2,
     ),
 }
 
@@ -155,6 +336,8 @@ class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     n_positions: int = 2048
+    qkv_bias: bool = False
+    out_bias: bool = False
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -166,17 +349,6 @@ class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     shard: bool = False
     shard_cache: bool = False
     qconfig: Optional[QConfig] = None
-
-
-def get_chat_setting(name=None):
-    if name is None or name == 'none':
-        return ChatSetting.none()
-    elif name == VicunaChatSetting.name:
-        return VicunaChatSetting()
-    elif name == LLaMA2ChatSetting.name:
-        return LLaMA2ChatSetting()
-    else:
-        raise ValueError(f"unknown chat config: {name}, must be one of {VicunaChatSetting.name}, {LLaMA2ChatSetting.name} or 'none'")
 
 
 class TransformerBlock(nn.Module):
@@ -205,8 +377,8 @@ class TransformerBlock(nn.Module):
             dtype=config.dtype,
             param_dtype=config.param_dtype,
             kernel_init=config.kernel_init,
-            qkv_bias=False,
-            out_bias=False,
+            qkv_bias=config.qkv_bias,
+            out_bias=config.out_bias,
             decode=config.decode,
             rope=True,
             rope_theta=config.rope_theta,
@@ -330,7 +502,53 @@ class TransformerLMHeadModel(nn.Module):
         return x
 
 
-def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
+def remap_qwen_state_dict(state_dict, head_dim=128):
+    n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("transformer.h.")]) + 1
+    hidden_size = state_dict['transformer.wte.weight'].shape[1]
+    if head_dim is None:
+        head_dim = 128
+    n_heads = hidden_size  // head_dim
+
+    root = {}
+    root["wte"] = {"embedding": state_dict.pop("transformer.wte.weight")}
+
+    for d in range(n_layers):
+        block_d = {}
+        block_d["ln_1"] = {"scale": state_dict.pop(
+            f"transformer.h.{d}.ln_1.weight")}
+        c_attn_weight = state_dict[f"transformer.h.{d}.attn.c_attn.weight"].T
+        c_attn_bias = state_dict[f"transformer.h.{d}.attn.c_attn.bias"]
+        block_d["attn"] = {
+            "query": {
+                "kernel": c_attn_weight[:, 0:hidden_size].reshape(hidden_size, n_heads, head_dim),
+                "bias": c_attn_bias[0:hidden_size].reshape(n_heads, head_dim),
+            },
+            "key": {
+                "kernel": c_attn_weight[:, hidden_size:hidden_size*2].reshape(hidden_size, n_heads, head_dim),
+                "bias": c_attn_bias[hidden_size:hidden_size*2].reshape(n_heads, head_dim),
+            },
+            "value": {
+                "kernel": c_attn_weight[:, hidden_size*2:hidden_size*3].reshape(hidden_size, n_heads, head_dim),
+                "bias": c_attn_bias[2*hidden_size:hidden_size*3].reshape(n_heads, head_dim),
+            },
+            "out": {
+                "kernel": state_dict.pop(f"transformer.h.{d}.attn.c_proj.weight").T.reshape(n_heads, head_dim, hidden_size),
+            },
+        }
+        block_d["ln_2"] = {"scale": state_dict.pop(f"transformer.h.{d}.ln_2.weight")}
+        block_d["mlp"] = {
+            "gate": {"kernel": state_dict.pop(f"transformer.h.{d}.mlp.w2.weight").T},
+            "up": {"kernel": state_dict.pop(f"transformer.h.{d}.mlp.w1.weight").T},
+            "down": {"kernel": state_dict.pop(f"transformer.h.{d}.mlp.c_proj.weight").T},
+        }
+        root[f"h_{d}"] = block_d
+
+    root["ln_f"] = {"scale": state_dict.pop("transformer.ln_f.weight")}
+    root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
+    return root
+
+
+def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
     q_method = qconfig.method if qconfig is not None else None
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
@@ -450,6 +668,105 @@ def remap_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = Non
         weight = root["wte"]["embedding"].T.copy()
     root["lm_head"] = {"kernel": weight.astype(half_dtype)}
     return root
+
+
+def remap_chatglm2_state_dict(state_dict, head_dim=None):
+    state_dict = {k.replace("transformer.", ""): v for k, v in state_dict.items()}
+    state_dict = {k.replace("encoder.", ""): v for k, v in state_dict.items()}
+
+    n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
+    hidden_size = state_dict['embedding.word_embeddings.weight'].shape[1]
+    # hard code for now
+    if head_dim is None:
+        head_dim = 128
+    num_groups = 2
+    n_heads = hidden_size  // head_dim
+
+    root = {}
+    root["wte"] = {"embedding": state_dict.pop("embedding.word_embeddings.weight")}
+
+    # TransformerBlock
+    for d in range(n_layers):
+        block_d = {}
+        block_d["ln_1"] = {
+            "scale": state_dict.pop(f"layers.{d}.input_layernorm.weight"),
+        }
+        c_attn_weight = state_dict[f"layers.{d}.self_attention.query_key_value.weight"].T
+        c_attn_weight = c_attn_weight.reshape(hidden_size, n_heads * head_dim + 2 * num_groups * head_dim)
+        c_attn_bias = state_dict[f"layers.{d}.self_attention.query_key_value.bias"]
+        c_attn_bias = c_attn_bias.reshape(n_heads * head_dim + 2 * num_groups * head_dim)
+
+        start = 0
+        end = n_heads * head_dim
+        query_kernel = c_attn_weight[..., start:end].reshape(hidden_size, n_heads, head_dim)
+        query_bias = c_attn_bias[start:end].reshape(n_heads, head_dim)
+
+        start = end
+        end = start + num_groups * head_dim
+        key_kernel = c_attn_weight[..., start:end].reshape(hidden_size, num_groups, head_dim)
+        key_bias = c_attn_bias[start:end].reshape(num_groups, head_dim)
+
+        start = end
+        end = start + num_groups * head_dim
+        value_kernel = c_attn_weight[..., start:end].reshape(hidden_size, num_groups, head_dim)
+        value_bias = c_attn_bias[start:end].reshape(num_groups, head_dim)
+
+
+        block_d["attn"] = {
+            "query": {
+                "kernel": query_kernel,
+                "bias": query_bias,
+            },
+            "key": {
+                "kernel": key_kernel,
+                "bias": key_bias,
+            },
+            "value": {
+                "kernel": value_kernel,
+                "bias": value_bias,
+            },
+            "out": {
+                "kernel": state_dict.pop(f"layers.{d}.self_attention.dense.weight").T.reshape(n_heads, head_dim, hidden_size),
+            },
+        }
+        block_d["ln_2"] = {
+            "scale": state_dict.pop(f"layers.{d}.post_attention_layernorm.weight"),
+        }
+
+        mlp_weight1 = state_dict[f"layers.{d}.mlp.dense_h_to_4h.weight"].T
+        intermediate_size = mlp_weight1.shape[1] // 2
+        block_d["mlp"] = {
+            "gate": {
+                "kernel": mlp_weight1[:, 0:intermediate_size],
+            },
+            "up": {
+                "kernel": mlp_weight1[:, intermediate_size:],
+            },
+            "down": {
+                "kernel": state_dict.pop(f"layers.{d}.mlp.dense_4h_to_h.weight").T,
+            },
+        }
+        root[f"h_{d}"] = block_d
+
+    root["ln_f"] = {
+        "scale": state_dict.pop("final_layernorm.weight"),
+    }
+    root["lm_head"] = {"kernel": state_dict.pop("output_layer.weight").T}
+    return root
+
+
+REMAP_FN = {
+    "llama": remap_llama_state_dict,
+    "qwen": remap_qwen_state_dict,
+    "chatglm": remap_chatglm2_state_dict,
+}
+
+def remap_state_dict(*args, **kwargs):
+    if 'format' in kwargs:
+        format = kwargs.pop('format')
+    else:
+        format = 'llama'
+    return REMAP_FN[format](*args, **kwargs)
 
 
 @register_chat_setting()
@@ -615,7 +932,7 @@ class LLaMA2ChatSetting:
 
 
 @register_chat_setting()
-class MistralInstructSetting:
+class MistralSetting:
     name = "mistral-instruct"
     system = ""
     roles = ("user", "assistant")
@@ -645,4 +962,74 @@ class MistralInstructSetting:
                     ret += f" {content}{eos}"
                 else:
                     ret += f" "
+        return ret
+
+
+@register_chat_setting()
+class InternLMChatSetting:
+    name = "internlm"
+    system = ""
+    roles = ("<|User|>", "<|Bot|>")
+    stop_token_ids = (2, 103028)
+
+    def get_prompt(self, messages):
+        r'''
+        prompt = ""
+        for record in history:
+            prompt += f"""<s><|User|>:{record[0]}<eoh>\n<|Bot|>:{record[1]}<eoa>\n"""
+        if len(prompt) == 0:
+            prompt += "<s>"
+        prompt += f"""<|User|>:{query}<eoh>\n<|Bot|>:"""            
+        '''
+        sep = "<eoh>\n"
+        sep2 = "<eoa>\n"
+        ret = ""
+        m = messages
+        n = len(m)
+        n = n - 2 if n % 2 == 0 else n - 1
+        for i in range(0, n, 2):
+            role1, message1 = m[i]
+            role2, message2 = m[i+1]
+            ret += f"""<s>{role1}:{message1}{sep}{role2}:{message2}{sep2}"""
+        if len(ret) == 0:
+            assert len(m) - n == 2
+            role1, message1 = m[-2]
+            role2, message2 = m[-1]
+            ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+            if message2:
+                ret += message2 + sep2
+        else:
+            if len(m) - n == 1:
+                role, message = m[-1]
+                ret += f"""<s>{role}:{message}{sep2}"""
+            else:
+                role1, message1 = m[-2]
+                role2, message2 = m[-1]
+                ret += f"""<s>{role1}:{message1}{sep}{role2}:"""
+                if message2:
+                    ret += message2 + sep2
+        return ret
+
+
+@register_chat_setting()
+class ChatGLM2Setting:
+    name = "chatglm2"
+    system = ""
+    roles = ("问", "答")
+    stop_token_ids = (0, 2)
+
+    def get_prompt(self, messages):
+        sep = "\n\n"
+        if self.system:
+            ret = self.system + sep
+        else:
+            ret = ""
+        for i, (role, message) in enumerate(messages):
+            if i % 2 == 0:
+                round = i // 2 + 1  # only difference from CHAT_GLM
+                ret += f"[Round {round}]{sep}{role}：{message}"
+            else:
+                ret += f"{sep}{role}："
+                if message:
+                    ret += message + sep
         return ret

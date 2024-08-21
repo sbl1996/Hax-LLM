@@ -1,4 +1,4 @@
-family: chatglm2
+family: llama
 name: chatglm2-6b
 tokenizer: THUDM/chatglm2-6b
 remat: False

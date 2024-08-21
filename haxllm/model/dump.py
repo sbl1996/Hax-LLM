@@ -96,12 +96,12 @@ def check_torch_ckpt(model_dir):
 
 @dataclass
 class Args:
-    model: str
-    """Model family available in haxllm.model"""
     source: str
     """Path to the model checkpoint file or directory, can be remote huggingface hub"""
     output: str = "."
     """Output path to save the dumped model"""
+    format: str = "llama"
+    """weight format, typically llama"""
     type: Optional[str] = None
     """Checkpoint type, can be either None, bin or safetensors. If None, will try to infer from the file extension"""
     dim: Optional[int] = None
@@ -112,9 +112,6 @@ class Args:
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    mod_name = "haxllm.model.{}".format(args.model)
-    print("Using {}".format(mod_name))
-    mod = importlib.import_module(mod_name)
 
     bin_files = None
     model_name = None
@@ -189,7 +186,8 @@ if __name__ == "__main__":
 
     if qconfig is not None:
         print("Quantize model with {}".format(qconfig))
-    tensors = mod.remap_state_dict(tensors, head_dim=args.dim, qconfig=qconfig)
+    from haxllm.model.llama import remap_state_dict
+    tensors = remap_state_dict(tensors, head_dim=args.dim, qconfig=qconfig, format=args.format)
     tensors = flatten_dict(tensors, sep=".")
     print("Save model to {}".format(save_path))
     save_file(tensors, save_path)
