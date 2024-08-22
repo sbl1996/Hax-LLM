@@ -175,6 +175,24 @@ def InternLM2_5Config(**kwargs):
     return {**base, **kwargs}
 
 
+def Phi3Config(**kwargs):
+    base = dict(
+        vocab_size=32064,
+        pad_token_id=0,  # <unk>
+        bos_token_id=1,
+        eos_token_id=32000,
+        rms_norm_eps=1e-5,
+        n_positions=32768,
+        rope_theta=10000.0,
+        # rope_scaling=dict(
+        #     rope_type='longrope',
+        #     factor=2.0,
+        #     max_position_embeddings=32768,
+        # )
+    )
+    return {**base, **kwargs}
+
+
 config_hub = {
     "qwen-7b": QwenConfig(
         hidden_size=4096,
@@ -353,6 +371,12 @@ config_hub = {
         n_heads=16,
         n_kv_heads=8,
         n_layers=24,
+    ),
+    "phi-3.5-mini-instruct": Phi3Config(
+        hidden_size=3072,
+        intermediate_size=8192,
+        n_heads=32,
+        n_layers=32,
     ),
 }
 
@@ -967,7 +991,7 @@ def remap_chatglm2_state_dict(state_dict, head_dim=None):
     return root
 
 
-def remap_internlm2_state_dict(state_dict, head_dim=None, qconfig=None):
+def remap_internlm2_state_dict(state_dict, head_dim=None):
     state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
     n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
     hidden_size = state_dict['tok_embeddings.weight'].shape[1]
@@ -986,17 +1010,19 @@ def remap_internlm2_state_dict(state_dict, head_dim=None, qconfig=None):
         block_d["ln_1"] = {
             "scale": state_dict.pop(f"layers.{d}.attention_norm.weight"),
         }
-        c_attn_weight = state_dict[f"layers.{d}.attention.wqkv.weight"].T
-        c_attn_weight = c_attn_weight.reshape(hidden_size, n_kv_heads, g + 2, head_dim)
-
-        query_kernel = c_attn_weight[:, :, :g].reshape(hidden_size, n_heads, head_dim)
-        key_kernel = c_attn_weight[:, :, -2].reshape(hidden_size, n_kv_heads, head_dim)
-        value_kernel = c_attn_weight[:, :, -1].reshape(hidden_size, n_kv_heads, head_dim)
+        w_qkv = state_dict[f"layers.{d}.attention.wqkv.weight"].T
+        w_qkv = w_qkv.reshape(hidden_size, n_kv_heads, g + 2, head_dim)
 
         block_d["attn"] = {
-            "query": {"kernel": query_kernel},
-            "key": {"kernel": key_kernel},
-            "value": {"kernel": value_kernel},
+            "query": {
+                "kernel": w_qkv[:, :, :g].reshape(hidden_size, n_heads, head_dim)
+            },
+            "key": {
+                "kernel": w_qkv[:, :, -2].reshape(hidden_size, n_kv_heads, head_dim)
+            },
+            "value": {
+                "kernel": w_qkv[:, :, -1].reshape(hidden_size, n_kv_heads, head_dim)
+            },
             "out": {
                 "kernel": state_dict.pop(
                     f"layers.{d}.attention.wo.weight").T.reshape(n_heads, head_dim, hidden_size),
@@ -1020,29 +1046,86 @@ def remap_internlm2_state_dict(state_dict, head_dim=None, qconfig=None):
     return root
 
 
+def remap_phi3_state_dict(state_dict, head_dim=None):
+    state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
+    n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
+    hidden_size = state_dict['embed_tokens.weight'].shape[1]
+    if head_dim is None:
+        head_dim = 128
+    n_heads = hidden_size  // head_dim
+    n_kv_heads = (state_dict['layers.0.self_attn.qkv_proj.weight'].shape[0] // head_dim - n_heads) // 2
+
+    root = {}
+    root["wte"] = {"embedding": state_dict.pop("embed_tokens.weight")}
+
+    # TransformerBlock
+    for d in range(n_layers):
+        block_d = {}
+        block_d["ln_1"] = {
+            "scale": state_dict.pop(f"layers.{d}.input_layernorm.weight"),
+        }
+        w_qkv = state_dict[f"layers.{d}.self_attn.qkv_proj.weight"].T
+        w_qkv = w_qkv.reshape(hidden_size, n_heads + 2 * n_kv_heads, head_dim)
+        block_d["attn"] = {
+            "query": {
+                "kernel": w_qkv[:, :n_heads]
+            },
+            "key": {
+                "kernel": w_qkv[:, n_heads:(n_heads + n_kv_heads)]
+            },
+            "value": {
+                "kernel": w_qkv[:, (n_heads + n_kv_heads):]
+            },
+            "out": {
+                "kernel": state_dict.pop(
+                    f"layers.{d}.self_attn.o_proj.weight").T.reshape(n_heads, head_dim, hidden_size),
+            },
+        }
+        block_d["ln_2"] = {
+            "scale": state_dict.pop(f"layers.{d}.post_attention_layernorm.weight"),
+        }
+
+        w_gate_up = state_dict[f"layers.{d}.mlp.gate_up_proj.weight"].T
+        c = w_gate_up.shape[1] // 2
+        block_d["mlp"] = {
+            "gate": {"kernel": w_gate_up[:, :c]},
+            "up": {"kernel": w_gate_up[:, c:]},
+            "down": {"kernel": state_dict.pop(f"layers.{d}.mlp.down_proj.weight").T},
+        }
+        root[f"h_{d}"] = block_d
+
+    root["ln_f"] = {
+        "scale": state_dict.pop("norm.weight"),
+    }
+    root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
+    return root
+
+
 REMAP_FN = {
     "llama": remap_llama_state_dict,
     "qwen": remap_qwen_state_dict,
     "chatglm": remap_chatglm2_state_dict,
     "internlm2": remap_internlm2_state_dict,
+    "phi3": remap_phi3_state_dict,
 }
 
 
 def remap_state_dict(*args, **kwargs):
     format = kwargs.pop("format", "llama")
     qconfig: QConfig = kwargs.pop("qconfig", None)
-    q_source = qconfig.source
-    q_method = qconfig.method
     if format != "llama" and qconfig is not None:
-        assert qconfig.source == QuantSource.half and q_method == QuantMethod.rtn_q8_0
+        assert qconfig.source == QuantSource.half and qconfig.method == QuantMethod.rtn_q8_0
     root = REMAP_FN[format](*args, **kwargs)
     if qconfig is not None:
+        q_source = qconfig.source
+        q_method = qconfig.method
         if q_source == QuantSource.half and q_method == QuantMethod.rtn_q8_0:
             return quantize_llama_to_q8(root, qconfig)
         elif q_source in [QuantSource.autogptq_q4, QuantSource.autoawq_q4, QuantSource.autogptq_q8]:
             return convert_llama_q_params(root, qconfig=qconfig)
         else:
             raise NotImplementedError(f"Quant method {q_method} is not supported for {format} from {q_source}")
+    return root
 
 
 @register_chat_setting()
@@ -1380,3 +1463,27 @@ class Qwen2ChatSetting:
 
     def get_prompt(self, messages):
         return qwen_encode_message(messages, self.system)
+
+
+@register_chat_setting()
+class Phi3ChatSetting:
+    name = "phi3"
+    system = ""
+    roles = ("<|user|>", "<|assistant|>")
+    stop_token_ids = (32000, 32007)
+
+    def get_prompt(self, messages):
+        eot = "<|end|>"
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        ret = ""
+        if system:
+            ret += f"<|system|>{system}{eot}"
+        for i, (role, message) in enumerate(messages):
+            ret += role
+            if message:
+                ret += f"{message}{eot}"
+        return ret

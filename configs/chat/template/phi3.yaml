@@ -1,0 +1,5 @@
+family: llama
+tokenizer: microsoft/Phi-3.5-mini-instruct
+remat: False
+scan: False
+conv_template: phi3

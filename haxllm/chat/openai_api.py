@@ -170,7 +170,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 
 def wrap_sse(chunk):
-    return f"event: chunk\nid: {chunk.id}\ndata: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+    return f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
 
 async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
@@ -246,7 +246,7 @@ async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
     chunk = ChatCompletionStreamResponse(
         id=id, model=model_id, choices=[choice_data])
     yield wrap_sse(chunk)
-    yield f"event: chunk\nid: {id}\ndata: [DONE]\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
