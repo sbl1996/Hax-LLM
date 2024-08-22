@@ -118,10 +118,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if len(prev_messages) > 0 and prev_messages[0].role == "system":
         system_message = prev_messages.pop(0).content
     else:
-        system_message = ""
+        system_message = None
 
     conv = get_conv_template(conv_template)
-    conv.config.system = system_message
+    if system_message:
+        conv.config.system = system_message
 
     for msg in prev_messages:
         if msg.role == "user":

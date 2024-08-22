@@ -10,10 +10,17 @@ import jax
 import jax.numpy as jnp
 
 
+class QuantSource(enum.Enum):
+    half = 0
+    autogptq_q8 = 1
+    autoawq_q4 = 2
+    autogptq_q4 = 3
+
+
 class QuantMethod(enum.Enum):
     rtn_q8_0 = 0
-    awq_q4 = 1
-    gptq_q4 = 2
+    repack_q4 = 1
+
 
 dtype_to_bits = {
     jnp.float32: 32,
@@ -25,6 +32,7 @@ dtype_to_bits = {
 
 @dataclass
 class QConfig:
+    source: QuantSource = QuantSource.half
     method: QuantMethod = QuantMethod.rtn_q8_0
     group_size: int = 128
     sym: bool = False
@@ -34,19 +42,23 @@ class QConfig:
 
     def __post_init__(self):
         for l in self.q_layers:
-            assert l in ("attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"), f"Invalid layer: {l}"
-        if self.method in [QuantMethod.rtn_q8_0, QuantMethod.gptq_q4]:
+            assert l in ("attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"), f"Invalid layer: {l}"        
+
+        if self.source in [QuantSource.autoawq_q4, QuantSource.autogptq_q4]:
+            assert self.method == QuantMethod.repack_q4
+        if self.source in [QuantSource.autogptq_q8]:
+            assert self.method == QuantMethod.rtn_q8_0
+
+        if self.source in [QuantSource.autogptq_q4] or self.method in [QuantMethod.rtn_q8_0]:
             assert self.sym
-        elif self.method in [QuantMethod.awq_q4]:
+        elif self.source in [QuantSource.autoawq_q4]:
             assert not self.sym
 
     @property
     def q_bits(self):
         if self.method == QuantMethod.rtn_q8_0:
             return 8
-        elif self.method == QuantMethod.awq_q4:
-            return 4
-        elif self.method == QuantMethod.gptq_q4:
+        elif self.method == QuantMethod.repack_q4:
             return 4
         else:
             raise NotImplementedError
@@ -59,15 +71,14 @@ class QConfig:
     def w_dtype(self):
         if self.method == QuantMethod.rtn_q8_0:
             return jnp.int8
-        elif self.method == QuantMethod.awq_q4:
-            return jnp.int32
-        elif self.method == QuantMethod.gptq_q4:
+        elif self.method == QuantMethod.repack_q4:
             return jnp.int32
         else:
             raise NotImplementedError
     
     def quantize(self, *args):
         if self.method == QuantMethod.rtn_q8_0:
+            assert self.source == QuantSource.half
             w, = args
             w, scale = group_abs_max_int8_quantize(w, group_size=self.group_size, q_dtype=self.q_dtype)
             return w, scale
@@ -77,12 +88,13 @@ class QConfig:
     def dequantize(self, q):
         if self.method == QuantMethod.rtn_q8_0:
             return group_dequantize(q["qweight"], None, q["scales"])
-        elif self.method == QuantMethod.awq_q4:
+        elif self.method == QuantMethod.repack_q4:
             qweight = self._unpack(q["qweight"])
-            return group_dequantize(qweight, q["zeros"][:, None], q["scales"])
-        elif self.method == QuantMethod.gptq_q4:
-            qweight = self._unpack(q["qweight"])
-            return group_dequantize(qweight, 8, q["scales"])
+            if self.source == QuantSource.autoawq_q4:
+                qzeros = q["zeros"][:, None]
+            elif self.source == QuantSource.autogptq_q4:
+                qzeros = 8
+            return group_dequantize(qweight, qzeros, q["scales"])
         else:
             raise NotImplementedError
 
@@ -107,29 +119,37 @@ class QConfig:
             raise NotImplementedError
 
     def requantize(self, *args):
-        if self.method == QuantMethod.awq_q4:
+        if self.source == QuantSource.autoawq_q4:
             qweight, qzeros = args
             weight, zeros = jax.tree.map(
                 lambda x: int_unpack(jnp.array(x)), (qweight, qzeros))
             weight = np.array(self._pack(weight))
             zeros = np.array(zeros)
             return weight, zeros
-        elif self.method == QuantMethod.gptq_q4:
+        elif self.source == QuantSource.autogptq_q4:
             qweight, qzeros = args
             weight = int_unpack(jnp.array(qweight), 4, 'gptq')
             weight = np.array(self._pack(weight))
+            return weight, qzeros
+        elif self.source == QuantSource.autogptq_q8:
+            qweight, qzeros = args
+            weight = int_unpack(jnp.array(qweight), 8, 'gptq') - 128
+            weight = np.array(weight)
             return weight, qzeros
         else:
             raise NotImplementedError
 
     def __str__(self):
-        return f"QConfig(method={self.method}, " \
+        return f"QConfig(" \
+               f"method={self.method}, " \
+               f"source={self.source}, " \
                f"group_size={self.group_size}, " \
                f"sym={self.sym}, q_dtype={self.q_dtype}, pack={self.pack}, q_layers={self.q_layers})"
 
     def to_json(self):
         return json.dumps(
             {
+                "source": self.source.name,
                 "method": self.method.name,
                 "sym": self.sym,
                 "group_size": self.group_size,
@@ -143,6 +163,7 @@ class QConfig:
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
         kwargs = dict(
+            source=QuantSource[data["source"]],
             method=QuantMethod[data["method"]],
             sym=data["sym"],
             q_dtype=jnp.dtype(data["q_dtype"]) if data["q_dtype"] is not None else None,
@@ -288,41 +309,3 @@ def group_dequantize(qweight, qzeros, scales):
     weight = qweight * scales[:, None]
     weight = weight.reshape(-1, *weight.shape[2:])
     return weight
-
-
-# def unpack_awq(qweight, qzeros, bits: int):
-#     shifts = jnp.arange(0, 32, bits, dtype=qweight.dtype)
-
-#     for i in range(qweight.ndim):
-#         shifts = jnp.expand_dims(shifts, axis=0)
-#     iweights = jnp.bitwise_right_shift(qweight[..., None], shifts).astype(jnp.int8)
-#     iweights = iweights.reshape(*iweights.shape[:-2], -1)
-
-#     if qzeros is not None:
-#         izeros = jnp.bitwise_right_shift(qzeros[..., None], shifts).astype(jnp.int8)
-#         izeros = izeros.reshape(*izeros.shape[:-2], -1)
-#     else:
-#         izeros = qzeros
-
-#     return iweights, izeros
-
-
-# def awq_dequantize(qweight, qzeros, scales):
-#     bits = scales.shape[-1] // qweight.shape[-1] // 2
-#     # qweight int32, qzeros int32
-#     # Unpack the qweight and qzeros tensors
-#     iweight, izeros = unpack_awq(qweight, qzeros, bits)
-#     # Reverse the order of the iweight and izeros tensors
-#     iweight, izeros = reverse_awq_order(iweight, izeros, bits)
-
-#     # overflow checks
-#     iweight = jnp.bitwise_and(iweight, (2**bits) - 1)
-#     izeros = jnp.bitwise_and(izeros, (2**bits) - 1)
-
-#     # fp16 weights
-#     group_size = iweight.shape[0] // scales.shape[0]
-#     iweight = iweight.reshape(-1, group_size, *iweight.shape[1:])
-#     iweight = (iweight - izeros[:, None]) * scales[:, None]
-#     iweight = iweight.reshape(-1, *iweight.shape[2:])
-
-#     return iweight

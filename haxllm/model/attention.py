@@ -9,15 +9,15 @@ import flax.linen as nn
 from haxllm.model.mixin import RoPEScalingConfig
 
 
-def compute_inv_freq(dim: int, theta = 10000.0):
-    return 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
+def compute_inv_freq(dim: int, base = 10000.0):
+    return 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32)[: (dim // 2)] / dim))
 
 
 def compute_llama3_inv_freq(
-    dim: int, theta = 10000.0, factor: float = 8.0,
+    dim: int, base = 10000.0, factor: float = 8.0,
     low_freq_factor: float = 1.0, high_freq_factor: float = 4.0,
     max_position_embeddings: int = 8192):
-    inv_freq = compute_inv_freq(dim, theta)
+    inv_freq = compute_inv_freq(dim, base)
     old_context_len = max_position_embeddings
 
     low_freq_wavelen = old_context_len / low_freq_factor
@@ -143,20 +143,28 @@ def apply_rotary_pos_emb_index2(q, k, cos, sin, position_id=None):
     return q, k
 
 
-def make_apply_rope(head_dim, max_len, dtype, theta=10000.0, scaling: Optional[RoPEScalingConfig] = None):
+def make_apply_rope(head_dim, max_len, dtype, base=10000.0, scaling: Optional[RoPEScalingConfig] = None):
     rope_type = "default" if scaling is None else scaling.rope_type
-    if rope_type == "default":
-        inv_freq = compute_inv_freq(head_dim, theta)
-        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
-        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
-    elif rope_type == "chatglm2":
-        inv_freq = compute_inv_freq(head_dim // 2, theta)
+    if rope_type == "chatglm2":
+        inv_freq = compute_inv_freq(head_dim // 2, base)
         cos, sin = precompute_freqs_cis2(inv_freq, max_len, dtype=dtype)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
+    elif rope_type == "default":
+        inv_freq = compute_inv_freq(head_dim, base)
+        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
+        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     elif rope_type == "llama3":
         inv_freq = compute_llama3_inv_freq(
-            head_dim, theta, scaling.factor, scaling.low_freq_factor, scaling.high_freq_factor,
+            head_dim, base, scaling.factor, scaling.low_freq_factor, scaling.high_freq_factor,
             scaling.max_position_embeddings)
+        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
+        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+    elif rope_type == "dynamic":
+        orig_max_len = scaling.max_position_embeddings
+        if max_len > orig_max_len:
+            alpha = scaling.factor * max_len / orig_max_len - (scaling.factor - 1)
+            base = base * alpha ** (dim / (dim - 2))
+        inv_freq = compute_inv_freq(head_dim, base)
         cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     return add_pos

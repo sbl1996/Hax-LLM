@@ -90,7 +90,7 @@ class DenseGeneral(nn.Module):
 
         if qconfig is None:
             kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
-        elif qconfig.method in [QuantMethod.awq_q4, QuantMethod.gptq_q4, QuantMethod.rtn_q8_0]:
+        elif qconfig.method in [QuantMethod.rtn_q8_0, QuantMethod.repack_q4]:
             shape1 = int(math.prod(kernel_shape[0:n_axis]))
             shape2 = int(math.prod(kernel_shape[-n_features:]))
             if qconfig.w_bits == qconfig.q_bits:

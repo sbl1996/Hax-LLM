@@ -1,0 +1,5 @@
+family: llama
+tokenizer: internlm/internlm2_5-1_8b-chat
+remat: False
+scan: False
+conv_template: internlm2

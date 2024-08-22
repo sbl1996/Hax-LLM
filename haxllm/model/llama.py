@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.quantize import QConfig, QuantMethod
+from haxllm.model.quantize import QConfig, QuantMethod, QuantSource
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfigMixin
@@ -22,6 +22,7 @@ def QwenConfig(**kwargs):
         bos_token_id=151643,
         eos_token_id=151645,
         rope_theta=10000.0,
+        n_positions=32768,
     )
     return {**base, **kwargs}
 
@@ -34,6 +35,7 @@ def Qwen2Config(**kwargs):
         bos_token_id=151643,
         eos_token_id=151645,
         rope_theta=1000000.0,
+        n_positions=32768,
     )
     return {**base, **kwargs}
 
@@ -45,6 +47,7 @@ def LlamaConfig(**kwargs):
         bos_token_id=1,
         eos_token_id=2,
         rope_theta=10000.0,
+        n_positions=4096,
     )
     return {**base, **kwargs}
 
@@ -57,6 +60,7 @@ def Llama2Config(**kwargs):
         eos_token_id=2,
         rope_theta=10000.0,
         rms_norm_eps=1e-5,
+        n_positions=4096,
     )
     return {**base, **kwargs}
 
@@ -69,6 +73,7 @@ def InternLMConfig(**kwargs):
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        n_positions=2048,
     )
     return {**base, **kwargs}
 
@@ -82,6 +87,7 @@ def ChatGLM2Config(**kwargs):
         bos_token_id=1,
         eos_token_id=2,
         rms_norm_eps=1e-5,
+        n_positions=32768,
         rope_scaling=dict(
             rope_type="chatglm2",
         )
@@ -97,6 +103,7 @@ def YiConfig(**kwargs):
         eos_token_id=2,
         rope_theta=5000000.0,
         rms_norm_eps=1e-5,
+        n_positions=4096,
     )
     return {**base, **kwargs}
 
@@ -110,6 +117,7 @@ def Yi1_5Config(**kwargs):
         eos_token_id=2,
         rope_theta=5000000.0,
         rms_norm_eps=1e-6,
+        n_positions=4096,
     )
     return {**base, **kwargs}
 
@@ -123,6 +131,7 @@ def Llama3Config(**kwargs):
         eos_token_id=128009,
         rope_theta=500000.0,
         rms_norm_eps=1e-5,
+        n_positions=8192,
         rope_scaling=dict(
             rope_type="llama3",
             factor=8.0,
@@ -143,6 +152,25 @@ def MistralConfig(**kwargs):
         eos_token_id=2,
         rope_theta=1000000.0,
         rms_norm_eps=1e-5,
+        n_positions=32768,
+    )
+    return {**base, **kwargs}
+
+
+def InternLM2_5Config(**kwargs):
+    base = dict(
+        vocab_size=92544,
+        pad_token_id=92537,  # last unused token
+        bos_token_id=1,
+        eos_token_id=2,
+        rms_norm_eps=1e-5,
+        n_positions=32768,
+        rope_theta=1000000.0,
+        rope_scaling=dict(
+            factor=2.0,
+            rope_type='dynamic',
+            max_position_embeddings=32768,
+        )
     )
     return {**base, **kwargs}
 
@@ -318,6 +346,13 @@ config_hub = {
         n_heads=48,
         n_kv_heads=8,
         n_layers=56,
+    ),
+    "internlm2.5-1_8b": InternLM2_5Config(
+        hidden_size=2048,
+        intermediate_size=8192,
+        n_heads=16,
+        n_kv_heads=8,
+        n_layers=24,
     ),
 }
 
@@ -548,8 +583,7 @@ def remap_qwen_state_dict(state_dict, head_dim=128):
     return root
 
 
-def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
-    q_method = qconfig.method if qconfig is not None else None
+def remap_llama_state_dict(state_dict, head_dim=None):
     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
     rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
@@ -558,26 +592,18 @@ def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig]
     elif head_dim is None:
         head_dim = 128
     n_heads = hidden_size  // head_dim
-    if q_method is None or q_method == QuantMethod.rtn_q8_0:
+    sample_w_key = 'model.layers.0.self_attn.k_proj.weight'
+    if sample_w_key in state_dict:
         sample_w = state_dict['model.layers.0.self_attn.k_proj.weight']
         n_kv_heads = sample_w.shape[0] // head_dim
         half_dtype = sample_w.dtype
-    elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
-        q_key = 'model.layers.0.self_attn.q_proj.'
-        qweight = state_dict[q_key + 'qweight']
-        scales = state_dict[q_key + 'scales']
+    else:
+        scales = state_dict['model.layers.0.self_attn.k_proj.scales']
+        n_kv_heads = scales.shape[1] // head_dim
         half_dtype = scales.dtype
-        # bits = scales.shape[-1] // qweight.shape[-1] // 2
-        bits = 4
-        assert qconfig.q_bits == bits
-        bits_reduce = qconfig.w_bits // qconfig.q_bits
-        if q_method == QuantMethod.awq_q4:
-            group_size = qweight.shape[0] // scales.shape[0]
-        else:
-            group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
-        assert qconfig.group_size == group_size
-        hidden_size_g = hidden_size // group_size
-        n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
+        if half_dtype == jnp.float32:
+            half_dtype = jnp.bfloat16
+
     assert half_dtype in [jnp.bfloat16, jnp.float16]
 
     root = {}
@@ -596,11 +622,9 @@ def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig]
             else:
                 src_l, src_l2 = "mlp", part
             prefix = f"model.layers.{d}.{src_l}.{src_l2}_proj"
-            if q_method is None or q_method == QuantMethod.rtn_q8_0:
+            weight_key = f"{prefix}.weight"
+            if weight_key in state_dict:
                 kernel = state_dict.pop(f"{prefix}.weight").T
-                quantize = q_method == QuantMethod.rtn_q8_0 and name in qconfig.q_layers
-                if quantize:
-                    kernel, scales = qconfig.quantize(kernel)
                 if part == 'query':
                     kernel = kernel.reshape(hidden_size, n_heads, head_dim)
                 elif part in ['key', 'value']:
@@ -608,41 +632,11 @@ def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig]
                 elif part == 'out':
                     kernel = kernel.reshape(n_heads, head_dim, hidden_size)
                 params = {"kernel": kernel}
-                if quantize:
-                    params['scales'] = scales
-            elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
+            else:
                 qweight = state_dict.pop(f"{prefix}.qweight")
                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
                 scales = state_dict.pop(f"{prefix}.scales")
-                qweight, qzeros = qconfig.requantize(qweight, qzeros)
-                if qconfig.pack == 1:
-                    div1, div2 = 1, 8
-                elif qconfig.pack == 2:
-                    div1, div2 = 2, 4
-                elif qconfig.pack == 3:
-                    div1, div2 = 8, 1
-                if part == 'query':
-                    qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
-                    scales = scales.reshape(hidden_size_g, n_heads*head_dim)
-                    if not qconfig.sym:
-                        qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim)
-                elif part in ['key', 'value']:
-                    qweight = qweight.reshape(hidden_size // div1, n_kv_heads, head_dim // div2)
-                    scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
-                    if not qconfig.sym:
-                        qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
-                elif part == 'out':
-                    # HACK
-                    if qconfig.pack == 3:
-                        qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
-                    else:
-                        qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
-                    scales = scales.reshape(hidden_size_g, hidden_size)
-                    if not qconfig.sym:
-                        qzeros = qzeros.reshape(hidden_size_g, hidden_size)
-                params = {"kernel": qweight, "scales": scales}
-                if not qconfig.sym:
-                    params['zeros'] = qzeros
+                params = {"qweight": qweight, "qzeros": qzeros, "scales": scales}
 
             bias = state_dict.pop(f"{prefix}.bias", None)
             if bias is not None and not (bias == 0).all():
@@ -670,6 +664,224 @@ def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig]
     return root
 
 
+def quantize_llama_to_q8(root, qconfig: QConfig):
+    # half -> int8
+    n_layers = len([k for k in root.keys() if k.startswith("h_")])
+    q_method = qconfig.q_method
+    if qconfig.source != QuantSource.half or q_method != QuantMethod.rtn_q8_0:
+        raise NotImplementedError("only support rtn_q8_0")
+
+    for i in range(n_layers):
+        d = root[f"h_{i}"]
+        for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
+            if name not in qconfig.q_layers:
+                continue
+            part1, part2 = name.split('.')
+            params = d[part1][part2]
+            kernel = params['kernel']
+            shape = kernel.shape
+            if part2 == 'out':
+                # h, d -> h*d
+                kernel = kernel.reshape(-1, *shape[2:])
+            kernel, scales = qconfig.quantize(kernel)
+            kernel = kernel.reshape(shape)
+            params['kernel'] = kernel
+            params['scales'] = scales
+    return root
+
+
+def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
+    # TODO: hard code head_dim
+    # TODO: decompose remap and quantize
+    n_layers = len([k for k in root.keys() if k.startswith("h_")])
+    q_source = qconfig.source
+    if q_source not in [QuantSource.autoawq_q4, QuantSource.autogptq_q4, QuantSource.autogptq_q8]:
+        raise NotImplementedError(f"only support awq_q4 and gptq_q4, but got {q_source}")
+
+    hidden_size = root['wte']['embedding'].shape[1]
+    n_heads = hidden_size  // head_dim
+    q_params = root['h_0']['attn']['query']
+    qweight = q_params['qweight']
+    scales = q_params['scales']
+    if q_source == QuantSource.autogptq_q8:
+        group_size = qweight.shape[0] * 4 // scales.shape[0]
+    else:
+        assert qconfig.q_bits == 4
+        bits_reduce = qconfig.w_bits // qconfig.q_bits
+        if q_source == QuantSource.autoawq_q4:
+            group_size = qweight.shape[0] // scales.shape[0]
+        else:
+            group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
+    assert qconfig.group_size == group_size
+    hidden_size_g = hidden_size // group_size
+    n_kv_heads = root['h_0']['attn']['key']['scales'].shape[1] // head_dim
+
+    for i in range(n_layers):
+        d = root[f"h_{i}"]
+        for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
+            part1, part2 = name.split('.')
+            params = d[part1][part2]
+            qweight = params.pop('qweight')
+            qzeros = params.pop('qzeros')
+            scales = params.pop('scales')
+            qweight, qzeros = qconfig.requantize(qweight, qzeros)
+            if q_source == QuantSource.autogptq_q8:
+                div1, div2 = 1, 1
+            elif qconfig.pack == 1:
+                div1, div2 = 1, 8
+            elif qconfig.pack == 2:
+                div1, div2 = 2, 4
+            elif qconfig.pack == 3:
+                div1, div2 = 8, 1
+            if part2 == 'query':
+                qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
+                scales = scales.reshape(hidden_size_g, n_heads*head_dim)
+                if not qconfig.sym:
+                    qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim)
+            elif part2 in ['key', 'value']:
+                qweight = qweight.reshape(hidden_size // div1, n_kv_heads, head_dim // div2)
+                scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
+                if not qconfig.sym:
+                    qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
+            elif part2 == 'out':
+                # HACK
+                if qconfig.pack == 3:
+                    qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
+                else:
+                    qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
+                scales = scales.reshape(hidden_size_g, hidden_size)
+                if not qconfig.sym:
+                    qzeros = qzeros.reshape(hidden_size_g, hidden_size)
+            params['kernel'] = qweight
+            params['scales'] = scales
+            if not qconfig.sym:
+                params['zeros'] = qzeros
+    return root
+
+
+# def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
+#     # TODO: decompose remap and quantize
+#     q_method = qconfig.method if qconfig is not None else None
+#     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
+#     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
+#     rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
+#     if rope_key in state_dict:
+#         head_dim = state_dict[rope_key].shape[0] * 2
+#     elif head_dim is None:
+#         head_dim = 128
+#     n_heads = hidden_size  // head_dim
+#     if q_method is None or q_method == QuantMethod.rtn_q8_0:
+#         sample_w = state_dict['model.layers.0.self_attn.k_proj.weight']
+#         n_kv_heads = sample_w.shape[0] // head_dim
+#         half_dtype = sample_w.dtype
+#     elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
+#         q_key = 'model.layers.0.self_attn.q_proj.'
+#         qweight = state_dict[q_key + 'qweight']
+#         scales = state_dict[q_key + 'scales']
+#         half_dtype = scales.dtype
+#         # bits = scales.shape[-1] // qweight.shape[-1] // 2
+#         bits = 4
+#         assert qconfig.q_bits == bits
+#         bits_reduce = qconfig.w_bits // qconfig.q_bits
+#         if q_method == QuantMethod.awq_q4:
+#             group_size = qweight.shape[0] // scales.shape[0]
+#         else:
+#             group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
+#         assert qconfig.group_size == group_size
+#         hidden_size_g = hidden_size // group_size
+#         n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
+#     assert half_dtype in [jnp.bfloat16, jnp.float16]
+
+#     root = {}
+#     root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight").astype(half_dtype)}
+
+#     for d in range(n_layers):
+#         block_d = {}
+#         block_d["ln_1"] = {"scale": state_dict.pop(
+#             f"model.layers.{d}.input_layernorm.weight")}
+#         block_d["attn"] = {}
+#         block_d["mlp"] = {}
+#         for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
+#             dst_l, part = name.split('.')
+#             if dst_l == 'attn':
+#                 src_l, src_l2 = "self_attn", part[0]
+#             else:
+#                 src_l, src_l2 = "mlp", part
+#             prefix = f"model.layers.{d}.{src_l}.{src_l2}_proj"
+#             if q_method is None or q_method == QuantMethod.rtn_q8_0:
+#                 kernel = state_dict.pop(f"{prefix}.weight").T
+#                 quantize = q_method == QuantMethod.rtn_q8_0 and name in qconfig.q_layers
+#                 if quantize:
+#                     kernel, scales = qconfig.quantize(kernel)
+#                 if part == 'query':
+#                     kernel = kernel.reshape(hidden_size, n_heads, head_dim)
+#                 elif part in ['key', 'value']:
+#                     kernel = kernel.reshape(hidden_size, n_kv_heads, head_dim)
+#                 elif part == 'out':
+#                     kernel = kernel.reshape(n_heads, head_dim, hidden_size)
+#                 params = {"kernel": kernel}
+#                 if quantize:
+#                     params['scales'] = scales
+#             elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
+#                 qweight = state_dict.pop(f"{prefix}.qweight")
+#                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
+#                 scales = state_dict.pop(f"{prefix}.scales")
+#                 qweight, qzeros = qconfig.requantize(qweight, qzeros)
+#                 if qconfig.pack == 1:
+#                     div1, div2 = 1, 8
+#                 elif qconfig.pack == 2:
+#                     div1, div2 = 2, 4
+#                 elif qconfig.pack == 3:
+#                     div1, div2 = 8, 1
+#                 if part == 'query':
+#                     qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
+#                     scales = scales.reshape(hidden_size_g, n_heads*head_dim)
+#                     if not qconfig.sym:
+#                         qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim)
+#                 elif part in ['key', 'value']:
+#                     qweight = qweight.reshape(hidden_size // div1, n_kv_heads, head_dim // div2)
+#                     scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
+#                     if not qconfig.sym:
+#                         qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
+#                 elif part == 'out':
+#                     # HACK
+#                     if qconfig.pack == 3:
+#                         qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
+#                     else:
+#                         qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
+#                     scales = scales.reshape(hidden_size_g, hidden_size)
+#                     if not qconfig.sym:
+#                         qzeros = qzeros.reshape(hidden_size_g, hidden_size)
+#                 params = {"kernel": qweight, "scales": scales}
+#                 if not qconfig.sym:
+#                     params['zeros'] = qzeros
+
+#             bias = state_dict.pop(f"{prefix}.bias", None)
+#             if bias is not None and not (bias == 0).all():
+#                 if part == 'query':
+#                     bias = bias.reshape(n_heads, head_dim)
+#                 elif part in ['key', 'value']:
+#                     bias = bias.reshape(n_kv_heads, head_dim)
+#                 elif part == 'out':
+#                     bias = bias.reshape(hidden_size)
+#                 params["bias"] = bias
+
+#             block_d[dst_l][part] = params
+#         block_d["ln_2"] = {"scale": state_dict.pop(
+#             f"model.layers.{d}.post_attention_layernorm.weight")}
+#         root[f"h_{d}"] = block_d
+
+#     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
+#     if "lm_head.weight" in state_dict:
+#         weight = state_dict.pop("lm_head.weight").T
+#     else:
+#         # tie_word_embeddings
+#         print("WARNING: use tied weights for lm_head")
+#         weight = root["wte"]["embedding"].T.copy()
+#     root["lm_head"] = {"kernel": weight.astype(half_dtype)}
+#     return root
+
+
 def remap_chatglm2_state_dict(state_dict, head_dim=None):
     state_dict = {k.replace("transformer.", ""): v for k, v in state_dict.items()}
     state_dict = {k.replace("encoder.", ""): v for k, v in state_dict.items()}
@@ -692,7 +904,7 @@ def remap_chatglm2_state_dict(state_dict, head_dim=None):
             "scale": state_dict.pop(f"layers.{d}.input_layernorm.weight"),
         }
         c_attn_weight = state_dict[f"layers.{d}.self_attention.query_key_value.weight"].T
-        c_attn_weight = c_attn_weight.reshape(hidden_size, n_heads * head_dim + 2 * num_groups * head_dim)
+        c_attn_weight = c_attn_weight.reshape(hidden_size, (n_heads + 2 * num_groups) * head_dim)
         c_attn_bias = state_dict[f"layers.{d}.self_attention.query_key_value.bias"]
         c_attn_bias = c_attn_bias.reshape(n_heads * head_dim + 2 * num_groups * head_dim)
 
@@ -755,18 +967,82 @@ def remap_chatglm2_state_dict(state_dict, head_dim=None):
     return root
 
 
+def remap_internlm2_state_dict(state_dict, head_dim=None, qconfig=None):
+    state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
+    n_layers = max([int(k.split('.')[1]) for k in state_dict.keys() if k.startswith("layers.")]) + 1
+    hidden_size = state_dict['tok_embeddings.weight'].shape[1]
+    if head_dim is None:
+        head_dim = 128
+    n_heads = hidden_size  // head_dim
+    n_kv_heads = (state_dict['layers.0.attention.wqkv.weight'].shape[0] // head_dim - n_heads) // 2
+    g = n_heads // n_kv_heads
+
+    root = {}
+    root["wte"] = {"embedding": state_dict.pop("tok_embeddings.weight")}
+
+    # TransformerBlock
+    for d in range(n_layers):
+        block_d = {}
+        block_d["ln_1"] = {
+            "scale": state_dict.pop(f"layers.{d}.attention_norm.weight"),
+        }
+        c_attn_weight = state_dict[f"layers.{d}.attention.wqkv.weight"].T
+        c_attn_weight = c_attn_weight.reshape(hidden_size, n_kv_heads, g + 2, head_dim)
+
+        query_kernel = c_attn_weight[:, :, :g].reshape(hidden_size, n_heads, head_dim)
+        key_kernel = c_attn_weight[:, :, -2].reshape(hidden_size, n_kv_heads, head_dim)
+        value_kernel = c_attn_weight[:, :, -1].reshape(hidden_size, n_kv_heads, head_dim)
+
+        block_d["attn"] = {
+            "query": {"kernel": query_kernel},
+            "key": {"kernel": key_kernel},
+            "value": {"kernel": value_kernel},
+            "out": {
+                "kernel": state_dict.pop(
+                    f"layers.{d}.attention.wo.weight").T.reshape(n_heads, head_dim, hidden_size),
+            },
+        }
+        block_d["ln_2"] = {
+            "scale": state_dict.pop(f"layers.{d}.ffn_norm.weight"),
+        }
+
+        block_d["mlp"] = {
+            "gate": {"kernel": state_dict.pop(f"layers.{d}.feed_forward.w1.weight").T},
+            "up": {"kernel": state_dict.pop(f"layers.{d}.feed_forward.w3.weight").T},
+            "down": {"kernel": state_dict.pop(f"layers.{d}.feed_forward.w2.weight").T},
+        }
+        root[f"h_{d}"] = block_d
+
+    root["ln_f"] = {
+        "scale": state_dict.pop("norm.weight"),
+    }
+    root["lm_head"] = {"kernel": state_dict.pop("output.weight").T}
+    return root
+
+
 REMAP_FN = {
     "llama": remap_llama_state_dict,
     "qwen": remap_qwen_state_dict,
     "chatglm": remap_chatglm2_state_dict,
+    "internlm2": remap_internlm2_state_dict,
 }
 
+
 def remap_state_dict(*args, **kwargs):
-    if 'format' in kwargs:
-        format = kwargs.pop('format')
-    else:
-        format = 'llama'
-    return REMAP_FN[format](*args, **kwargs)
+    format = kwargs.pop("format", "llama")
+    qconfig: QConfig = kwargs.pop("qconfig", None)
+    q_source = qconfig.source
+    q_method = qconfig.method
+    if format != "llama" and qconfig is not None:
+        assert qconfig.source == QuantSource.half and q_method == QuantMethod.rtn_q8_0
+    root = REMAP_FN[format](*args, **kwargs)
+    if qconfig is not None:
+        if q_source == QuantSource.half and q_method == QuantMethod.rtn_q8_0:
+            return quantize_llama_to_q8(root, qconfig)
+        elif q_source in [QuantSource.autogptq_q4, QuantSource.autoawq_q4, QuantSource.autogptq_q8]:
+            return convert_llama_q_params(root, qconfig=qconfig)
+        else:
+            raise NotImplementedError(f"Quant method {q_method} is not supported for {format} from {q_source}")
 
 
 @register_chat_setting()
@@ -932,7 +1208,7 @@ class LLaMA2ChatSetting:
 
 
 @register_chat_setting()
-class MistralSetting:
+class MistralChatSetting:
     name = "mistral-instruct"
     system = ""
     roles = ("user", "assistant")
@@ -1012,7 +1288,36 @@ class InternLMChatSetting:
 
 
 @register_chat_setting()
-class ChatGLM2Setting:
+class InternLM2ChatSetting:
+    name = "internlm2"
+    system = "You are an AI assistant whose name is InternLM (书生·浦语).\n" \
+    "- InternLM (书生·浦语) is a conversational language model that is developed by Shanghai AI Laboratory " \
+    "(上海人工智能实验室). It is designed to be helpful, honest, and harmless.\n" \
+    "- InternLM (书生·浦语) can understand and communicate fluently in the language chosen by the user such " \
+    "as English and 中文."
+    roles = ("user", "assistant")
+    stop_token_ids = (2, 92542)
+
+    def get_prompt(self, messages):
+        bot, eot = "<|im_start|>", "<|im_end|>"
+        # ret = "<s>"
+        ret = ""
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        if system:
+            ret += f"{bot}system\n{system}{eot}\n"
+        for i, (role, message) in enumerate(messages):
+            ret += f"{bot}{role}\n"
+            if message:
+                ret += f"{message}{eot}\n"
+        return ret
+
+
+@register_chat_setting()
+class ChatGLM2ChatSetting:
     name = "chatglm2"
     system = ""
     roles = ("问", "答")
@@ -1033,3 +1338,45 @@ class ChatGLM2Setting:
                 if message:
                     ret += message + sep
         return ret
+
+
+def qwen_encode_message(messages, system):
+    im_start, im_end = "<|im_start|>", "<|im_end|>"
+    if messages[0][0] == "system":
+        system = messages[0][1]
+        messages = messages[1:]
+    system = system.strip()
+
+    sep = "\n"
+    ret = f"{im_start}system{sep}{system}{im_end}"
+
+    for i, (role, message) in enumerate(messages):
+        if i % 2 == 0:
+            ret += f"{sep}{im_start}{role}{sep}{message}{im_end}"
+        else:
+            ret += f"{sep}{im_start}{role}{sep}"
+            if message:
+                ret += f"{message}{im_end}"
+    return ret
+
+
+@register_chat_setting()
+class QwenChatSetting:
+    name = "qwen"
+    system = "You are a helpful assistant."
+    roles = ("user", "assistant")
+    stop_token_ids = (151643,)
+
+    def get_prompt(self, messages):
+        return qwen_encode_message(messages, self.system)
+
+
+@register_chat_setting()
+class Qwen2ChatSetting:
+    name = "qwen2"
+    system = "You are a helpful assistant"
+    roles = ("user", "assistant")
+    stop_token_ids = (151643,)
+
+    def get_prompt(self, messages):
+        return qwen_encode_message(messages, self.system)
