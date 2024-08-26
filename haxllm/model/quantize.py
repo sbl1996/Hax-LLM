@@ -39,6 +39,7 @@ class QConfig:
     q_dtype: Optional[jnp.dtype] = None
     q_layers: Sequence[str] = ("attn.out", "mlp.gate", "mlp.up", "mlp.down")
     pack: int = 2
+    use_g_idx: bool = False
 
     def __post_init__(self):
         for l in self.q_layers:
@@ -53,6 +54,9 @@ class QConfig:
             assert self.sym
         elif self.source in [QuantSource.autoawq_q4]:
             assert not self.sym
+        
+        if self.use_g_idx:
+            assert self.source == QuantSource.autogptq_q4
 
     @property
     def q_bits(self):
@@ -94,7 +98,8 @@ class QConfig:
                 qzeros = q["zeros"][:, None]
             elif self.source == QuantSource.autogptq_q4:
                 qzeros = 8
-            return group_dequantize(qweight, qzeros, q["scales"])
+                g_idx = q.get("g_idx", None)
+            return group_dequantize(qweight, qzeros, q["scales"], g_idx)
         else:
             raise NotImplementedError
 
@@ -144,7 +149,9 @@ class QConfig:
                f"method={self.method}, " \
                f"source={self.source}, " \
                f"group_size={self.group_size}, " \
-               f"sym={self.sym}, q_dtype={self.q_dtype}, pack={self.pack}, q_layers={self.q_layers})"
+               f"sym={self.sym}, q_dtype={self.q_dtype}, pack={self.pack}, "\
+               f"use_g_idx={self.use_g_idx}, " \
+               f"q_layers={self.q_layers})"
 
     def to_json(self):
         return json.dumps(
@@ -156,6 +163,7 @@ class QConfig:
                 "q_dtype": self.q_dtype.dtype.name if self.q_dtype is not None else None,
                 "q_layers": self.q_layers,
                 "pack": self.pack,
+                "use_g_idx": self.use_g_idx,
             }, indent=2,
         )
 
@@ -173,6 +181,8 @@ class QConfig:
             kwargs["group_size"] = data["group_size"]
         if "pack" in data:
             kwargs["pack"] = data["pack"]
+        if "use_g_idx" in data:
+            kwargs["use_g_idx"] = data["use_g_idx"]
         return cls(**kwargs)
 
 
@@ -301,11 +311,15 @@ def unpack1(x, bits=4):
     return x
 
 
-def group_dequantize(qweight, qzeros, scales):
+def group_dequantize(qweight, qzeros, scales, g_idx):
     group_size = qweight.shape[0] // scales.shape[0]
     qweight = qweight.reshape(-1, group_size, *qweight.shape[1:])
     if qzeros is not None:
         qweight = qweight - qzeros
-    weight = qweight * scales[:, None]
+    if g_idx is not None:
+        scales = scales[g_idx].reshape(-1, group_size, *scales.shape[1:])
+    else:
+        scales = scales[:, None]
+    weight = qweight * scales
     weight = weight.reshape(-1, *weight.shape[2:])
     return weight

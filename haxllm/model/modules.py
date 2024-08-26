@@ -118,10 +118,11 @@ class DenseGeneral(nn.Module):
                 zeros = self.param(
                     "zeros", zero_init, zeros_shape, jnp.int8)
                 q_params["zeros"] = zeros
-            # jax.debug.inspect_array_sharding(qweight, callback=lambda x: print(self.name, x))
-            # print(qweight.shape, scales.shape, kernel_shape)
+            if qconfig.use_g_idx:
+                g_idx = self.param(
+                    "g_idx", zero_init, (shape1,), jnp.int32)
+                q_params["g_idx"] = g_idx
             kernel = qconfig.dequantize(q_params)
-            # jax.debug.inspect_array_sharding(kernel, callback=lambda x: print(self.name, x))
             kernel = kernel.reshape(kernel_shape)
         kernel = kernel.astype(self.param_dtype)
 

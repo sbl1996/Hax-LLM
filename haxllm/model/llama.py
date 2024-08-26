@@ -2,6 +2,7 @@ from typing import Callable, Any, Optional
 
 from datetime import datetime
 
+import numpy as np
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -471,7 +472,6 @@ class TransformerBlock(nn.Module):
         y = x + y
 
         outputs = (y, padding_mask)
-
         if self.scan:
             return outputs, None
         else:
@@ -661,8 +661,10 @@ def remap_llama_state_dict(state_dict, head_dim=None):
                 qweight = state_dict.pop(f"{prefix}.qweight")
                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
                 scales = state_dict.pop(f"{prefix}.scales")
+                g_idx = state_dict.pop(f"{prefix}.g_idx", None)
                 params = {"qweight": qweight, "qzeros": qzeros, "scales": scales}
-
+                if g_idx is not None:
+                    params["g_idx"] = g_idx
             bias = state_dict.pop(f"{prefix}.bias", None)
             if bias is not None and not (bias == 0).all():
                 if part == 'query':
@@ -692,7 +694,7 @@ def remap_llama_state_dict(state_dict, head_dim=None):
 def quantize_llama_to_q8(root, qconfig: QConfig):
     # half -> int8
     n_layers = len([k for k in root.keys() if k.startswith("h_")])
-    q_method = qconfig.q_method
+    q_method = qconfig.method
     if qconfig.source != QuantSource.half or q_method != QuantMethod.rtn_q8_0:
         raise NotImplementedError("only support rtn_q8_0")
 
@@ -705,7 +707,10 @@ def quantize_llama_to_q8(root, qconfig: QConfig):
             params = d[part1][part2]
             kernel = params['kernel']
             shape = kernel.shape
-            if part2 == 'out':
+            # reshape to ensure scales are always 2-dim
+            if part2 in ['query', 'key', 'value']:
+                kernel = kernel.reshape(shape[0], -1)
+            elif part2 == 'out':
                 # h, d -> h*d
                 kernel = kernel.reshape(-1, *shape[2:])
             kernel, scales = qconfig.quantize(kernel)
@@ -741,6 +746,7 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
     hidden_size_g = hidden_size // group_size
     n_kv_heads = root['h_0']['attn']['key']['scales'].shape[1] // head_dim
 
+    skip_g_idx = None
     for i in range(n_layers):
         d = root[f"h_{i}"]
         for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
@@ -749,6 +755,15 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
             qweight = params.pop('qweight')
             qzeros = params.pop('qzeros')
             scales = params.pop('scales')
+            g_idx = params.pop('g_idx', None)
+            if g_idx is not None:
+                if skip_g_idx is None:
+                    n_groups = g_idx.shape[0] // group_size
+                    skip_g_idx = bool((g_idx.reshape(-1, group_size) == np.arange(n_groups)[:, None]).all())
+                elif skip_g_idx is True:
+                    g_idx = None
+                else:
+                    assert qconfig.use_g_idx
             qweight, qzeros = qconfig.requantize(qweight, qzeros)
             if q_source == QuantSource.autogptq_q8:
                 div1, div2 = 1, 1
@@ -781,130 +796,9 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
             params['scales'] = scales
             if not qconfig.sym:
                 params['zeros'] = qzeros
+            if g_idx is not None:
+                params['g_idx'] = g_idx
     return root
-
-
-# def remap_llama_state_dict(state_dict, head_dim=None, qconfig: Optional[QConfig] = None):
-#     # TODO: decompose remap and quantize
-#     q_method = qconfig.method if qconfig is not None else None
-#     n_layers = max([int(k.split('.')[2]) for k in state_dict.keys() if k.startswith("model.layers.")]) + 1
-#     hidden_size = state_dict['model.embed_tokens.weight'].shape[1]
-#     rope_key = 'model.layers.0.self_attn.rotary_emb.inv_freq'
-#     if rope_key in state_dict:
-#         head_dim = state_dict[rope_key].shape[0] * 2
-#     elif head_dim is None:
-#         head_dim = 128
-#     n_heads = hidden_size  // head_dim
-#     if q_method is None or q_method == QuantMethod.rtn_q8_0:
-#         sample_w = state_dict['model.layers.0.self_attn.k_proj.weight']
-#         n_kv_heads = sample_w.shape[0] // head_dim
-#         half_dtype = sample_w.dtype
-#     elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
-#         q_key = 'model.layers.0.self_attn.q_proj.'
-#         qweight = state_dict[q_key + 'qweight']
-#         scales = state_dict[q_key + 'scales']
-#         half_dtype = scales.dtype
-#         # bits = scales.shape[-1] // qweight.shape[-1] // 2
-#         bits = 4
-#         assert qconfig.q_bits == bits
-#         bits_reduce = qconfig.w_bits // qconfig.q_bits
-#         if q_method == QuantMethod.awq_q4:
-#             group_size = qweight.shape[0] // scales.shape[0]
-#         else:
-#             group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
-#         assert qconfig.group_size == group_size
-#         hidden_size_g = hidden_size // group_size
-#         n_kv_heads = state_dict['model.layers.0.self_attn.k_proj.scales'].shape[1] // head_dim
-#     assert half_dtype in [jnp.bfloat16, jnp.float16]
-
-#     root = {}
-#     root["wte"] = {"embedding": state_dict.pop("model.embed_tokens.weight").astype(half_dtype)}
-
-#     for d in range(n_layers):
-#         block_d = {}
-#         block_d["ln_1"] = {"scale": state_dict.pop(
-#             f"model.layers.{d}.input_layernorm.weight")}
-#         block_d["attn"] = {}
-#         block_d["mlp"] = {}
-#         for name in ["attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"]:
-#             dst_l, part = name.split('.')
-#             if dst_l == 'attn':
-#                 src_l, src_l2 = "self_attn", part[0]
-#             else:
-#                 src_l, src_l2 = "mlp", part
-#             prefix = f"model.layers.{d}.{src_l}.{src_l2}_proj"
-#             if q_method is None or q_method == QuantMethod.rtn_q8_0:
-#                 kernel = state_dict.pop(f"{prefix}.weight").T
-#                 quantize = q_method == QuantMethod.rtn_q8_0 and name in qconfig.q_layers
-#                 if quantize:
-#                     kernel, scales = qconfig.quantize(kernel)
-#                 if part == 'query':
-#                     kernel = kernel.reshape(hidden_size, n_heads, head_dim)
-#                 elif part in ['key', 'value']:
-#                     kernel = kernel.reshape(hidden_size, n_kv_heads, head_dim)
-#                 elif part == 'out':
-#                     kernel = kernel.reshape(n_heads, head_dim, hidden_size)
-#                 params = {"kernel": kernel}
-#                 if quantize:
-#                     params['scales'] = scales
-#             elif q_method in [QuantMethod.awq_q4, QuantMethod.gptq_q4]:
-#                 qweight = state_dict.pop(f"{prefix}.qweight")
-#                 qzeros = state_dict.pop(f"{prefix}.qzeros", None)
-#                 scales = state_dict.pop(f"{prefix}.scales")
-#                 qweight, qzeros = qconfig.requantize(qweight, qzeros)
-#                 if qconfig.pack == 1:
-#                     div1, div2 = 1, 8
-#                 elif qconfig.pack == 2:
-#                     div1, div2 = 2, 4
-#                 elif qconfig.pack == 3:
-#                     div1, div2 = 8, 1
-#                 if part == 'query':
-#                     qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
-#                     scales = scales.reshape(hidden_size_g, n_heads*head_dim)
-#                     if not qconfig.sym:
-#                         qzeros = qzeros.reshape(hidden_size_g, n_heads*head_dim)
-#                 elif part in ['key', 'value']:
-#                     qweight = qweight.reshape(hidden_size // div1, n_kv_heads, head_dim // div2)
-#                     scales = scales.reshape(hidden_size_g, n_kv_heads*head_dim)
-#                     if not qconfig.sym:
-#                         qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
-#                 elif part == 'out':
-#                     # HACK
-#                     if qconfig.pack == 3:
-#                         qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
-#                     else:
-#                         qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
-#                     scales = scales.reshape(hidden_size_g, hidden_size)
-#                     if not qconfig.sym:
-#                         qzeros = qzeros.reshape(hidden_size_g, hidden_size)
-#                 params = {"kernel": qweight, "scales": scales}
-#                 if not qconfig.sym:
-#                     params['zeros'] = qzeros
-
-#             bias = state_dict.pop(f"{prefix}.bias", None)
-#             if bias is not None and not (bias == 0).all():
-#                 if part == 'query':
-#                     bias = bias.reshape(n_heads, head_dim)
-#                 elif part in ['key', 'value']:
-#                     bias = bias.reshape(n_kv_heads, head_dim)
-#                 elif part == 'out':
-#                     bias = bias.reshape(hidden_size)
-#                 params["bias"] = bias
-
-#             block_d[dst_l][part] = params
-#         block_d["ln_2"] = {"scale": state_dict.pop(
-#             f"model.layers.{d}.post_attention_layernorm.weight")}
-#         root[f"h_{d}"] = block_d
-
-#     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
-#     if "lm_head.weight" in state_dict:
-#         weight = state_dict.pop("lm_head.weight").T
-#     else:
-#         # tie_word_embeddings
-#         print("WARNING: use tied weights for lm_head")
-#         weight = root["wte"]["embedding"].T.copy()
-#     root["lm_head"] = {"kernel": weight.astype(half_dtype)}
-#     return root
 
 
 def remap_chatglm2_state_dict(state_dict, head_dim=None):
@@ -1149,7 +1043,7 @@ class VicunaChatSetting:
 
 @register_chat_setting()
 class YiChatSetting:
-    name = "Yi-chat"
+    name = "yi-chat"
     system = ""
     roles = ("user", "assistant")
     stop_token_ids = (2, 7,)
@@ -1159,11 +1053,11 @@ class YiChatSetting:
         eos = "<|im_end|>"
         ret = ""
         for i, (role, message) in enumerate(messages):
-            ret += bos
+            ret += f"{bos}{role}\n"
             if message:
-                ret += role + "\n" + message + eos + "\n"
+                ret += f"{message}{eos}\n"
             else:
-                ret += role + "\n"
+                assert i == len(messages) - 1 and role == self.roles[1]
         return ret
 
 
@@ -1194,6 +1088,8 @@ class LLaMA31InstructSetting:
             ret += f"{boh}{role}{eoh}\n\n"
             if message:
                 ret += message.strip() + eos
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
         return ret
 
 
@@ -1221,6 +1117,8 @@ class LLaMA3ChatSetting:
             ret += f"{boh}{role}{eoh}\n\n"
             if message:
                 ret += message.strip() + eos
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
         return ret
 
 
@@ -1397,6 +1295,8 @@ class InternLM2ChatSetting:
             ret += f"{bot}{role}\n"
             if message:
                 ret += f"{message}{eot}\n"
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
         return ret
 
 
@@ -1424,8 +1324,9 @@ class ChatGLM2ChatSetting:
         return ret
 
 
-def qwen_encode_message(messages, system):
+def qwen_encode_message(self, messages):
     im_start, im_end = "<|im_start|>", "<|im_end|>"
+    system = self.system
     if messages[0][0] == "system":
         system = messages[0][1]
         messages = messages[1:]
@@ -1436,11 +1337,13 @@ def qwen_encode_message(messages, system):
 
     for i, (role, message) in enumerate(messages):
         if i % 2 == 0:
-            ret += f"{sep}{im_start}{role}{sep}{message}{im_end}"
+            ret += f"{im_start}{role}{sep}{message}{im_end}{sep}"
         else:
-            ret += f"{sep}{im_start}{role}{sep}"
+            ret += f"{im_start}{role}{sep}"
             if message:
-                ret += f"{message}{im_end}"
+                ret += f"{message}{im_end}{sep}"
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
     return ret
 
 
@@ -1452,7 +1355,7 @@ class QwenChatSetting:
     stop_token_ids = (151643,)
 
     def get_prompt(self, messages):
-        return qwen_encode_message(messages, self.system)
+        return qwen_encode_message(self, messages)
 
 
 @register_chat_setting()
@@ -1463,7 +1366,7 @@ class Qwen2ChatSetting:
     stop_token_ids = (151643,)
 
     def get_prompt(self, messages):
-        return qwen_encode_message(messages, self.system)
+        return qwen_encode_message(self, messages)
 
 
 @register_chat_setting()
@@ -1471,7 +1374,7 @@ class Phi3ChatSetting:
     name = "phi3"
     system = ""
     roles = ("<|user|>", "<|assistant|>")
-    stop_token_ids = (32000, 32007)
+    stop_token_ids = (32000, 32001, 32007)
 
     def get_prompt(self, messages):
         eot = "<|end|>"
@@ -1482,9 +1385,11 @@ class Phi3ChatSetting:
         system = system.strip()
         ret = ""
         if system:
-            ret += f"<|system|>{system}{eot}"
+            ret += f"<|system|>\n{system}{eot}\n"
         for i, (role, message) in enumerate(messages):
-            ret += role
+            ret += f"{role}\n"
             if message:
-                ret += f"{message}{eot}"
+                ret += f"{message}{eot}\n"
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
         return ret
