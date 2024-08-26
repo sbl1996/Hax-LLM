@@ -149,24 +149,41 @@ def make_apply_rope(head_dim, max_len, dtype, base=10000.0, scaling: Optional[Ro
         inv_freq = compute_inv_freq(head_dim // 2, base)
         cos, sin = precompute_freqs_cis2(inv_freq, max_len, dtype=dtype)
         add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index2(q, k, cos, sin, p)
-    elif rope_type == "default":
+        return add_pos
+    scaling_factor = None
+    if rope_type == "default":
         inv_freq = compute_inv_freq(head_dim, base)
-        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
-        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     elif rope_type == "llama3":
         inv_freq = compute_llama3_inv_freq(
             head_dim, base, scaling.factor, scaling.low_freq_factor, scaling.high_freq_factor,
             scaling.max_position_embeddings)
-        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
-        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     elif rope_type == "dynamic":
         orig_max_len = scaling.max_position_embeddings
         if max_len > orig_max_len:
             alpha = scaling.factor * max_len / orig_max_len - (scaling.factor - 1)
-            base = base * alpha ** (dim / (dim - 2))
+            base = base * alpha ** (head_dim / (head_dim - 2))
         inv_freq = compute_inv_freq(head_dim, base)
-        cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
-        add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
+    elif rope_type == "longrope":
+        orig_max_len = scaling.max_position_embeddings
+        inv_freq = compute_inv_freq(head_dim, base)
+        if max_len > orig_max_len:
+            factors = np.array(scaling.long_factor, dtype=np.float32)
+        else:
+            factors = np.array(scaling.short_factor, dtype=np.float32)
+        inv_freq = inv_freq * factors
+        scale = max_len / orig_max_len
+        if scale <= 1.0:
+            scaling_factor = 1.0
+        else:
+            scaling_factor = math.sqrt(1 + math.log(scale) / math.log(orig_max_len))
+    else:
+        raise ValueError(f"Unknown rope type: {rope_type}")
+    cos, sin = precompute_freqs_cis(inv_freq, max_len, dtype=dtype)
+    if scaling_factor is not None:
+        scaling_factor = np.array(scaling_factor, dtype=dtype)
+        cos = cos * scaling_factor
+        sin = sin * scaling_factor
+    add_pos = lambda q, k, p=None: apply_rotary_pos_emb_index(q, k, cos, sin, p)
     return add_pos
 
 

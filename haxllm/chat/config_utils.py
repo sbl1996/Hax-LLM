@@ -77,6 +77,7 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
     peft = getattr(cfg, "peft", None)
     qconfig = getattr(cfg, "qconfig", None)
     mod = get_module(template_config.pop("family"), peft)
+    max_len = getattr(cfg, "max_len", None)
 
     if qconfig:
         with open(qconfig, 'r') as f:
@@ -84,6 +85,8 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
         qconfig = QConfig.from_json(qconfig)
         print(f"Load quantized model with qconfig {qconfig}")
     model_config = {"name": model_name, "dtype": dtype, "param_dtype": param_dtype, **template_config}
+    if max_len is not None:
+        model_config["n_positions"] = max_len
     config = _load_config(
         mod,
         **model_config,
@@ -102,7 +105,7 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
 
     model = load_model_cls(mod, "lm")(config)
 
-    max_len = getattr(cfg, "max_len", None) or config.n_positions
+    max_len = max_len or config.n_positions
     Pipeline = ChatPipeline if chat else TextGenerationPipeline
     pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,

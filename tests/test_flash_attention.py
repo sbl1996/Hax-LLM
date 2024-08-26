@@ -5,7 +5,7 @@ import time
 import jax
 import functools
 
-from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as flash_attention_tpu
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as flash_attention_tpu, BlockSizes
 
 _cur_key = jax.random.PRNGKey(4)
 
@@ -15,13 +15,25 @@ def fresh():
     _cur_key, result = jax.random.split(_cur_key)
     return result
 
+def get_block_sizes(q_len, kv_len):
+    return BlockSizes(
+            block_q=min(q_len, 128),
+            block_k_major=min(kv_len, 1024),
+            block_k=min(kv_len, 1024),
+            block_b=1,
+            block_q_major_dkv=128,
+            block_k_major_dkv=128,
+            block_k_dkv=128,
+            block_q_dkv=128,
+            block_k_major_dq=128,
+            block_k_dq=128,
+            block_q_dq=128,
+        )
 
-batch_size = 128
-num_heads = 1
+batch_size = 16
+num_heads = 32
 feature_dims = 128
 mask_mode = 'bidirectional'
-# pad_position = jax.random.randint(fresh(), (batch_size,), 0, 64)
-pad_position = None
 context_length = jax.random.randint(fresh(), (batch_size,), 0, 64)
 
 
@@ -53,7 +65,8 @@ def flash_attention(query, key, value, mask=None, dtype=jnp.float32, precision=N
     else:
         ab = None
     ab = jnp.broadcast_to(ab, (batch_size, num_heads, query.shape[1], key.shape[1]))
-    o = flash_attention_tpu(q, k, v, sm_scale=sm_scale, ab=ab)
+    block_sizes = get_block_sizes(q.shape[2], k.shape[2])
+    o = flash_attention_tpu(q, k, v, sm_scale=sm_scale, ab=ab, block_sizes=block_sizes)
     o = jnp.swapaxes(o, 1, 2).astype(dtype)
     return o
 
@@ -76,8 +89,8 @@ def standard_attention(query, key, value, mask=None, dtype=jnp.float32, precisio
 
 # The evaluation uses mixed-precision by default (bfloat16 for the inputs and
 # outputs, and float32 for certain internal representations.)
-input_dtype = jnp.float32
-dtype = jnp.float32
+input_dtype = jnp.bfloat16
+dtype = jnp.bfloat16
 # Using HIGHEST means that we use full float32 precision. For neural network
 # training we can often use lax.Precision.DEFAULT instead.
 precision = lax.Precision.DEFAULT
@@ -86,7 +99,7 @@ execute_standard_att = True
 execute_flash_att = True
 repeats = 200
 
-for i in range(8, 11, 1):
+for i in range(8, 12, 1):
     q_size = 2**i
     memsize = 2**i
     print("\nAttention size:", q_size, "x", memsize)
@@ -158,11 +171,6 @@ for i in range(8, 11, 1):
 execute_standard_att = True
 execute_flash_att = True
 
-input_dtype = jnp.float32
-dtype = jnp.bfloat16
-precision = lax.Precision.DEFAULT
-
-
 def loss_simp(query, key, value, mask):
     return jnp.sum(standard_attention(query, key, value, mask, dtype=dtype, precision=precision))
 
@@ -173,7 +181,7 @@ def loss_ckpt(query, key, value, mask):
 diff_attention_simp = jax.jit(jax.grad(loss_simp, argnums=[0, 1, 2]))
 diff_flash_attention = jax.jit(jax.grad(loss_ckpt, argnums=[0, 1, 2]))
 
-for i in range(8, 11, 1):
+for i in range(8, 12, 1):
     q_size = 2**i
     memsize = 2**i
     print("\nAttention size:", q_size, "x", memsize)

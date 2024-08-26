@@ -5,19 +5,19 @@
 
 
 ## Models
-- GPT-2
-- BERT (RoBERTa)
-- LLaMA (1, 2)
-- Vicuna
-- ChatGLM2
-- InternLM
-- Qwen (in process)
+- LLaMA (1, 2, 3, 3.1)
+- Mistral (v0.1, v0.3)
+- ChatGLM (2, 3)
+- Yi (v1, v1.5)
+- InternLM (v1, v2.5)
+- Qwen (v1, v1.5, v2)
+- Phi (3.5)
 
 
 ## Parameter-Efficient Fine-Tuning (PEFT)
 - LoRA
 - P-tuning v2
-- LLaMA-Adapter (in process)
+- LLaMA-Adapter
 
 
 ## Supported Tasks
@@ -29,10 +29,7 @@
 ## Training Features
 - Data and model parallel 
 - Mixed precision
-- Gradient checkpoint (fine-grained)
-- Scan (for faster jit compilation)
-- Model parameter freezing
-- Memory-efficient attention
+- Gradient checkpoint
 - Resource monitoring
 
 
@@ -41,50 +38,32 @@
 - Beam search
 - Temperature, top-k, top-p
 - KV cache
+- Quantization
+
 
 ## Experiments
 Check the experiments and training scripts on this [repo](https://github.com/sbl1996/llm_experiments).
 
-## Chat CLI
+## Convert Checkpoints
 
-### Vicuna
-
-First, we should download the model and convert the checkpoints to JAX format.
+We should download the model and convert the checkpoints to JAX format.
 ```bash
-python -m haxllm.model.dump -m llama -s lmsys/vicuna-7b-v1.3
+python -m haxllm.model.dump --source mistralai/Mistral-7B-Instruct-v0.3
 ```
-`llama` is the model family, currently supports `gpt2`, `llama` and `chatglm2`.
-`lmsys/vicuna-7b-v1.3` is the model name, can be huggingface model name, local directory or checkpoint file (pytorch-model-*.bin or model.safetensors).
-
-Then, we can chat with the model.
-```bash
-python -m haxllm.chat.cli template=llama model=vicuna-7b checkpoint=vicuna-7b-v1.3_np.safetensors temperature=0.7
-```
-You may refer `configs/chat/base.yaml` for more settings like max length, temperature, top-k, top-p.
+`mistralai/Mistral-7B-Instruct-v0.3` is the model name, can be huggingface model name, local directory or checkpoint file (pytorch-model-*.bin or model.safetensors).
 
 ```bash
-rm -rf ~/.cache/huggingface/hub/models--lmsys--vicuna-7b-v1.3
+rm -rf ~/.cache/huggingface/hub/models--mistralai--Mistral-7B-Instruct-v0.3
 ```
 You can remove the cache to save disk space.
 
-### LLaMA-2
-
-First, we should download the model and convert the checkpoints to JAX format.
-```bash
-python -m haxllm.model.dump -m llama -s meta-llama/Llama-2-7b-chat-hf -t safetensors
-```
-LLaMA-2 has both `safetensors` and `bin` checkpoints.  We want to download the `safetensors` only to save disk space.
-
-Good to go!
-```bash
-python -m haxllm.chat.cli template=llama2 model=llama2-7b checkpoint=Llama-2-7b-chat-hf_np.safetensors
-```
 
 ## Mock OpenAI API
 
-We can also start a server to mock OpenAI API.
+Then, we can start a server with the converted model to mock OpenAI API.
 ```bash
-python -m haxllm.chat.openai_api template=chatglm2 model=chatglm2-6b checkpoint=chatglm2-6b_np.safetensors
+python -m haxllm.chat.openai_api template=mistral model=mistral-7b-v0.3 checkpoint=chatglm2-6b_np.safetensors \
+    max_len=4096 temperature=0.8 top_p=0.9 max_new_tokens=1000
 ```
 
 Then, we can chat with the model via OpenAI API (streaming supported).
@@ -95,7 +74,7 @@ openai.api_base = "http://localhost:8000/v1"
 openai.api_key = "none"
 
 req = openai.ChatCompletion.create(
-    model="chatglm2-6b",
+    model="gpt-3.5-turbo",
     messages=[
         {"role": "user", "content": "Hello"}
     ],
@@ -105,7 +84,7 @@ print(req.choices[0].message.content)
 
 
 for chunk in openai.ChatCompletion.create(
-    model="chatglm2-6b",
+    model="gpt-3.5-turbo",
     messages=[
         {"role": "user", "content": "你好"}
     ],
@@ -113,20 +92,6 @@ for chunk in openai.ChatCompletion.create(
 ):
     if hasattr(chunk.choices[0].delta, "content"):
         print(chunk.choices[0].delta.content, end="", flush=True)
-```
-
-## LangChain
-
-With the OpenAI API mocking server, `langchain` support is enabled.
-```python
-from langchain.chat_models import ChatOpenAI
-
-openai_api_base = "http://localhost:8000/v1"
-openai_api_key = "none"
-
-chat_model = ChatOpenAI(
-    openai_api_base=openai_api_base, openai_api_key=openai_api_key)
-print(chat_model.predict("Hello"))
 ```
 
 ## Sponsors
