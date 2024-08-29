@@ -90,7 +90,7 @@ def ChatGLM2Config(**kwargs):
         rms_norm_eps=1e-5,
         n_positions=32768,
         rope_scaling=dict(
-            rope_type="chatglm2",
+            rope_type="chatglm",
         )
     )
     return {**base, **kwargs}
@@ -167,11 +167,6 @@ def InternLM2_5Config(**kwargs):
         rms_norm_eps=1e-5,
         n_positions=32768,
         rope_theta=1000000.0,
-        rope_scaling=dict(
-            factor=2.0,
-            rope_type='dynamic',
-            max_position_embeddings=32768,
-        )
     )
     return {**base, **kwargs}
 
@@ -190,6 +185,24 @@ def Phi3Config(**kwargs):
             max_position_embeddings=4096,
             long_factor=[1.0800000429153442,1.1100000143051147,1.1399999856948853,1.340000033378601,1.5899999141693115,1.600000023841858,1.6200000047683716,2.620000123977661,3.2300000190734863,3.2300000190734863,4.789999961853027,7.400000095367432,7.700000286102295,9.09000015258789,12.199999809265137,17.670000076293945,24.46000099182129,28.57000160217285,30.420001983642578,30.840002059936523,32.590003967285156,32.93000411987305,42.320003509521484,44.96000289916992,50.340003967285156,50.45000457763672,57.55000305175781,57.93000411987305,58.21000289916992,60.1400032043457,62.61000442504883,62.62000274658203,62.71000289916992,63.1400032043457,63.1400032043457,63.77000427246094,63.93000411987305,63.96000289916992,63.970001220703125,64.02999877929688,64.06999969482422,64.08000183105469,64.12000274658203,64.41000366210938,64.4800033569336,64.51000213623047,64.52999877929688, 64.83999633789062],
             short_factor=[1.0,1.0199999809265137,1.0299999713897705,1.0299999713897705,1.0499999523162842,1.0499999523162842,1.0499999523162842,1.0499999523162842,1.0499999523162842,1.0699999332427979,1.0999999046325684,1.1099998950958252,1.1599998474121094,1.1599998474121094,1.1699998378753662,1.2899998426437378,1.339999794960022,1.679999828338623,1.7899998426437378,1.8199998140335083,1.8499997854232788,1.8799997568130493,1.9099997282028198,1.9399996995925903,1.9899996519088745,2.0199997425079346,2.0199997425079346,2.0199997425079346,2.0199997425079346,2.0199997425079346,2.0199997425079346,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0299997329711914,2.0799996852874756,2.0899996757507324,2.189999580383301,2.2199995517730713,2.5899994373321533,2.729999542236328,2.749999523162842,2.8399994373321533],
+        )
+    )
+    return {**base, **kwargs}
+
+
+def GLM4Config(**kwargs):
+    base = dict(
+        vocab_size=151552,
+        qkv_bias=True,
+        out_bias=False,
+        pad_token_id=151330,  # [MASK], unpossible to be used
+        bos_token_id=151329,
+        eos_token_id=151329,
+        rms_norm_eps=0.00000015625,
+        n_positions=131072,
+        rope_theta=5000000.0,
+        rope_scaling=dict(
+            rope_type="chatglm",
         )
     )
     return {**base, **kwargs}
@@ -367,18 +380,55 @@ config_hub = {
         n_kv_heads=8,
         n_layers=56,
     ),
-    "internlm2.5-1_8b": InternLM2_5Config(
+    "internlm2.5-1.8b": InternLM2_5Config(
         hidden_size=2048,
         intermediate_size=8192,
         n_heads=16,
         n_kv_heads=8,
         n_layers=24,
+        rope_scaling=dict(
+            factor=2.0,
+            rope_type='dynamic',
+            max_position_embeddings=32768,
+        )
+    ),
+    "internlm2.5-7b": InternLM2_5Config(
+        hidden_size=4096,
+        intermediate_size=14336,
+        n_heads=32,
+        n_kv_heads=8,
+        n_layers=32,
+        rope_scaling=dict(
+            factor=2.0,
+            rope_type='dynamic',
+            max_position_embeddings=32768,
+        )
+    ),
+    "internlm2.5-20b": InternLM2_5Config(
+        hidden_size=6144,
+        intermediate_size=16384,
+        n_heads=48,
+        n_kv_heads=8,
+        n_layers=48,
+        rope_theta=50000000.0,
+        rope_scaling=dict(
+            factor=2.5,
+            rope_type='dynamic',
+            max_position_embeddings=32768,
+        )
     ),
     "phi-3.5-mini-instruct": Phi3Config(
         hidden_size=3072,
         intermediate_size=8192,
         n_heads=32,
         n_layers=32,
+    ),
+    "glm4-9b": GLM4Config(
+        hidden_size=4096,
+        intermediate_size=13696,
+        n_heads=32,
+        n_layers=40,
+        n_kv_heads=2,
     ),
 }
 
@@ -760,6 +810,8 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
                 if skip_g_idx is None:
                     n_groups = g_idx.shape[0] // group_size
                     skip_g_idx = bool((g_idx.reshape(-1, group_size) == np.arange(n_groups)[:, None]).all())
+                    if skip_g_idx is True:
+                        print("Skip g_idx")
                 elif skip_g_idx is True:
                     g_idx = None
                 else:
@@ -801,7 +853,7 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
     return root
 
 
-def remap_chatglm2_state_dict(state_dict, head_dim=None):
+def remap_chatglm_state_dict(state_dict, head_dim=None):
     state_dict = {k.replace("transformer.", ""): v for k, v in state_dict.items()}
     state_dict = {k.replace("encoder.", ""): v for k, v in state_dict.items()}
 
@@ -999,7 +1051,7 @@ def remap_phi3_state_dict(state_dict, head_dim=None):
 REMAP_FN = {
     "llama": remap_llama_state_dict,
     "qwen": remap_qwen_state_dict,
-    "chatglm": remap_chatglm2_state_dict,
+    "chatglm": remap_chatglm_state_dict,
     "internlm2": remap_internlm2_state_dict,
     "phi3": remap_phi3_state_dict,
 }
@@ -1390,6 +1442,32 @@ class Phi3ChatSetting:
             ret += f"{role}\n"
             if message:
                 ret += f"{message}{eot}\n"
+            else:
+                assert i == len(messages) - 1 and role == self.roles[1]
+        return ret
+
+
+@register_chat_setting()
+class GLM4ChatSetting:
+    name = "glm4"
+    system = ""
+    roles = ("<|user|>", "<|assistant|>")
+    stop_token_ids = (151329, 151336, 151338)
+
+    def get_prompt(self, messages):
+        system = self.system
+        if messages[0][0] == "system":
+            system = messages[0][1]
+            messages = messages[1:]
+        system = system.strip()
+        # ret = "[gMASK]<sop>"
+        ret = ""
+        if system:
+            ret += f"<|system|>\n{system}"
+        for i, (role, message) in enumerate(messages):
+            ret += f"{role}\n"
+            if message:
+                ret += message
             else:
                 assert i == len(messages) - 1 and role == self.roles[1]
         return ret

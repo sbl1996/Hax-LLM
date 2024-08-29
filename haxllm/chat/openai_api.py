@@ -270,6 +270,7 @@ def chat_api_server(cfg: DictConfig) -> None:
     print(f"  top_k: {pipeline.top_k}")
     print(f"  repetition_penalty: {pipeline.repetition_penalty}")
     print(f"  max_len: {pipeline.max_len}")
+    print(f"  chunk_size: {pipeline.pad_multiple}")
 
     host = getattr(cfg, "host", "127.0.0.1")
     port = getattr(cfg, "port", 8000)

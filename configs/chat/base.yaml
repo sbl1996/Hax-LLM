@@ -16,6 +16,7 @@ qconfig: null
 mesh: auto
 
 max_len: null
+chunk_size: null
 temperature: 0.0
 top_k: -1
 top_p: 1.0

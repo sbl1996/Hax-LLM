@@ -22,7 +22,7 @@ class RematScanConfigMixin:
 
 @struct.dataclass
 class RoPEScalingConfig:
-    rope_type: Literal["default", "llama3", "chatglm2", "dynamic", "longrope"] = "default"
+    rope_type: Literal["default", "llama3", "chatglm", "dynamic", "longrope"] = "default"
     factor: float = 8.0
     low_freq_factor: float = 1.0
     high_freq_factor: float = 4.0

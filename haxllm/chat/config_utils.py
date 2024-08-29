@@ -106,9 +106,11 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
     model = load_model_cls(mod, "lm")(config)
 
     max_len = max_len or config.n_positions
+    pad_multiple = getattr(cfg, "chunk_size", 512)
     Pipeline = ChatPipeline if chat else TextGenerationPipeline
     pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,
-        temperature=temperature, top_p=top_p, top_k=top_k, max_new_tokens=max_new_tokens)
+        temperature=temperature, top_p=top_p, top_k=top_k,
+        max_new_tokens=max_new_tokens, pad_multiple=pad_multiple)
     pipeline.init(transformer_weight=checkpoint, mesh=mesh)
     return pipeline, conv_template, max_new_tokens
