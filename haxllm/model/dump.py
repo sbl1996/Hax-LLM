@@ -186,7 +186,7 @@ if __name__ == "__main__":
 
     if qconfig is not None:
         print("Quantize model with {}".format(qconfig))
-    from haxllm.model.llama import remap_state_dict
+    from haxllm.model import remap_state_dict
     tensors = remap_state_dict(tensors, head_dim=args.dim, qconfig=qconfig, format=args.format)
     tensors = flatten_dict(tensors, sep=".")
     print("Save model to {}".format(save_path))

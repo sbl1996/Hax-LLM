@@ -311,7 +311,7 @@ def unpack1(x, bits=4):
     return x
 
 
-def group_dequantize(qweight, qzeros, scales, g_idx):
+def group_dequantize(qweight, qzeros, scales, g_idx=None):
     group_size = qweight.shape[0] // scales.shape[0]
     qweight = qweight.reshape(-1, group_size, *qweight.shape[1:])
     if qzeros is not None:

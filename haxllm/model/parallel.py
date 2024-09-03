@@ -1,4 +1,4 @@
-from typing import Mapping, Optional, Tuple, Callable, Sequence, Union
+from typing import Mapping, Optional, Tuple, Callable, Sequence, Union, Literal
 import functools
 import dataclasses
 
@@ -14,13 +14,12 @@ from flax.linen.attention import (
     Array,
     PRNGKey,
     Shape,
-    dot_product_attention,
 )
 
 from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
-from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache
+from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache, dot_product_attention
 from haxllm.model.quantize import QConfig
 from haxllm.model.mixin import RoPEScalingConfig
 
@@ -156,25 +155,15 @@ class Embed(ShardMixIn, nn.Embed):
 
 
 ShardAxis = Optional[str]
-
-
-def replicate_for_multi_query(x, num_heads):
-    src_num_heads, head_dim = x.shape[-2:]
-    x = jnp.repeat(x, num_heads // src_num_heads, axis=-2)
-    # x = jnp.expand_dims(x, axis=-2)
-    # x = jnp.tile(x, (1, 1, 1, num_heads // src_num_heads, 1))
-    # x = jnp.reshape(x, (*x.shape[:2], num_heads, head_dim))
-    return x
-
-
 ModuleClass = Callable[..., nn.Module]
-
 
 
 class SelfAttention(ShardModule):
     num_heads: int
     max_len: int
-    multi_query_groups: Optional[int] = None
+    num_kv_heads: Optional[int] = None
+    head_dim: Optional[int] = None
+    sliding_window_size: Optional[int] = None
     dtype: Optional[Dtype] = None
     param_dtype: Optional[Dtype] = jnp.float32
     broadcast_dropout: bool = False
@@ -186,6 +175,8 @@ class SelfAttention(ShardModule):
     out_bias: bool = True
     decode: bool = False
     rope: bool = False
+    scale: Optional[float] = None
+    attn_logits_soft_cap: Optional[float] = None
     rope_theta: float = 10000.0
     rope_scaling: Optional[RoPEScalingConfig] = None
     padding_left: bool = False
@@ -232,14 +223,14 @@ class SelfAttention(ShardModule):
         """
         get_qconfig = lambda name: self.qconfig if self.qconfig is not None and name in self.qconfig.q_layers else None
 
-        multi_query = self.multi_query_groups is not None
+        multi_query = self.num_kv_heads is not None
         kv_shard_axes = self.kv_shard_axes or self.query_shard_axes
 
         features = x.shape[-1]
         assert (
             features % self.num_heads == 0
         ), "Memory dimension must be divisible by number of heads."
-        head_dim = features // self.num_heads
+        head_dim = self.head_dim or features // self.num_heads
 
         if not isinstance(self.dense_cls, Sequence):
             dense_cls = [self.dense_cls for _ in range(4)]
@@ -261,9 +252,9 @@ class SelfAttention(ShardModule):
             name="query",
         )(x)
 
-        kv_num_heads = self.num_heads
+        num_kv_heads = self.num_heads
         if multi_query:
-            kv_num_heads = self.multi_query_groups
+            num_kv_heads = self.num_kv_heads
             kv_dense_shard_axes = None
         else:
             kv_dense_shard_axes = {"kernel": kv_shard_axes}
@@ -271,7 +262,7 @@ class SelfAttention(ShardModule):
         kv_dense = [
             functools.partial(
                 cls,
-                features=(kv_num_heads, head_dim),
+                features=(num_kv_heads, head_dim),
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 kernel_init=self.kernel_init,
@@ -310,17 +301,14 @@ class SelfAttention(ShardModule):
 
             if is_initialized:
                 if self.padding_left:
+                    if sliding_window_size is not None:
+                        raise NotImplementedError
                     query, key, value, mask = decode_for_padding_left(
                         add_pos, query, key, value, cache_index, cached_key, cached_value, cache_position, padding_mask)
                 else:
                     query, key, value, mask = decode_for_padding_right(
-                        add_pos, query, key, value, cache_index, cached_key, cached_value)
-
-        # If we shard at the last axis, it may be padded to meet 8x128 layout which results 8x expansion of memory.
-        if multi_query:
-            # GSPMD automatically recognize it to (X, None, Y, None)
-            key = replicate_for_multi_query(key, self.num_heads)
-            value = replicate_for_multi_query(value, self.num_heads)
+                        add_pos, query, key, value, cache_index,
+                        cached_key, cached_value, self.sliding_window_size)
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:
@@ -368,6 +356,8 @@ class SelfAttention(ShardModule):
                 key,
                 value,
                 mask=mask,
+                scale=self.scale,
+                attn_logits_soft_cap=self.attn_logits_soft_cap,
                 dropout_rng=dropout_rng,
                 dropout_rate=self.dropout_rate,
                 broadcast_dropout=self.broadcast_dropout,
@@ -459,6 +449,7 @@ class GLUMlpBlock(ShardModule):
     shard: bool = False
     qconfig: Optional[QConfig] = None
     dense_cls: Union[ModuleClass, Sequence[ModuleClass]] = DenseGeneral
+    activation: Literal["swish", "gelu"] = "swish"
 
     @nn.compact
     def __call__(self, inputs):
@@ -490,7 +481,12 @@ class GLUMlpBlock(ShardModule):
             qconfig=get_qconfig("mlp.gate"),
             name="gate",
         )(inputs)
-        g = nn.silu(g)
+        if self.activation == "gelu":
+            g = nn.gelu(g)
+        elif self.activation == "swish":
+            g = nn.swish(g)
+        else:
+            raise NotImplementedError
         x = g * dense[1](
             features=self.intermediate_size,
             shard_axes={"kernel": self.shard_axes1},

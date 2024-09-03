@@ -1,0 +1,5 @@
+family: gemma
+tokenizer: google/gemma-2-9b-it
+remat: False
+scan: False
+conv_template: gemma2

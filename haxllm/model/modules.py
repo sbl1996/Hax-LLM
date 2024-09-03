@@ -38,6 +38,7 @@ class RMSNorm(nn.Module):
     epsilon: float = 1e-6
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    offset: Optional[float] = None
 
     @nn.compact
     def __call__(self, x):
@@ -49,6 +50,8 @@ class RMSNorm(nn.Module):
         scale = self.param(
             "scale", nn.initializers.ones, reduced_feature_shape, self.param_dtype
         )
+        if self.offset is not None:
+            scale = scale + jnp.asarray(self.offset, scale.dtype)
         x = x * scale
         return jnp.asarray(x, self.dtype)
 

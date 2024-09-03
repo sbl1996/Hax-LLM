@@ -19,23 +19,10 @@ def QwenConfig(**kwargs):
     base = dict(
         vocab_size=151936,
         qkv_bias=True,
-        pad_token_id=151643,
+        pad_token_id=151643,  # although same as bos_token_id, but actually not used
         bos_token_id=151643,
         eos_token_id=151645,
         rope_theta=10000.0,
-        n_positions=32768,
-    )
-    return {**base, **kwargs}
-
-
-def Qwen2Config(**kwargs):
-    base = dict(
-        vocab_size=151936,
-        qkv_bias=True,
-        pad_token_id=151643,
-        bos_token_id=151643,
-        eos_token_id=151645,
-        rope_theta=1000000.0,
         n_positions=32768,
     )
     return {**base, **kwargs}
@@ -158,10 +145,23 @@ def MistralConfig(**kwargs):
     return {**base, **kwargs}
 
 
+def Qwen2Config(**kwargs):
+    base = dict(
+        vocab_size=151936,
+        qkv_bias=True,
+        pad_token_id=151643,  # although same as bos_token_id, but actually not used
+        bos_token_id=151643,
+        eos_token_id=151645,
+        rope_theta=1000000.0,
+        n_positions=32768,
+    )
+    return {**base, **kwargs}
+
+
 def InternLM2_5Config(**kwargs):
     base = dict(
         vocab_size=92544,
-        pad_token_id=92537,  # last unused token
+        pad_token_id=0,  # <unk>, unpossible to be used
         bos_token_id=1,
         eos_token_id=2,
         rms_norm_eps=1e-5,
@@ -174,7 +174,7 @@ def InternLM2_5Config(**kwargs):
 def Phi3Config(**kwargs):
     base = dict(
         vocab_size=32064,
-        pad_token_id=0,  # <unk>
+        pad_token_id=0,  # <unk>, unpossible to be used
         bos_token_id=1,
         eos_token_id=32000,
         rms_norm_eps=1e-5,
@@ -274,6 +274,7 @@ config_hub = {
         n_heads=12,
         n_layers=28,
         n_kv_heads=2,
+        tie_word_embeddings=True,
     ),
     "qwen2-7b": Qwen2Config(
         hidden_size=3584,
@@ -460,6 +461,7 @@ class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     shard: bool = False
     shard_cache: bool = False
     qconfig: Optional[QConfig] = None
+    tie_word_embeddings: bool = False
 
 
 class TransformerBlock(nn.Module):
@@ -483,7 +485,7 @@ class TransformerBlock(nn.Module):
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
             num_heads=config.n_heads,
-            multi_query_groups=config.n_kv_heads,
+            num_kv_heads=config.n_kv_heads,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
@@ -536,53 +538,14 @@ class TransformerModel(nn.Module):
     def __call__(self, inputs, train):
         config = self.config
         remat = config.remat or config.remat_scan
-
-        if not config.decode:
-            assert inputs.shape[1] > 1, "input sequence length must be > 1 for training"
-
-        embed_layer = Embed if remat else Embed
-        x = embed_layer(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=config.dtype,
-            param_dtype=config.param_dtype,
-            shard_axes={"embedding": ("X", "Y")},
-            shard=config.shard,
-            name="wte")(inputs)
-
-        padding_mask = None
-        if config.padding_left and inputs.shape[1] > 1:
-            padding_mask = jnp.equal(inputs, config.pad_token_id)
-
+        x, padding_mask = inputs
         x = make_block_stack(
             self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
 
-        norm_layer = RMSNorm if remat else RMSNorm
+        norm_layer = RMSNorm
         x = norm_layer(epsilon=config.rms_norm_eps,
                        dtype=config.dtype, name="ln_f")(x)
         return x
-
-
-# class TransformerSequenceClassifier(nn.Module):
-#     config: TransformerConfig
-
-#     @nn.compact
-#     def __call__(self, *, inputs, attn_mask, train=False):
-#         config = self.config
-#         x = TransformerModel(
-#             config=config, name="transformer")(inputs, train)
-
-#         batch_size = inputs.shape[0]
-#         seq_len = jnp.not_equal(inputs, config.pad_token_id).sum(-1) - 1
-#         x = x[jnp.arange(batch_size), seq_len]
-
-#         x = DenseGeneral(
-#             config.num_labels,
-#             dtype=config.dtype,
-#             kernel_init=config.kernel_init,
-#             bias_init=config.bias_init,
-#             name="score")(x)
-#         return x
 
 
 class TransformerLMHeadModel(nn.Module):
@@ -591,24 +554,45 @@ class TransformerLMHeadModel(nn.Module):
     @nn.compact
     def __call__(self, *, input_ids, train=False):
         config = self.config
-        x = TransformerModel(
-            config=config, name="transformer")(inputs=input_ids, train=train)
 
-        if config.decode:
-            shard_axes = {"kernel": ("Y", "X")}
-        else:
-            # shard output in training to avoid out of memory
-            shard_axes = {'kernel': ("X", 'Y')}
+        if not config.decode:
+            assert input_ids.shape[1] > 1, "input sequence length must be > 1 for training"
 
-        x = DenseGeneral(
-            config.vocab_size,
-            use_bias=False,
+        embed_layer = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
-            kernel_init=config.kernel_init,
-            shard_axes=shard_axes,
+            shard_axes={"embedding": ("X", "Y")},
             shard=config.shard,
-            name="lm_head")(x)
+            name="wte")
+        x = embed_layer(input_ids)
+
+        padding_mask = None
+        if config.padding_left and input_ids.shape[1] > 1:
+            padding_mask = jnp.equal(input_ids, config.pad_token_id)
+
+        x = TransformerModel(
+            config=config, name="transformer")(inputs=(x, padding_mask), train=train)
+
+        if config.tie_word_embeddings:
+            x = embed_layer.attend(x)
+        else:
+            if config.decode:
+                shard_axes = {"kernel": ("Y", "X")}
+            else:
+                # shard output in training to avoid out of memory
+                shard_axes = {'kernel': ("X", 'Y')}
+
+            x = DenseGeneral(
+                config.vocab_size,
+                use_bias=False,
+                dtype=config.dtype,
+                param_dtype=config.param_dtype,
+                kernel_init=config.kernel_init,
+                shard_axes=shard_axes,
+                shard=config.shard,
+                name="lm_head")(x)
         return x
 
 
@@ -666,12 +650,12 @@ def remap_llama_state_dict(state_dict, head_dim=None):
         head_dim = state_dict[rope_key].shape[0] * 2
     elif head_dim is None:
         head_dim = 128
-    n_heads = hidden_size  // head_dim
-    sample_w_key = 'model.layers.0.self_attn.k_proj.weight'
-    if sample_w_key in state_dict:
-        sample_w = state_dict['model.layers.0.self_attn.k_proj.weight']
-        n_kv_heads = sample_w.shape[0] // head_dim
-        half_dtype = sample_w.dtype
+    # n_heads = hidden_size  // head_dim
+    sample_kv_key = 'model.layers.0.self_attn.k_proj.weight'
+    if sample_kv_key in state_dict:
+        sample_kv = state_dict['model.layers.0.self_attn.k_proj.weight']
+        n_kv_heads = sample_kv.shape[0] // head_dim
+        half_dtype = sample_kv.dtype
     else:
         scales = state_dict['model.layers.0.self_attn.k_proj.scales']
         n_kv_heads = scales.shape[1] // head_dim
@@ -701,11 +685,11 @@ def remap_llama_state_dict(state_dict, head_dim=None):
             if weight_key in state_dict:
                 kernel = state_dict.pop(f"{prefix}.weight").T
                 if part == 'query':
-                    kernel = kernel.reshape(hidden_size, n_heads, head_dim)
+                    kernel = kernel.reshape(hidden_size, -1, head_dim)
                 elif part in ['key', 'value']:
                     kernel = kernel.reshape(hidden_size, n_kv_heads, head_dim)
                 elif part == 'out':
-                    kernel = kernel.reshape(n_heads, head_dim, hidden_size)
+                    kernel = kernel.reshape(-1, head_dim, hidden_size)
                 params = {"kernel": kernel}
             else:
                 qweight = state_dict.pop(f"{prefix}.qweight")
@@ -718,7 +702,7 @@ def remap_llama_state_dict(state_dict, head_dim=None):
             bias = state_dict.pop(f"{prefix}.bias", None)
             if bias is not None and not (bias == 0).all():
                 if part == 'query':
-                    bias = bias.reshape(n_heads, head_dim)
+                    bias = bias.reshape(-1, head_dim)
                 elif part in ['key', 'value']:
                     bias = bias.reshape(n_kv_heads, head_dim)
                 elif part == 'out':
@@ -728,16 +712,24 @@ def remap_llama_state_dict(state_dict, head_dim=None):
             block_d[dst_l][part] = params
         block_d["ln_2"] = {"scale": state_dict.pop(
             f"model.layers.{d}.post_attention_layernorm.weight")}
+
+        # gemma2
+        ln_2p = state_dict.pop(f"model.layers.{d}.post_feedforward_layernorm.weight", None)
+        if ln_2p is not None:
+            block_d["ln_1p"] = {"scale": block_d["ln_2"]["scale"]}
+            block_d["ln_2"]['scale'] = state_dict.pop(
+                f"model.layers.{d}.pre_feedforward_layernorm.weight")
+            block_d["ln_2p"] = {"scale": ln_2p}
+
         root[f"h_{d}"] = block_d
 
     root["ln_f"] = {"scale": state_dict.pop("model.norm.weight")}
     if "lm_head.weight" in state_dict:
         weight = state_dict.pop("lm_head.weight").T
+        root["lm_head"] = {"kernel": weight.astype(half_dtype)}
     else:
         # tie_word_embeddings
         print("WARNING: use tied weights for lm_head")
-        weight = root["wte"]["embedding"].T.copy()
-    root["lm_head"] = {"kernel": weight.astype(half_dtype)}
     return root
 
 
@@ -1045,33 +1037,6 @@ def remap_phi3_state_dict(state_dict, head_dim=None):
         "scale": state_dict.pop("norm.weight"),
     }
     root["lm_head"] = {"kernel": state_dict.pop("lm_head.weight").T}
-    return root
-
-
-REMAP_FN = {
-    "llama": remap_llama_state_dict,
-    "qwen": remap_qwen_state_dict,
-    "chatglm": remap_chatglm_state_dict,
-    "internlm2": remap_internlm2_state_dict,
-    "phi3": remap_phi3_state_dict,
-}
-
-
-def remap_state_dict(*args, **kwargs):
-    format = kwargs.pop("format", "llama")
-    qconfig: QConfig = kwargs.pop("qconfig", None)
-    if format != "llama" and qconfig is not None:
-        assert qconfig.source == QuantSource.half and qconfig.method == QuantMethod.rtn_q8_0
-    root = REMAP_FN[format](*args, **kwargs)
-    if qconfig is not None:
-        q_source = qconfig.source
-        q_method = qconfig.method
-        if q_source == QuantSource.half and q_method == QuantMethod.rtn_q8_0:
-            return quantize_llama_to_q8(root, qconfig)
-        elif q_source in [QuantSource.autogptq_q4, QuantSource.autoawq_q4, QuantSource.autogptq_q8]:
-            return convert_llama_q_params(root, qconfig=qconfig)
-        else:
-            raise NotImplementedError(f"Quant method {q_method} is not supported for {format} from {q_source}")
     return root
 
 

@@ -4,19 +4,25 @@ import time
 import json
 from glob import glob
 
-from tqdm import tqdm
-
 import pandas as pd
-import numpy as np
 
 import hydra
 from omegaconf import DictConfig
 
 from haxllm.chat.config_utils import load_config
+from haxllm.inference.batch import batch_inference
 from haxllm.gconfig import set_gconfig
 
 
 choices = ["A", "B", "C", "D"]
+
+
+def accuracy(pred_answers, gold_answers):
+    acc = 0
+    for pred, gold in zip(pred_answers, gold_answers):
+        if pred == gold:
+            acc += 1
+    return acc, len(gold_answers)
 
 
 def compute_metric(output_filename):
@@ -25,14 +31,12 @@ def compute_metric(output_filename):
     total_acc = 0
     total_num = 0
     for task in run_results:
-        acc = 0
         pred_answers = run_results[task]['pred_answers']
         gold_answers = run_results[task]['gold_answers']
-        for pred, gold in zip(pred_answers, gold_answers):
-            if pred == gold: acc += 1
-        print("ACC-%s: %.4f" % (task, acc/len(gold_answers)))
+        acc, n = accuracy(pred_answers, gold_answers)
+        print("ACC-%s: %.4f" % (task, acc / n))
         total_acc += acc
-        total_num += len(gold_answers)
+        total_num += n
     print("ACC-all: %.4f" % (total_acc/total_num))
 
 
@@ -42,6 +46,7 @@ def format_subject(subject):
     for entry in l:
         s += " " + entry
     return s
+
 
 def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
@@ -53,6 +58,7 @@ def format_example(df, idx, include_answer=True):
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
 
+
 def gen_prompt(train_df, subject, k=-1):
     prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(format_subject(subject))
     if k == -1:
@@ -62,57 +68,25 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-def prepare_input(tokenizer, prompts, max_len):
-    n = len(prompts)
-    padding_side = tokenizer.padding_side
-    inputs = np.full((n, max_len), tokenizer.pad_token_id, dtype=np.int32)
-
-    encode_inputs = tokenizer(prompts, max_length=max_len, truncation=True)['input_ids']
-
-    for i in range(n):
-        encode_input = encode_inputs[i]
-        if padding_side == "right":
-            inputs[i, :len(encode_input)] = encode_input
-        else:
-            inputs[i, -len(encode_input):] = encode_input
-    return inputs
-
-
-def batch_split(prompts, batch_num):
-    batch_prompts = []
-    mini_batch = []
-    for prompt in prompts:
-        mini_batch.append(prompt)
-        if len(mini_batch) == batch_num:
-            batch_prompts.append(mini_batch)
-            mini_batch = []
-    if len(mini_batch) != 0:
-        batch_prompts.append(mini_batch)
-    return batch_prompts
-
-def batch_infer(pipeline, tokenizer, prompts, batch_size):
-    answers = []
-    for batch_input in tqdm(batch_split(prompts, batch_size)):
-        pad_len = 0
-        if len(batch_input) < batch_size:
-            pad_len = batch_size - len(batch_input)
-            batch_input = batch_input + ['Pad'] * pad_len
-        input_ids = prepare_input(tokenizer, batch_input, max_len=pipeline.max_len - 1)
-        output_ids = pipeline.random_sample(input_ids, max_new_tokens=1)[:(batch_size-pad_len)]
-        answers.extend(tokenizer.batch_decode(output_ids[:, -1], skip_special_tokens=True))
-    return answers
+def truncate_prompt(tokenizer, prompt, max_len):
+    while len(tokenizer.tokenize(prompt, add_special_tokens=True)) > max_len:
+        prompt_split = prompt.split("\n\n")
+        prompt_split.pop(1)
+        prompt = '\n\n'.join(prompt_split)
+    return prompt
 
 
 def load(cfg):
-    pipeline = load_config(cfg, chat=False)[0]
-    tokenizer = pipeline.tokenizer
-    return pipeline, tokenizer
+    pipeline, conv_template, max_new_tokens = load_config(cfg, chat=False)
+    return pipeline, max_new_tokens
 
 
 @hydra.main(version_base=None, config_path="../configs/chat", config_name="base")
 def main(cfg: DictConfig) -> None:
+    from jax_smi import initialise_tracking
+    initialise_tracking()
     from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.initialize_cache(os.path.expanduser("~/jax_cache"))
+    cc.set_cache_dir(os.path.expanduser("~/jax_cache"))
 
     set_gconfig({
         "seed": cfg.seed,
@@ -131,16 +105,15 @@ def main(cfg: DictConfig) -> None:
     k = getattr(cfg, "shot", 5)
     output_filename = 'run_results_%s.json' % cfg.model
 
-    # compute_metric(output_filename)
-    # raise NotImplementedError
-
     suffix = "_dev.csv"
 
     tasks = sorted(list(map(lambda x: x.split("/")[-1][:-len(suffix)], glob(os.path.join(data_dir, "dev", "*" + suffix)))))
 
     print("Use left padding for batch inference")
     cfg.padding_side = "left"
-    pipeline, tokenizer = load(cfg)
+    pipeline, max_new_tokens = load(cfg)
+    max_prompt_len = pipeline.max_len - max_new_tokens
+    tokenizer = pipeline.tokenizer
     print(pipeline.model.config)
 
     for task in tasks:
@@ -153,16 +126,21 @@ def main(cfg: DictConfig) -> None:
             # get prompt and make sure it fits
             prompt_end = format_example(test_df, i, include_answer=False)
             prompt = train_prompt + prompt_end
-            while len(tokenizer.tokenize(prompt)) + 1> pipeline.max_len: # bos token
-                prompt_split = prompt.split("\n\n")
-                prompt_split.pop(1)
-                prompt = '\n\n'.join(prompt_split)
+            prompt = truncate_prompt(tokenizer, prompt, max_prompt_len)
             label = test_df.iloc[i, test_df.shape[1]-1]
-            records.append({'prompt':prompt, 'answer':label})
+            records.append({'prompt': prompt, 'answer': label})
 
-        pred_answers = batch_infer(pipeline, tokenizer, [record['prompt'] for record in records], cfg.batch_size)
+        inputs = [record['prompt'] for record in records]
+        pred_answers = batch_inference(
+            pipeline, inputs, cfg.batch_size, progress_bar=True)
+        pred_answers = [x.strip() for x in pred_answers]
         gold_answers = [record['answer'] for record in records]
-        run_results[task] = {'pred_answers':pred_answers, 'gold_answers':gold_answers}
+
+        acc, n = accuracy(pred_answers, gold_answers)
+        print("ACC-%s: %.4f" % (task, acc / n))
+
+        run_results[task] = {'pred_answers': pred_answers, 'gold_answers': gold_answers}
+
     with open(output_filename, 'w') as f:
         json.dump(run_results, f, ensure_ascii=False, indent=2)
 

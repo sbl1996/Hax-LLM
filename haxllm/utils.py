@@ -224,6 +224,7 @@ def load_transformer_params(params, path: str, device, lm_head=False, verbose=Fa
 
     prefix = "transformer."
     all_keys = list([k[len(prefix):] for k in params.keys() if k.startswith(prefix)])
+    all_keys.append("wte.embedding")
     if lm_head:
         all_keys.extend([ k for k in params.keys() if k.startswith("lm_head")])
     fprint("Loading param on device...")
@@ -231,8 +232,10 @@ def load_transformer_params(params, path: str, device, lm_head=False, verbose=Fa
         if key not in new_transformer_params:
             fprint(f"Key {key} not found in transformer params")
             continue
-
-        full_key = key if key.startswith("lm_head") else prefix + key
+        if key.startswith("lm_head") or key.startswith("wte"):
+            full_key = key
+        else:
+            full_key = prefix + key
         p = params[full_key]
         # fprint(f"Loading param {key}")
         x = new_transformer_params[key]
