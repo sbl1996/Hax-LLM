@@ -17,9 +17,8 @@ from flax.linen.attention import (
 )
 
 from haxllm.model.modules import DenseGeneral
-from haxllm.gconfig import get as get_gconfig
-from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
-from haxllm.model.attention import decode_for_padding, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache, dot_product_attention
+from haxllm.gconfig import get as get_gconfig, get_attention_impl
+from haxllm.model.attention import decode_for_padding, tpu_flash_attention, make_apply_rope, init_decode_cache, dot_product_attention
 from haxllm.model.quantize import QConfig
 from haxllm.model.mixin import RoPEScalingConfig
 
@@ -173,6 +172,7 @@ class SelfAttention(ShardModule):
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
     qkv_bias: bool = True
     out_bias: bool = True
+    is_causal: bool = True
     decode: bool = False
     rope: bool = False
     scale: Optional[float] = None
@@ -180,8 +180,6 @@ class SelfAttention(ShardModule):
     rope_theta: float = 10000.0
     rope_scaling: Optional[RoPEScalingConfig] = None
     padding_left: bool = False
-    memory_efficient: bool = False
-    memory_efficient_mask_mode: str = "causal"
     query_shard_axes: Tuple[ShardAxis, ShardAxis, ShardAxis] = ("X", "Y", None)
     kv_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis]] = None
     kv_cache_shard_axes: Optional[Tuple[ShardAxis, ShardAxis, ShardAxis, ShardAxis]] = None
@@ -195,7 +193,6 @@ class SelfAttention(ShardModule):
     def __call__(
         self,
         x: Array,
-        mask: Optional[Array] = None,
         padding_mask: Optional[Array] = None,
     ):
         r"""
@@ -203,8 +200,6 @@ class SelfAttention(ShardModule):
         ----------
         x: Array, shape [batch, q_len, features]
             Input features.
-        mask: Optional[Array], shape [batch, 1, q_len, kv_len]
-            Mask to apply to attention scores.
         padding_mask: Optional[Array], shape [batch, q_len]
             Mask to indicate which query elements are padding.
             If both mask and padding_mask are provided, you must combine them by yourself.
@@ -286,12 +281,15 @@ class SelfAttention(ShardModule):
 
         if not self.decode:
             if self.padding_left:
-                position_ids = get_position_ids_for_padding_left(padding_mask)
-            else:
-                position_ids = None
+                raise NotImplementedError("padding_left=True is not supported for non-decode mode.")
+            position_ids = None
+            B = jnp.arange(key.shape[1])[None, :]
+            idx = jnp.arange(query.shape[1])
+            mask = B <= idx[:, None]
+            if self.sliding_window_size is not None:
+                mask = mask & (B > (idx - self.sliding_window_size)[:, None])
             query, key = add_pos(query, key, position_ids)
         else:
-            assert mask is None, "Mask is not needed for decoding, we infer it from cache."
             kv_cache_shard_axes = self.kv_cache_shard_axes or (key.ndim - 2) * (None,) + kv_shard_axes[-2:]
             is_initialized, cached_key, cached_value, cache_index = init_decode_cache(self, key, value, kv_cache_shard_axes)
             if self.padding_left:
@@ -301,6 +299,7 @@ class SelfAttention(ShardModule):
             else:
                 cache_position = None
 
+            mask = None
             if is_initialized:
                 query, key, value, mask = decode_for_padding(
                     add_pos, query, key, value, cache_index, cached_key, cached_value,
@@ -313,8 +312,19 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
-        if self.memory_efficient:
-            raise NotImplementedError
+        if get_attention_impl() == 'flash':
+            assert not self.decode, "flash attention is not supported for decode mode."
+            assert deterministic, "dropout not supported for flash attention."
+            x = tpu_flash_attention(
+                query,
+                key,
+                value,
+                sliding_window_size=self.sliding_window_size,
+                is_causal=self.is_causal,
+                scale=self.scale,
+                attn_logits_soft_cap=self.attn_logits_soft_cap,
+                dtype=self.dtype,
+            )
         else:
             x = dot_product_attention(
                 query,

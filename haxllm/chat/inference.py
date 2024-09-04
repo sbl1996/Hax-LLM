@@ -12,18 +12,19 @@ def partial_stop(output, stop_str):
     return False
 
 
-def generate_stream(pipeline: ChatPipeline, params, max_len=2048, stream_interval=2, kv_cache=None):
+def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=None):
     tokenizer = pipeline.tokenizer
     prompt = params["prompt"]
     len_prompt = len(prompt)
     temperature = float(params.get("temperature") or 1.0)
     repetition_penalty = float(params.get("repetition_penalty", 1.0))
+    max_len = int(params.get("max_len") or 2048)
     top_p = float(params.get("top_p") or 1.0)
     top_k = int(params.get("top_k") or -1)  # -1 means disable
-    stop_str = params.get("stop")
     echo = bool(params.get("echo") or False)
-    stop_token_ids = list(params.get("stop_token_ids")) or []
-    stop_token_ids.append(tokenizer.eos_token_id)
+    stop_token_ids = list(params.get("stop_token_ids", [])) or pipeline.stop_token_ids
+    if tokenizer.eos_token_id not in stop_token_ids:
+        stop_token_ids.append(tokenizer.eos_token_id)
 
     input_ids = tokenizer(prompt).input_ids
     input_echo_len = len(input_ids)

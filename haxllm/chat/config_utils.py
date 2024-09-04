@@ -13,6 +13,7 @@ from haxllm.pipeline.text_generation import ChatPipeline, TextGenerationPipeline
 from haxllm.config_utils import get_module
 from haxllm.model.utils import load_config as _load_config, load_model_cls
 from haxllm.model.quantize import QConfig
+from haxllm.chat.conversation import get_conv_template
 
 
 def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipeline, str, int]:
@@ -109,10 +110,13 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
 
     max_len = max_len or config.n_positions
     pad_multiple = getattr(cfg, "chunk_size", 512)
+    stop_token_ids = get_conv_template(conv_template).config.stop_token_ids
     Pipeline = ChatPipeline if chat else TextGenerationPipeline
     pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,
         temperature=temperature, top_p=top_p, top_k=top_k,
-        max_new_tokens=max_new_tokens, pad_multiple=pad_multiple)
+        max_new_tokens=max_new_tokens, pad_multiple=pad_multiple,
+        stop_token_ids=stop_token_ids,
+    )
     pipeline.init(transformer_weight=checkpoint, mesh=mesh)
     return pipeline, conv_template

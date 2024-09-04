@@ -144,7 +144,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
         "top_p": request.top_p or model.top_p,
         "repetition_penalty": repetition_penalty,
         "max_len": request.max_tokens or model.max_len,
-        "stop_token_ids": conv.config.stop_token_ids,
         "max_new_tokens": model.max_new_tokens,
     }
 
@@ -249,6 +248,24 @@ async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
     yield "data: [DONE]\n\n"
 
 
+def compile():
+    start = time.time()
+    print("Compiling model stream mode...")
+    model.reset_chat_state()
+    gen_params = {
+        "temperature": model.temperature,
+        "top_p": model.top_p,
+        "repetition_penalty": model.repetition_penalty,
+        "max_len": model.max_len,
+        "max_new_tokens": model.max_new_tokens,
+        "prompt": "hello"
+    }
+    output = generate_stream(model, gen_params)
+    for x in output:
+        pass
+    print(f"Compilation finished in {time.time() - start:.2f}s")
+
+
 @hydra.main(version_base=None, config_path="../../configs/chat", config_name="base")
 def chat_api_server(cfg: DictConfig) -> None:
     from jax_smi import initialise_tracking
@@ -271,6 +288,7 @@ def chat_api_server(cfg: DictConfig) -> None:
     print(f"  repetition_penalty: {pipeline.repetition_penalty}")
     print(f"  max_len: {pipeline.max_len}")
     print(f"  chunk_size: {pipeline.pad_multiple}")
+    compile()
 
     host = getattr(cfg, "host", "127.0.0.1")
     port = getattr(cfg, "port", 8000)

@@ -14,6 +14,9 @@ from flax.linen.attention import (
     PrecisionLike,
 )
 from flax.linen.dtypes import promote_dtype
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
 from haxllm.model.mixin import RoPEScalingConfig
 
 
@@ -425,9 +428,6 @@ def dot_product_attention_weights(
 def replicate_for_multi_query(x, num_heads):
     src_num_heads, head_dim = x.shape[-2:]
     x = jnp.repeat(x, num_heads // src_num_heads, axis=-2)
-    # x = jnp.expand_dims(x, axis=-2)
-    # x = jnp.tile(x, (1, 1, 1, num_heads // src_num_heads, 1))
-    # x = jnp.reshape(x, (*x.shape[:2], num_heads, head_dim))
     return x
 
 
@@ -513,6 +513,7 @@ def dot_product_attention(
         force_fp32_for_softmax,
         einsum_dot_general=einsum_dot_general,
     )
+    attn_weights = attn_weights.astype(value.dtype)
 
     if query.shape[-2] != key.shape[-2]:
         # no significant speed difference between replication and explicit grouped computation
@@ -545,3 +546,70 @@ def dot_product_attention(
             precision=precision,
             _dot_general=einsum_dot_general,
         )
+
+
+def tpu_flash_attention(
+    query, key, value, scale: float | None = None,
+    attn_logits_soft_cap: float | None = None,
+    is_causal: bool = True, sliding_window_size: int | None = None,
+    dtype: Optional[Dtype] = None,
+):
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    dtype = query.dtype
+
+    """TPU Flash Attention."""
+    # Transpose to ('batch', 'heads', 'length', 'kv')
+    query = jnp.transpose(query, axes=(0, 2, 1, 3))
+    key = jnp.transpose(key, axes=(0, 2, 1, 3))
+    value = jnp.transpose(value, axes=(0, 2, 1, 3))
+    if scale is None:
+        depth = query.shape[-1]
+        scale = 1 / jnp.sqrt(depth)
+    scale = jnp.asarray(scale, dtype=query.dtype)
+    query = query * scale
+
+    # if decoder_segment_ids is not None:
+    #     decoder_segment_ids = splash_attention_kernel.SegmentIds(decoder_segment_ids, decoder_segment_ids)
+
+    def wrap_flash_attention(query, key, value, decoder_segment_ids):
+        if decoder_segment_ids is not None:
+            assert (
+                query.shape[2] == decoder_segment_ids.q.shape[1]
+            ), "Sharding along sequence dimension not allowed in tpu kernel attention"
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=min(512, query.shape[2]),
+            block_kv_compute=min(512, key.shape[2]),
+            block_kv=min(512, key.shape[2]),
+            block_q_dkv=min(512, query.shape[2]),
+            block_kv_dkv=min(512, key.shape[2]),
+            block_kv_dkv_compute=min(512, query.shape[2]),
+            block_q_dq=min(512, query.shape[2]),
+            block_kv_dq=min(512, query.shape[2]),
+        )
+
+        mask = None
+        if is_causal:
+            mask = splash_attention_mask.CausalMask(shape=(query.shape[2], query.shape[2]))
+
+        if sliding_window_size is not None:
+            sliding_mask = splash_attention_mask.LocalMask(
+                shape=(query.shape[2], query.shape[2]),
+                window_size=(sliding_window_size, sliding_window_size),
+                offset=0,
+            )
+            if mask is not None:
+                mask = mask & sliding_mask
+            else:
+                mask = sliding_mask
+
+        # Create multi-head mask
+        multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) *  query.shape[1])
+        splash_kernel = splash_attention_kernel.make_splash_mha(
+            mask=multi_head_mask, head_shards=1, q_seq_shards=1, block_sizes=block_sizes, attn_logits_soft_cap=attn_logits_soft_cap,
+        )
+
+        return jax.vmap(splash_kernel)(query, key, value, segment_ids=decoder_segment_ids)
+
+    x = wrap_flash_attention(query, key, value, None)
+    x = jnp.transpose(x, axes=(0, 2, 1, 3))
+    return x.astype(dtype)

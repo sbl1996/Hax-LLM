@@ -4,6 +4,7 @@ _GCONFIG = {
     "remat_scan_level": 2,
     "remat_policy": "default",
     "seed": 42,
+    "attention_impl": "native",  # flash
 }
 
 def get(key):
@@ -23,6 +24,9 @@ def set(key, value):
                 raise ValueError(f"Invalid remat ratio {ratio}")
         else:
             raise ValueError(f"Unknown remat policy {value}")
+    if key == "attention_impl":
+        if value not in ["native", "flash"]:
+            raise ValueError(f"Unknown attention implementation {value}, must be one of [native, flash]")
     _GCONFIG[key] = value
 
 
@@ -70,3 +74,7 @@ def get_remat_policy():
 
 def get_seed():
     return get("seed")
+
+
+def get_attention_impl():
+    return get("attention_impl")

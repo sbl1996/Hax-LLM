@@ -93,7 +93,6 @@ class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     kernel_init: Callable = nn.initializers.xavier_uniform()
     bias_init: Callable = nn.initializers.normal(stddev=1e-6)
     padding_left: bool = False
-    memory_efficient_attention: bool = False
     decode: bool = False
     shard: bool = False
     shard_cache: bool = False
@@ -121,20 +120,6 @@ class TransformerBlock(nn.Module):
 
         inputs, padding_mask = inputs
 
-        if config.decode:
-            mask = None
-        else:
-            mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
-            if padding_mask is not None:
-                # padding left
-                raise NotImplementedError("padding left not supported in non-decode mode")
-                # mask = mask & ~padding_mask[:, None, None, :]
-            elif self.is_sliding:
-                ones = jnp.ones_like(mask)
-                window_size = config.sliding_window_size
-                sliding_mask = jnp.triu(ones, -window_size + 1) * jnp.tril(ones, window_size - 1)
-                mask = mask * sliding_mask
-
         x = RMSNorm(epsilon=config.rms_norm_eps, offset=1.0,
                     dtype=config.dtype, name="ln_1")(inputs)
         x = SelfAttention(
@@ -161,7 +146,7 @@ class TransformerBlock(nn.Module):
             shard=config.shard,
             shard_cache=config.shard_cache,
             qconfig=config.qconfig,
-            name="attn")(x, mask, padding_mask)
+            name="attn")(x, padding_mask=padding_mask)
         if config.use_post_attn_norm:
             x = RMSNorm(epsilon=config.rms_norm_eps, offset=1.0,
                         dtype=config.dtype, name="ln_1p")(x)
@@ -239,7 +224,7 @@ class TransformerLMHeadModel(nn.Module):
         x *= jnp.sqrt(config.hidden_size).astype(x.dtype)
 
         padding_mask = None
-        if config.padding_left and input_ids.shape[1] > 1:
+        if config.decode and config.padding_left and input_ids.shape[1] > 1:
             padding_mask = jnp.equal(input_ids, config.pad_token_id)
 
         x = TransformerModel(
