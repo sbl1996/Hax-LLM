@@ -232,21 +232,27 @@ def get_position_ids_for_padding_left(padding_mask, return_pad_position=False):
     return position_ids
 
 
-def decode_for_padding_left(add_pos, query, key, value, cache_index, cached_key, cached_value, cache_position, padding_mask=None):
+def decode_for_padding(
+    add_pos, query, key, value, cache_index, cached_key, cached_value,
+    padding_left, cache_position=None, padding_mask=None, window_size=None):
     num_queries = query.shape[-3]
     cur_index = cache_index.value
 
     assert key.ndim == 4 and value.ndim == 4, "Only 1D batched input is supported for decoding."
     batch_size, max_length, num_heads, depth_per_head = cached_key.value.shape
 
-    if num_queries > 1:
-        # First stage, context decode
-        position_ids, pad_position = get_position_ids_for_padding_left(
-            padding_mask, return_pad_position=True)
+    if padding_left:
+        if num_queries > 1:
+            # Prefill
+            position_ids, pad_position = get_position_ids_for_padding_left(
+                padding_mask, return_pad_position=True)
+        else:
+            cur_position = cache_position.value
+            pad_position = cur_index - cur_position
+            position_ids = cur_position[:, None]
     else:
-        cur_position = cache_position.value
-        pad_position = cur_index - cur_position
-        position_ids = cur_position[:, None]
+        position_ids = jnp.arange(num_queries) + cur_index
+
     position_ids = jnp.broadcast_to(position_ids, (batch_size, num_queries))
     query, key = add_pos(query, key, position_ids)
 
@@ -255,49 +261,23 @@ def decode_for_padding_left(add_pos, query, key, value, cache_index, cached_key,
     value = lax.dynamic_update_slice(cached_value.value, value, indices)
     cached_key.value = key
     cached_value.value = value
-
-    cache_position.value = position_ids[:, -1] + 1
     cache_index.value = cache_index.value + num_queries
 
-    padding_mask = jnp.arange(max_length)[None, :] < pad_position[:, None]
+    if padding_left:
+        cache_position.value = position_ids[:, -1] + 1
+        padding_mask = jnp.arange(max_length)[None, :] < pad_position[:, None]
 
     idx = jnp.arange(num_queries) + cur_index
-    mask = jnp.arange(max_length)[None, :] <= idx[:, None]
-    mask = mask[None, None] & (~padding_mask[:, None, None, :])
+    B = jnp.arange(max_length)[None, :]
+    mask = B <= idx[:, None]
+    if window_size is not None:
+        mask = mask & (B > (idx - window_size)[:, None])
+    if padding_mask is not None:
+        mask = mask[None, None] & (~padding_mask[:, None, None, :])
     mask = jnp.broadcast_to(
         mask, (batch_size, 1, num_queries, max_length),
     )
-    return query, key, value, mask
-
-
-def decode_for_padding_right(
-    add_pos, query, key, value, cache_index, cached_key, cached_value, window_size=None):
-    num_queries = query.shape[-3]
-    cur_index = cache_index.value
-
-    *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-
-    position_ids = jnp.arange(num_queries) + cur_index
-    position_ids = jnp.broadcast_to(position_ids, tuple(batch_dims) + (num_queries,))
-    query, key = add_pos(query, key, position_ids)
-
-    indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-    key = lax.dynamic_update_slice(cached_key.value, key, indices)
-    value = lax.dynamic_update_slice(cached_value.value, value, indices)
-    cached_key.value = key
-    cached_value.value = value
-
-    cache_index.value = cache_index.value + num_queries
-
-    idx = jnp.arange(num_queries) + cur_index
-    mask = jnp.arange(max_length)[None, :] <= idx[:, None]
-    if window_size is not None:
-        ones = jnp.ones_like(mask)
-        sliding_mask = jnp.triu(ones, -window_size + 1) * jnp.tril(ones, window_size - 1)
-        mask = mask * sliding_mask
-    mask = jnp.broadcast_to(
-        mask, tuple(batch_dims) + (1, num_queries, max_length),
-    )
+    # TODO: maybe use only part of kv for window attention
     return query, key, value, mask
 
 

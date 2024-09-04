@@ -260,7 +260,7 @@ def chat_api_server(cfg: DictConfig) -> None:
 
     global model, tokenizer, conv_template
 
-    pipeline, conv_template, max_new_tokens = load_config(cfg)
+    pipeline, conv_template = load_config(cfg)
     model = pipeline
     tokenizer = pipeline.tokenizer
 

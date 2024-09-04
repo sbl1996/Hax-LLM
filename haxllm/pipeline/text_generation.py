@@ -36,7 +36,7 @@ def init_mesh(mesh):
 class TextGenerationPipeline:
 
     def __init__(self, tokenizer: Tokenizer, model, max_len=512, seed=None, rng=None,
-                 two_stage=False, pad_multiple=512, temperature=1.0, top_k=-1,
+                 two_stage=True, pad_multiple=512, temperature=1.0, top_k=-1,
                  top_p=1.0, repetition_penalty=1.0,
                  max_new_tokens=None, stop_token_ids=None, verbose=True):
         r"""
@@ -340,6 +340,7 @@ class ChatPipeline(TextGenerationPipeline):
         """
         super().__init__(tokenizer, model, max_len, seed, two_stage=True, pad_multiple=pad_multiple, **kwargs)
         self.reset_chat_state()
+        self.conv_template = None
     
     def reset_chat_state(self):
         self._ccache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), self.cache)
@@ -375,9 +376,6 @@ class ChatPipeline(TextGenerationPipeline):
         self._ccache = cache
         return logits
 
-    def chat(self, query: str, history: List[Tuple[str, str]] = None,
-             temperature=0.8, top_k=None, top_p=0.8, repetition_penalty=1.0, max_len=None):
-        return self.random_sample(query, history, temperature, top_k, top_p, repetition_penalty, max_len)
 
 # TODO: refactor
 def apply_with_pad(apply_fn, params, cache, input_ids, pad_multiple, pad_token_id):

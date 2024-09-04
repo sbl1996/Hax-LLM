@@ -19,7 +19,7 @@ from flax.linen.attention import (
 from haxllm.model.modules import DenseGeneral
 from haxllm.gconfig import get as get_gconfig
 from haxllm.model.efficient_attention import dot_product_attention as dot_product_attention_m
-from haxllm.model.attention import decode_for_padding_left, decode_for_padding_right, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache, dot_product_attention
+from haxllm.model.attention import decode_for_padding, get_position_ids_for_padding_left, make_apply_rope, init_decode_cache, dot_product_attention
 from haxllm.model.quantize import QConfig
 from haxllm.model.mixin import RoPEScalingConfig
 
@@ -298,17 +298,13 @@ class SelfAttention(ShardModule):
                 cache_position = self.variable(
                     "cache", "cache_position", lambda: jnp.zeros(key.shape[0], dtype=jnp.int32)
                 )
+            else:
+                cache_position = None
 
             if is_initialized:
-                if self.padding_left:
-                    if sliding_window_size is not None:
-                        raise NotImplementedError
-                    query, key, value, mask = decode_for_padding_left(
-                        add_pos, query, key, value, cache_index, cached_key, cached_value, cache_position, padding_mask)
-                else:
-                    query, key, value, mask = decode_for_padding_right(
-                        add_pos, query, key, value, cache_index,
-                        cached_key, cached_value, self.sliding_window_size)
+                query, key, value, mask = decode_for_padding(
+                    add_pos, query, key, value, cache_index, cached_key, cached_value,
+                    self.padding_left, cache_position, padding_mask, self.sliding_window_size)
 
         dropout_rng = None
         if self.dropout_rate > 0 and not self.deterministic:
@@ -319,37 +315,6 @@ class SelfAttention(ShardModule):
 
         if self.memory_efficient:
             raise NotImplementedError
-            assert not self.decode, "Memory efficient attention does not support decoding."
-            assert deterministic, "Memory efficient attention does not support dropout."
-            assert not self.padding_left, "Memory efficient attention does not support padding_left."
-        
-            mask_mode = self.memory_efficient_mask_mode
-            context_lengths = None
-            pad_positions = None
-            if mask_mode == "causal":
-                if mask is not None:
-                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='causal'.")
-                mask = None
-            # TODO: implement padding mask
-            elif mask_mode == 'padding':
-                raise NotImplementedError
-            #     if mask is not None:
-            #         print("WARNING: padding mask is needed for memory efficient attention using mask_mode='padding'.")
-            #     mask = mask[:, None, None, :]
-            elif mask_mode == 'bidirectional':
-                if mask is not None:
-                    print("WARNING: mask is not needed for memory efficient attention using mask_mode='bidirectional', we infer it from position_ids.")
-                    mask = None
-                context_lengths = jnp.argmax(position_ids[:, 0, :], axis=1) + 1
-            x = dot_product_attention_m(
-                query,
-                key,
-                value,
-                pad_positions,
-                context_lengths,
-                mask_mode,
-                dtype=self.dtype,
-            )
         else:
             x = dot_product_attention(
                 query,

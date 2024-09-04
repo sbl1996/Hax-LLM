@@ -41,6 +41,8 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
     random_seed = cfg.seed
     tokenizer_name = template_config.pop("tokenizer")
     conv_template = template_config.pop("conv_template", None)
+    if conv_template is None or getattr(cfg, "non_chat", False):
+        conv_template = "non_chat"
 
     checkpoint = getattr(cfg, "checkpoint", None)
     if checkpoint is None:
@@ -113,4 +115,4 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
         temperature=temperature, top_p=top_p, top_k=top_k,
         max_new_tokens=max_new_tokens, pad_multiple=pad_multiple)
     pipeline.init(transformer_weight=checkpoint, mesh=mesh)
-    return pipeline, conv_template, max_new_tokens
+    return pipeline, conv_template

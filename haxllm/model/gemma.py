@@ -7,9 +7,10 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax import struct
 
-from haxllm.model.quantize import QConfig, QuantMethod, QuantSource
-from haxllm.model.modules import RMSNorm, make_block_stack
-from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention
+from haxllm.model.quantize import QConfig
+from haxllm.gconfig import get_remat_policy
+from haxllm.model.modules import RMSNorm
+from haxllm.model.parallel import GLUMlpBlock, remat, Embed, SelfAttention
 from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfigMixin
 from haxllm.chat.setting import register_chat_setting
 from haxllm.model.llama import remap_llama_state_dict
@@ -120,19 +121,19 @@ class TransformerBlock(nn.Module):
 
         inputs, padding_mask = inputs
 
-        if config.memory_efficient_attention or config.decode:
+        if config.decode:
             mask = None
         else:
             mask = nn.make_causal_mask(inputs[..., 0], dtype=jnp.bool_)  # (batch, 1, seq_len, seq_len)
             if padding_mask is not None:
-                raise NotImplementedError
+                # padding left
+                raise NotImplementedError("padding left not supported in non-decode mode")
                 # mask = mask & ~padding_mask[:, None, None, :]
-            else:
-                if self.is_sliding:
-                    ones = jnp.ones_like(mask)
-                    window_size = config.sliding_window_size
-                    sliding_mask = jnp.triu(ones, -window_size + 1) * jnp.tril(ones, window_size - 1)
-                    mask = mask * sliding_mask
+            elif self.is_sliding:
+                ones = jnp.ones_like(mask)
+                window_size = config.sliding_window_size
+                sliding_mask = jnp.triu(ones, -window_size + 1) * jnp.tril(ones, window_size - 1)
+                mask = mask * sliding_mask
 
         x = RMSNorm(epsilon=config.rms_norm_eps, offset=1.0,
                     dtype=config.dtype, name="ln_1")(inputs)
@@ -200,17 +201,18 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, inputs, train):
         config = self.config
-        remat = config.remat or config.remat_scan
+        is_remat = config.remat or config.remat_scan
         x, padding_mask = inputs
-        # TODO: follow make_block_stack
-        # x = make_block_stack(
-        #     self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
+
+        block_fn = self.block_cls
+        if is_remat and train:
+            remat_policy = get_remat_policy()
+            block_fn = remat(block_fn, policy=remat_policy)
         for i in range(config.n_layers):
-            x = self.block_cls(
+            x = block_fn(
                 config=config, is_sliding=i % 2 == 0, name=f"h_{i}")((x, padding_mask))[0]
 
-        norm_layer = RMSNorm
-        x = norm_layer(epsilon=config.rms_norm_eps, offset=1.0,
+        x = RMSNorm(epsilon=config.rms_norm_eps, offset=1.0,
                        dtype=config.dtype, name="ln_f")(x)
         return x
 

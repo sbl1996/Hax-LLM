@@ -30,14 +30,20 @@ def compute_metric(output_filename):
         run_results = json.load(f)
     total_acc = 0
     total_num = 0
+    task_accuracies = []
     for task in run_results:
         pred_answers = run_results[task]['pred_answers']
         gold_answers = run_results[task]['gold_answers']
         acc, n = accuracy(pred_answers, gold_answers)
-        print("ACC-%s: %.4f" % (task, acc / n))
+        task_accuracy = acc / n
+        task_accuracies.append(task_accuracy)
+        print("ACC-%s: %.4f" % (task, task_accuracy))
         total_acc += acc
         total_num += n
-    print("ACC-all: %.4f" % (total_acc/total_num))
+    micro_avg_acc = total_acc / total_num
+    macro_avg_acc = sum(task_accuracies) / len(task_accuracies)
+    print("ACC-all-micro: %.4f" % micro_avg_acc)
+    print("ACC-all-macro: %.4f" % macro_avg_acc)
 
 
 def format_subject(subject):
@@ -77,8 +83,8 @@ def truncate_prompt(tokenizer, prompt, max_len):
 
 
 def load(cfg):
-    pipeline, conv_template, max_new_tokens = load_config(cfg, chat=False)
-    return pipeline, max_new_tokens
+    pipeline, conv_template = load_config(cfg, chat=False)
+    return pipeline
 
 
 @hydra.main(version_base=None, config_path="../configs/chat", config_name="base")
@@ -104,6 +110,7 @@ def main(cfg: DictConfig) -> None:
     run_results = {}
     k = getattr(cfg, "shot", 5)
     output_filename = 'run_results_%s.json' % cfg.model
+    compute_metric(output_filename)
 
     suffix = "_dev.csv"
 
@@ -111,8 +118,8 @@ def main(cfg: DictConfig) -> None:
 
     print("Use left padding for batch inference")
     cfg.padding_side = "left"
-    pipeline, max_new_tokens = load(cfg)
-    max_prompt_len = pipeline.max_len - max_new_tokens
+    pipeline = load(cfg)
+    max_prompt_len = pipeline.max_len - pipeline.max_new_tokens
     tokenizer = pipeline.tokenizer
     print(pipeline.model.config)
 
