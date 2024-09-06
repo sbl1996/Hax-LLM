@@ -1,0 +1,5 @@
+family: llama
+tokenizer: mistralai/Mistral-Nemo-Instruct-2407
+remat: False
+scan: False
+conv_template: mistral-nemo

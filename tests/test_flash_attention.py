@@ -5,6 +5,8 @@ import jax
 import functools
 
 from haxllm.model.attention import dot_product_attention, tpu_flash_attention
+from jax_smi import initialise_tracking
+initialise_tracking()
 
 
 _cur_key = jax.random.PRNGKey(4)
@@ -16,7 +18,7 @@ def fresh():
     return result
 
 
-batch_size = 1
+batch_size = 16
 num_groups = 16
 num_heads = 32
 head_dim = 128
@@ -136,7 +138,7 @@ if decode:
 # Compare differentiation performance
 
 execute_standard_att = True
-execute_flash_att = True
+execute_flash_att = False
 
 def loss_simp(query, key, value, mask):
     return jnp.sum(standard_attention(query, key, value, mask, dtype=dtype, precision=precision))
@@ -157,7 +159,7 @@ for i in range(8, 13, 1):
     key = fresh_kv(memsize, input_dtype)
     value = fresh_kv(memsize, input_dtype)
     if mask_mode:
-        mask = fresh_mask(q_size)
+        mask = fresh_mask(q_size, memsize)
     else:
         mask = None
 

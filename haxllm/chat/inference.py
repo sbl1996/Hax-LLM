@@ -22,7 +22,8 @@ def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=
     top_p = float(params.get("top_p") or 1.0)
     top_k = int(params.get("top_k") or -1)  # -1 means disable
     echo = bool(params.get("echo") or False)
-    stop_token_ids = list(params.get("stop_token_ids", [])) or pipeline.stop_token_ids
+    stop_token_ids = params.get("stop_token_ids", []) or pipeline.stop_token_ids
+    stop_token_ids = list(stop_token_ids)
     if tokenizer.eos_token_id not in stop_token_ids:
         stop_token_ids.append(tokenizer.eos_token_id)
 

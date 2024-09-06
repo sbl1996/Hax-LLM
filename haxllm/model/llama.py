@@ -99,7 +99,6 @@ def YiConfig(**kwargs):
 def Yi1_5Config(**kwargs):
     base = dict(
         vocab_size=64000,
-        qkv_bias=False,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
@@ -113,7 +112,6 @@ def Yi1_5Config(**kwargs):
 def Llama3Config(**kwargs):
     base = dict(
         vocab_size=128256,
-        qkv_bias=False,
         pad_token_id=0,
         bos_token_id=128000,
         eos_token_id=128009,
@@ -134,13 +132,26 @@ def Llama3Config(**kwargs):
 def MistralConfig(**kwargs):
     base = dict(
         vocab_size=32768,
-        qkv_bias=False,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
         rope_theta=1000000.0,
         rms_norm_eps=1e-5,
         n_positions=32768,
+    )
+    return {**base, **kwargs}
+
+
+def MistralNemoConfig(**kwargs):
+    base = dict(
+        vocab_size=131072,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=1000000.0,
+        rms_norm_eps=1e-5,
+        n_positions=32768,
+        head_dim=128,
     )
     return {**base, **kwargs}
 
@@ -381,6 +392,13 @@ config_hub = {
         n_kv_heads=8,
         n_layers=56,
     ),
+    "mistral-nemo-12b": MistralNemoConfig(
+        hidden_size=5120,
+        intermediate_size=14336,
+        n_heads=32,
+        n_kv_heads=8,
+        n_layers=40,
+    ),
     "internlm2.5-1.8b": InternLM2_5Config(
         hidden_size=2048,
         intermediate_size=8192,
@@ -444,6 +462,7 @@ class TransformerConfig(RematScanConfigMixin, RoPEScalingConfigMixin):
     intermediate_size: int = 11008
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     n_layers: int = 32
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
@@ -478,6 +497,7 @@ class TransformerBlock(nn.Module):
         x = SelfAttention(
             num_heads=config.n_heads,
             num_kv_heads=config.n_kv_heads,
+            head_dim=config.head_dim,
             max_len=config.n_positions,
             dtype=config.dtype,
             param_dtype=config.param_dtype,
@@ -1072,11 +1092,12 @@ class YiChatSetting:
 
 
 @register_chat_setting()
-class LLaMA31InstructSetting:
-    name = "llama31-instruct"
+class LLaMA3ChatSetting:
+    name = "llama3-instruct"
     system = ""
     roles = ("user", "assistant")
     stop_token_ids = (128001, 128009,)
+    add_date = False
 
     def get_prompt(self, messages):
         boh = "<|start_header_id|>"
@@ -1089,11 +1110,16 @@ class LLaMA31InstructSetting:
             system = messages[0][1]
             messages = messages[1:]
         system = system.strip()
+        date_prompt = ""
+        if self.add_date:
+            date_string = datetime.now().strftime('%d %b %Y')
+            # date_string = "26 Jul 2024"
+            date_prompt = \
+                f"Cutting Knowledge Date: December 2023\n" \
+                f"Today Date: {date_string}\n\n"
+            system = date_prompt + system
         if system:
-            ret += f"{boh}system{eoh}\n\n" \
-                   f"Cutting Knowledge Date: December 2023\n" \
-                   f"Today Date: {datetime.now().strftime('%d %b %Y')}\n\n" \
-                   f"{system}{eos}"
+            ret += f"{boh}system{eoh}\n\n{system}{eos}"
         for i, (role, message) in enumerate(messages):
             ret += f"{boh}{role}{eoh}\n\n"
             if message:
@@ -1104,32 +1130,9 @@ class LLaMA31InstructSetting:
 
 
 @register_chat_setting()
-class LLaMA3ChatSetting:
-    name = "llama3-chat"
-    system = "You are a helpful assistant."
-    roles = ("user", "assistant")
-    stop_token_ids = (128001, 128009,)
-
-    def get_prompt(self, messages):
-        boh = "<|start_header_id|>"
-        eoh = "<|end_header_id|>"
-        eos = "<|eot_id|>"
-        # ret = "<|begin_of_text|>"
-        ret = ""
-        system = self.system
-        if messages[0][0] == "system":
-            system = messages[0][1]
-            messages = messages[1:]
-        system = system.strip()
-        if system:
-            ret += f"{boh}system{eoh}\n\n{system}{eos}"
-        for i, (role, message) in enumerate(messages):
-            ret += f"{boh}{role}{eoh}\n\n"
-            if message:
-                ret += message.strip() + eos
-            else:
-                assert i == len(messages) - 1 and role == self.roles[1]
-        return ret
+class LLaMA31InstructSetting(LLaMA3ChatSetting):
+    name = "llama3.1-instruct"
+    add_date = True
 
 
 B_INST, E_INST = "[INST]", "[/INST]"
@@ -1205,6 +1208,7 @@ class MistralChatSetting:
     system = ""
     roles = ("user", "assistant")
     stop_token_ids = (2,)
+    extra_space = True
 
     def get_prompt(self, messages):
         B_INST, E_INST = "[INST]", "[/INST]"
@@ -1217,20 +1221,32 @@ class MistralChatSetting:
             messages = messages[1:]
         system = system.strip()
         n = len(messages)
+        last_msg = messages[-1]
+        if (last_msg[0] == self.roles[1] and last_msg[1] is None) or last_msg[0] == self.roles[0]:
+            system = system.strip()
+        else:
+            system = None
+        space = " " if self.extra_space else ""
         for i, (role, content) in enumerate(messages):
             if role == self.roles[0]:
                 if i % 2 != 0:
                     raise ValueError(f"After the optional system message, conversation roles must alternate user/assistant/user/assistant/...")
                 if system and i in [n - 1, n - 2]:
-                    ret += f"{B_INST} {system}\n\n{content}{E_INST}"
+                    ret += f"{B_INST}{space}{system}\n\n{content}{E_INST}"
                 else:
-                    ret += f"{B_INST} {content}{E_INST}"
+                    ret += f"{B_INST}{space}{content}{E_INST}"
             else:
                 if content:
-                    ret += f" {content}{eos}"
+                    ret += f"{space}{content}{eos}"
                 else:
-                    ret += f" "
+                    ret += space
         return ret
+
+
+@register_chat_setting()
+class MistralNemoChatSetting(MistralChatSetting):
+    name = "mistral-nemo"
+    extra_space = False
 
 
 @register_chat_setting()

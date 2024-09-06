@@ -604,6 +604,7 @@ def tpu_flash_attention(
 
         # Create multi-head mask
         multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) *  query.shape[1])
+        # splash_attention_kernel.make_splash_mqa not work for gqa
         splash_kernel = splash_attention_kernel.make_splash_mha(
             mask=multi_head_mask, head_shards=1, q_seq_shards=1, block_sizes=block_sizes, attn_logits_soft_cap=attn_logits_soft_cap,
         )
