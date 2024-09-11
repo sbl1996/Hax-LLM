@@ -53,6 +53,7 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
 
     temperature = getattr(cfg, "temperature", 1.0)
     top_p = getattr(cfg, "top_p", 1.0)
+    min_p = getattr(cfg, "min_p", 0.0)
     top_k = getattr(cfg, "top_k", -1)
     max_new_tokens = getattr(cfg, "max_new_tokens", None)
 
@@ -109,12 +110,12 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
     model = load_model_cls(mod, "lm")(config)
 
     max_len = max_len or config.n_positions
-    pad_multiple = getattr(cfg, "chunk_size", 512)
+    pad_multiple = getattr(cfg, "chunk_size", None) or 512
     stop_token_ids = get_conv_template(conv_template).config.stop_token_ids
     Pipeline = ChatPipeline if chat else TextGenerationPipeline
     pipeline = Pipeline(
         tokenizer, model, max_len=max_len, seed=random_seed,
-        temperature=temperature, top_p=top_p, top_k=top_k,
+        temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p,
         max_new_tokens=max_new_tokens, pad_multiple=pad_multiple,
         stop_token_ids=stop_token_ids,
     )

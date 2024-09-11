@@ -15,11 +15,11 @@ def partial_stop(output, stop_str):
 def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=None):
     tokenizer = pipeline.tokenizer
     prompt = params["prompt"]
-    len_prompt = len(prompt)
     temperature = float(params.get("temperature") or 1.0)
     repetition_penalty = float(params.get("repetition_penalty", 1.0))
     max_len = int(params.get("max_len") or 2048)
     top_p = float(params.get("top_p") or 1.0)
+    min_p = float(params.get("min_p") or 0.0)
     top_k = int(params.get("top_k") or -1)  # -1 means disable
     echo = bool(params.get("echo") or False)
     stop_token_ids = params.get("stop_token_ids", []) or pipeline.stop_token_ids
@@ -50,6 +50,7 @@ def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=
     else:
         rng = pipeline.get_next_rng()
 
+    token = None
     for i in range(max_new_tokens):
         if i == 0:
             input_ids = jnp.array([input_ids[pre:]], dtype=jnp.int32)
@@ -59,7 +60,9 @@ def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=
                 jnp.array([[token]], dtype=jnp.int32))
 
         rng, subrng = split_rng(rng)
-        token = sample_token(logits[0, -1, :], live_seq, subrng, temperature, top_p, top_k, repetition_penalty) 
+        token = sample_token(
+            logits[0, -1, :], live_seq, subrng, temperature, top_p,
+            top_k, repetition_penalty, min_p)
         token = int(token)
 
         output_ids.append(token)
@@ -75,10 +78,8 @@ def generate_stream(pipeline: ChatPipeline, params, stream_interval=2, kv_cache=
         if i % stream_interval == 0 or i == max_new_tokens - 1 or stopped:
             if echo:
                 tmp_output_ids = output_ids
-                rfind_start = len_prompt
             else:
                 tmp_output_ids = output_ids[input_echo_len:]
-                rfind_start = 0
 
             output = tokenizer.decode(
                 tmp_output_ids,

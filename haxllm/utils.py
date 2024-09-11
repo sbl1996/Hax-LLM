@@ -26,6 +26,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 import optax
 
 from haxllm.model.utils import report_params_and_flops
+from haxllm.model.quantize import unpack_q4
 
 
 def spec_from_dataset(dataset, input_keys):
@@ -237,8 +238,10 @@ def load_transformer_params(params, path: str, device, lm_head=False, verbose=Fa
         else:
             full_key = prefix + key
         p = params[full_key]
-        # fprint(f"Loading param {key}")
         x = new_transformer_params[key]
+        # TODO: refactor with qconfig
+        if x.dtype == jnp.int32 and "kernel" in key:
+            x = unpack_q4(x, dtype=jnp.int8)
         if isinstance(p, nn.Partitioned):
             dtype = p.value.dtype
         else:

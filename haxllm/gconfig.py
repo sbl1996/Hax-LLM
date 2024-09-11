@@ -37,6 +37,8 @@ def set_gconfig(key_or_dict, value=None):
     else:
         set(key_or_dict, value)
 
+def set_seed(seed):
+    set_gconfig({"seed": seed})
 
 def get_gconfig(key):
     return _GCONFIG[key]

@@ -17,8 +17,9 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax import linen as nn
 
 from haxllm.utils import load_transformer_params
-from haxllm.model.decode import random_sample, beam_search, fix_cache_index, batch_random_sample
+from haxllm.model.decode import random_sample, beam_search, fix_cache_index, batch_random_sample, add_batch_dim
 from haxllm.gconfig import get_seed
+
 
 def find_pad_context_length(seq_len, multiple=64):
     # Find the smallest multiple of `multiple` that is larger than seq_len
@@ -37,7 +38,7 @@ class TextGenerationPipeline:
 
     def __init__(self, tokenizer: Tokenizer, model, max_len=512, seed=None, rng=None,
                  two_stage=True, pad_multiple=512, temperature=1.0, top_k=-1,
-                 top_p=1.0, repetition_penalty=1.0,
+                 top_p=1.0, repetition_penalty=1.0, min_p=0.0,
                  max_new_tokens=None, stop_token_ids=None, verbose=True):
         r"""
         Initialize the TextGenerationPipeline with given tokenizer, model, and other optional parameters.
@@ -89,6 +90,7 @@ class TextGenerationPipeline:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.min_p = min_p
         self.repetition_penalty = repetition_penalty
         self.max_new_tokens = max_new_tokens
         self.stop_token_ids = stop_token_ids
@@ -102,6 +104,9 @@ class TextGenerationPipeline:
         self.params = None
         self.cache = None
         self._apply_fn = None
+
+        # inspection
+        self._apply_fn_i = None
 
     def print(self, *args, **kwargs):
         if self.verbose:
@@ -212,6 +217,22 @@ class TextGenerationPipeline:
         self.params = params
         self.cache = cache
     
+    def init_inspection(self):
+        if self._apply_fn_i is not None:
+            return
+        def apply_fn(params, cache, input_ids, model):
+            logits, new_vars = model.apply(
+                {"params": params, "cache": cache},
+                input_ids=input_ids,
+                train=False,
+                mutable=["cache", "intermediates"],
+            )
+            return new_vars['cache'], logits, new_vars['intermediates']
+
+        p_apply_fn = jax.jit(partial(apply_fn, model=self.model))
+
+        self._apply_fn_i = p_apply_fn
+
     def set_params(self, params):
         self.params = params
     
@@ -247,14 +268,15 @@ class TextGenerationPipeline:
                                   stop_token_ids=stop_token_ids, padding_left=padding_left)
 
     def random_sample(
-            self, inputs, temperature=None, top_k=None, top_p=None, repetition_penalty=None,
-            max_len=None, rng=None, max_source_length=None, stop_token_ids=None,
-            padding_left=None, max_new_tokens=None):
+            self, inputs, temperature=None, top_k=None, top_p=None, min_p=None,
+            repetition_penalty=None, max_len=None, rng=None, max_source_length=None,
+            stop_token_ids=None, padding_left=None, max_new_tokens=None):
         temperature = self.temperature if temperature is None else temperature
         stop_token_ids = self.stop_token_ids if stop_token_ids is None else stop_token_ids
 
         top_k = self.top_k if top_k is None else top_k
         top_p = self.top_p if top_p is None else top_p
+        min_p = self.min_p if min_p is None else min_p
         repetition_penalty = self.repetition_penalty if repetition_penalty is None else repetition_penalty
         max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
 
@@ -279,8 +301,9 @@ class TextGenerationPipeline:
             inputs, kwargs = self.prepare_call_args(inputs)
             return random_sample(
                 inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
-                temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
-                rng=rng, max_len=max_len, max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, **kwargs)
+                temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                repetition_penalty=repetition_penalty, rng=rng, max_len=max_len,
+                max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, **kwargs)
         elif isinstance(inputs, list) or (isinstance(inputs, np.ndarray) and inputs.ndim == 2):
             if not is_greedy and rng is None:
                 self._rng, rng = random.split(self._rng)
@@ -303,8 +326,8 @@ class TextGenerationPipeline:
             max_len = max_len or self.max_len
             outputs = batch_random_sample(
                 input_ids, self._apply_fn, self.params, self.cache,
-                max_len=max_len, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
-                pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id,
+                max_len=max_len, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                rng=rng, pad_token_id=pad_token_id, eos_token_id=self.tokenizer.eos_token_id,
                 max_new_tokens=max_new_tokens, stop_token_ids=stop_token_ids, padding_left=padding_left)
             if decode:
                 outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -317,6 +340,15 @@ class TextGenerationPipeline:
         return beam_search(
             inputs, self.tokenizer, self._apply_fn, self.params, self.cache,
             n_beams=beam_size, **kwargs)
+
+    def forward(self, input_ids, inspect=False):
+        if inspect:
+            assert self._apply_fn_i is not None, "call `init_inspection` before calling `forward` with inspect=True"
+        apply_fn = self._apply_fn if not inspect else self._apply_fn_i
+        batch_size, max_source_length = input_ids.shape
+        cache = jax.tree_map(lambda x: add_batch_dim(x, batch_size), self.cache)
+        input_ids = jnp.asarray(input_ids)
+        return apply_fn(self.params, cache, input_ids)
 
 
 class ChatPipeline(TextGenerationPipeline):

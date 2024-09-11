@@ -11,9 +11,6 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen import initializers
 from flax.linen.attention import Dtype, Array, PRNGKey, Shape
 
-from haxllm.model.efficient_attention import (
-    dot_product_attention as dot_product_attention_m,
-)
 from haxllm.gconfig import get_remat_policy
 from haxllm.model.mixin import RematScanConfigMixin
 from haxllm.model.quantize import QConfig, QuantMethod
@@ -93,33 +90,20 @@ class DenseGeneral(nn.Module):
 
         if qconfig is None:
             kernel = self.param("kernel", kernel_init_wrap, kernel_shape, self.param_dtype)
-        elif qconfig.method in [QuantMethod.rtn_q8_0, QuantMethod.repack_q4]:
+        elif qconfig.method in [QuantMethod.rtn_q8_0, QuantMethod.native_q4]:
             shape1 = int(math.prod(kernel_shape[0:n_axis]))
             shape2 = int(math.prod(kernel_shape[-n_features:]))
-            if qconfig.w_bits == qconfig.q_bits:
-                div1 = div2 = 1
-            elif qconfig.pack == 1:
-                div1, div2 = 1, 8
-            elif qconfig.pack == 2:
-                div1, div2 = 2, 4
-            elif qconfig.pack == 3:
-                div1, div2 = 8, 1
-            if qconfig.pack == 3 and len(kernel_shape) == 3 and kernel_shape[0] < kernel_shape[1]:
-                # TODO: HACK, out_proj (n_heads, head_dim, hidden_size)
-                qweight_shape = (kernel_shape[0], kernel_shape[1] // div1, kernel_shape[2] // div2)
-            else:
-                qweight_shape = (kernel_shape[0] // div1, *kernel_shape[1:-1], kernel_shape[-1] // div2)
             qweight = self.param(
-                "kernel", zero_init, qweight_shape, qconfig.w_dtype)
-            qweight = qweight.reshape(shape1 // div1, shape2 // div2)
+                "kernel", zero_init, kernel_shape, qconfig.w_dtype)
+            qweight = qweight.reshape(shape1, shape2)
             scales_shape = shape1 // qconfig.group_size, shape2
             scales = self.param(
-                "scales", zero_init, scales_shape, qconfig.q_dtype or self.param_dtype)
+                "scales", zero_init, scales_shape, self.param_dtype)
             q_params = {"qweight": qweight, "scales": scales}
             if not qconfig.sym:
                 zeros_shape = shape1 // qconfig.group_size, shape2
                 zeros = self.param(
-                    "zeros", zero_init, zeros_shape, jnp.int8)
+                    "zeros", zero_init, zeros_shape, self.param_dtype)
                 q_params["zeros"] = zeros
             if qconfig.use_g_idx:
                 g_idx = self.param(

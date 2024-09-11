@@ -295,6 +295,14 @@ config_hub = {
         n_kv_heads=4,
         vocab_size=152064,
     ),
+    "qwen2-72b": Qwen2Config(
+        hidden_size=8192,
+        intermediate_size=29696,
+        n_heads=64,
+        n_layers=80,
+        n_kv_heads=8,
+        vocab_size=152064,
+    ),
     "llama-t": LlamaConfig(
         hidden_size=1024,
         intermediate_size=2816,
@@ -490,10 +498,14 @@ class TransformerBlock(nn.Module):
     def __call__(self, inputs):
         config = self.config
 
+        # resid_pre
         inputs, padding_mask = inputs
+
+        self.sow('intermediates', 'resid_pre', inputs)
 
         x = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_1")(inputs)
+        # attn_out
         x = SelfAttention(
             num_heads=config.n_heads,
             num_kv_heads=config.n_kv_heads,
@@ -519,10 +531,12 @@ class TransformerBlock(nn.Module):
             qconfig=config.qconfig,
             name="attn")(x, padding_mask=padding_mask)
 
+        # mlp_in = resid_mid = attn_out + resid_pre
         x = x + inputs
 
         y = RMSNorm(epsilon=config.rms_norm_eps,
                     dtype=config.dtype, name="ln_2")(x)
+        # mlp_out
         y = GLUMlpBlock(
             intermediate_size=config.intermediate_size,
             dtype=config.dtype,
@@ -534,6 +548,7 @@ class TransformerBlock(nn.Module):
             qconfig=config.qconfig,
             name="mlp")(y)
 
+        # resid_post = resid_mid + mlp_out
         y = x + y
 
         outputs = (y, padding_mask)
@@ -550,7 +565,7 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, inputs, train):
         config = self.config
-        remat = config.remat or config.remat_scan
+        # remat = config.remat or config.remat_scan
         x, padding_mask = inputs
         x = make_block_stack(
             self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
@@ -791,13 +806,13 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
     if q_source == QuantSource.autogptq_q8:
         group_size = qweight.shape[0] * 4 // scales.shape[0]
     else:
-        assert qconfig.q_bits == 4
-        bits_reduce = qconfig.w_bits // qconfig.q_bits
+        assert qconfig.w_bits == 4
+        bits_reduce = qconfig.f_bits // qconfig.w_bits
         if q_source == QuantSource.autoawq_q4:
             group_size = qweight.shape[0] // scales.shape[0]
         else:
             group_size = qweight.shape[0] * bits_reduce // scales.shape[0]
-    assert qconfig.group_size == group_size
+    assert qconfig.group_size == group_size, f"group size mismatch: {qconfig.group_size} vs {group_size}"
     hidden_size_g = hidden_size // group_size
     n_kv_heads = root['h_0']['attn']['key']['scales'].shape[1] // head_dim
 
@@ -824,12 +839,8 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
             qweight, qzeros = qconfig.requantize(qweight, qzeros)
             if q_source == QuantSource.autogptq_q8:
                 div1, div2 = 1, 1
-            elif qconfig.pack == 1:
-                div1, div2 = 1, 8
-            elif qconfig.pack == 2:
+            elif q_source in [QuantSource.autoawq_q4, QuantSource.autogptq_q4]:
                 div1, div2 = 2, 4
-            elif qconfig.pack == 3:
-                div1, div2 = 8, 1
             if part2 == 'query':
                 qweight = qweight.reshape(hidden_size // div1, n_heads, head_dim // div2)
                 scales = scales.reshape(hidden_size_g, n_heads*head_dim)
@@ -841,11 +852,7 @@ def convert_llama_q_params(root, qconfig: QConfig, head_dim=128):
                 if not qconfig.sym:
                     qzeros = qzeros.reshape(hidden_size_g, n_kv_heads*head_dim)
             elif part2 == 'out':
-                # HACK
-                if qconfig.pack == 3:
-                    qweight = qweight.reshape(n_heads, head_dim // div1, hidden_size // div2)
-                else:
-                    qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
+                qweight = qweight.reshape(n_heads // div1, head_dim, hidden_size // div2)
                 scales = scales.reshape(hidden_size_g, hidden_size)
                 if not qconfig.sym:
                     qzeros = qzeros.reshape(hidden_size_g, hidden_size)
@@ -1230,7 +1237,7 @@ class MistralChatSetting:
         for i, (role, content) in enumerate(messages):
             if role == self.roles[0]:
                 if i % 2 != 0:
-                    raise ValueError(f"After the optional system message, conversation roles must alternate user/assistant/user/assistant/...")
+                    raise ValueError("After the optional system message, conversation roles must alternate user/assistant/user/assistant/...")
                 if system and i in [n - 1, n - 2]:
                     ret += f"{B_INST}{space}{system}\n\n{content}{E_INST}"
                 else:
@@ -1359,7 +1366,9 @@ def qwen_encode_message(self, messages):
     system = system.strip()
 
     sep = "\n"
-    ret = f"{im_start}system{sep}{system}{im_end}"
+    ret = ""
+    if system:
+        ret += f"{im_start}system{sep}{system}{im_end}"
 
     for i, (role, message) in enumerate(messages):
         if i % 2 == 0:

@@ -19,7 +19,7 @@ class QuantSource(enum.Enum):
 
 class QuantMethod(enum.Enum):
     rtn_q8_0 = 0
-    repack_q4 = 1
+    native_q4 = 1
 
 
 dtype_to_bits = {
@@ -28,6 +28,7 @@ dtype_to_bits = {
     jnp.bfloat16: 16,
     jnp.int8: 8,
     jnp.int32: 32,
+    jnp.uint4: 4,
 }
 
 @dataclass
@@ -36,17 +37,16 @@ class QConfig:
     method: QuantMethod = QuantMethod.rtn_q8_0
     group_size: int = 128
     sym: bool = False
-    q_dtype: Optional[jnp.dtype] = None
     q_layers: Sequence[str] = ("attn.out", "mlp.gate", "mlp.up", "mlp.down")
-    pack: int = 2
     use_g_idx: bool = False
+    p_dtype: Optional[jnp.dtype] = None
 
     def __post_init__(self):
         for l in self.q_layers:
             assert l in ("attn.query", "attn.key", "attn.value", "attn.out", "mlp.gate", "mlp.up", "mlp.down"), f"Invalid layer: {l}"        
 
         if self.source in [QuantSource.autoawq_q4, QuantSource.autogptq_q4]:
-            assert self.method == QuantMethod.repack_q4
+            assert self.method in [QuantMethod.native_q4]
         if self.source in [QuantSource.autogptq_q8]:
             assert self.method == QuantMethod.rtn_q8_0
 
@@ -54,29 +54,37 @@ class QConfig:
             assert self.sym
         elif self.source in [QuantSource.autoawq_q4]:
             assert not self.sym
-        
+
         if self.use_g_idx:
             assert self.source == QuantSource.autogptq_q4
 
     @property
-    def q_bits(self):
+    def f_bits(self):
+        return dtype_to_bits[self.f_dtype]
+
+    @property
+    def f_dtype(self):
+        # dtype in the dumped safetensors file
         if self.method == QuantMethod.rtn_q8_0:
-            return 8
-        elif self.method == QuantMethod.repack_q4:
-            return 4
+            return jnp.int8
+        elif self.method == QuantMethod.native_q4:
+            return jnp.int32
         else:
             raise NotImplementedError
-
+    
     @property
     def w_bits(self):
         return dtype_to_bits[self.w_dtype]
 
     @property
     def w_dtype(self):
+        # dtype of quantized model weight
+        if self.p_dtype is not None:
+            return self.p_dtype
         if self.method == QuantMethod.rtn_q8_0:
             return jnp.int8
-        elif self.method == QuantMethod.repack_q4:
-            return jnp.int32
+        elif self.method == QuantMethod.native_q4:
+            return jnp.uint4
         else:
             raise NotImplementedError
     
@@ -84,7 +92,7 @@ class QConfig:
         if self.method == QuantMethod.rtn_q8_0:
             assert self.source == QuantSource.half
             w, = args
-            w, scale = group_abs_max_int8_quantize(w, group_size=self.group_size, q_dtype=self.q_dtype)
+            w, scale = group_abs_max_int8_quantize(w, group_size=self.group_size)
             return w, scale
         else:
             raise NotImplementedError
@@ -92,36 +100,24 @@ class QConfig:
     def dequantize(self, q):
         if self.method == QuantMethod.rtn_q8_0:
             return group_dequantize(q["qweight"], None, q["scales"])
-        elif self.method == QuantMethod.repack_q4:
-            qweight = self._unpack(q["qweight"])
+        elif self.method == QuantMethod.native_q4:
+            scales = q["scales"]
+            qweight = q["qweight"].astype(scales.dtype)
             if self.source == QuantSource.autoawq_q4:
                 qzeros = q["zeros"][:, None]
+                g_idx = None
             elif self.source == QuantSource.autogptq_q4:
                 qzeros = 8
                 g_idx = q.get("g_idx", None)
-            return group_dequantize(qweight, qzeros, q["scales"], g_idx)
+            return group_dequantize(qweight, qzeros, scales, g_idx)
         else:
             raise NotImplementedError
 
     def _pack(self, w):
-        if self.pack == 1:
-            return pack1(w)
-        elif self.pack == 2:
-            return pack2(w)
-        elif self.pack == 3:
-            return pack_int(w)
-        else:
-            raise NotImplementedError
+        return pack_q4(w)
     
     def _unpack(self, w):
-        if self.pack == 1:
-            return unpack1(w)
-        elif self.pack == 2:
-            return unpack2(w)
-        elif self.pack == 3:
-            return int_unpack(w, 4, "gptq")
-        else:
-            raise NotImplementedError
+        return unpack_q4(w)
 
     def requantize(self, *args):
         if self.source == QuantSource.autoawq_q4:
@@ -149,7 +145,8 @@ class QConfig:
                f"method={self.method}, " \
                f"source={self.source}, " \
                f"group_size={self.group_size}, " \
-               f"sym={self.sym}, q_dtype={self.q_dtype}, pack={self.pack}, "\
+               f"sym={self.sym}, "\
+               f"p_dtype={self.p_dtype}, " \
                f"use_g_idx={self.use_g_idx}, " \
                f"q_layers={self.q_layers})"
 
@@ -160,9 +157,8 @@ class QConfig:
                 "method": self.method.name,
                 "sym": self.sym,
                 "group_size": self.group_size,
-                "q_dtype": self.q_dtype.dtype.name if self.q_dtype is not None else None,
+                "p_dtype": self.p_dtype.dtype.name if self.p_dtype is not None else None,
                 "q_layers": self.q_layers,
-                "pack": self.pack,
                 "use_g_idx": self.use_g_idx,
             }, indent=2,
         )
@@ -170,17 +166,16 @@ class QConfig:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
+        p_dtype = data.get("p_dtype", None)
         kwargs = dict(
             source=QuantSource[data["source"]],
             method=QuantMethod[data["method"]],
             sym=data["sym"],
-            q_dtype=jnp.dtype(data["q_dtype"]) if data["q_dtype"] is not None else None,
+            p_dtype=jnp.dtype(p_dtype) if p_dtype is not None else None,
             q_layers=tuple(data["q_layers"]),
         )
         if "group_size" in data:
             kwargs["group_size"] = data["group_size"]
-        if "pack" in data:
-            kwargs["pack"] = data["pack"]
         if "use_g_idx" in data:
             kwargs["use_g_idx"] = data["use_g_idx"]
         return cls(**kwargs)
@@ -212,7 +207,7 @@ def abs_max_int8_quantize(x, axis=-1):
     return qs, d.squeeze(axis)
 
 
-def group_abs_max_int8_quantize(x, group_size, q_dtype):
+def group_abs_max_int8_quantize(x, group_size, q_dtype=None):
     if q_dtype is None:
         q_dtype = x.dtype
     x = x.reshape(-1, group_size, *x.shape[1:])
@@ -262,52 +257,22 @@ def int_unpack(x, bits=4, variant='awq'):
     return x
 
 
-@partial(jax.jit, static_argnums=(1,))
-def pack_int(x, bits=4):
-    assert bits == 4
-    shifts = jnp.arange(0, 32, bits, dtype=jnp.int32)
-    shifts = shifts[None, :]
-    for i in range(x.ndim - 1):
-        shifts = jnp.expand_dims(shifts, axis=-1)
-    x = x.reshape(-1, shifts.shape[1], *x.shape[1:])
-    x = x.astype(jnp.int32)
-    x = jnp.bitwise_left_shift(x, shifts)
-    x0 = x[:, 0]
-    for i in range(1, x.shape[1]):
-        x0 = jnp.bitwise_or(x0, x[:, i])
-    return x0
-
-
-@partial(jax.jit, static_argnums=(1,))
-def pack2(x, bits=4):
-    assert bits == 4
+@jax.jit
+def pack_q4(x):
     n = x.shape[0]
     return (x[:n//2] * 16 + x[n//2:]).view(jnp.int32)
 
 
-def unpack2(x, bits=4):
-    assert bits == 4
+@partial(jax.jit, static_argnums=(1,))
+def unpack_q4(x, dtype=jnp.uint4):
+    assert x.dtype == jnp.int32
+    x = jnp.asarray(x)
     x = x.view(jnp.uint8)
     x1 = x >> 4
     x2 = x & 0xf
     x = jnp.concatenate([x1, x2], axis=0)
     x = x.view(jnp.int8)
-    return x
-
-
-@partial(jax.jit, static_argnums=(1,))
-def pack1(x, bits=4):
-    assert bits == 4
-    return (x[..., ::2] * 16 + x[..., 1::2]).view(jnp.int32)
-
-
-def unpack1(x, bits=4):
-    assert bits == 4
-    x = x.view(jnp.uint8)
-    x1, x2 = jnp.divmod(x, 16)
-    x = jnp.stack([x1, x2], axis=-1)
-    x = x.reshape(*x.shape[:-2], -1)
-    x = x.view(jnp.int8)
+    x = x.astype(dtype)
     return x
 
 

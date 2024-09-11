@@ -253,11 +253,13 @@ class TrainerBase:
             abs_params = jax.eval_shape(self.model.init, rng, input_ids=input_ids)['params']
             self.tx = freeze_params_optimizer(tx, abs_params, tx.trainable_pattern)
 
-    def set_pipeline(self, tokenizer, max_len, temperature: float = 1.0, top_k: int = -1, top_p: float = 1, **kwargs):
+    def set_pipeline(
+            self, tokenizer, max_len, temperature: float = 1.0, top_k: int = -1,
+            top_p: float = 1.0, min_p: float = 0.0, **kwargs):
         model = self.model
         model = model.clone(config=model.config.replace(decode=True, shard_cache=True))
         pipeline = TextGenerationPipeline(
-            tokenizer, model, max_len, rng=self._rng, temperature=temperature, top_k=top_k, top_p=top_p, **kwargs)
+            tokenizer, model, max_len, rng=self._rng, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, **kwargs)
         pipeline.init_without_params(getattr(self, "mesh", None))
         self.pipeline = pipeline
 

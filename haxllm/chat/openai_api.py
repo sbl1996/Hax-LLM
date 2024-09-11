@@ -64,7 +64,6 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     top_p: Optional[float] = None
-    # top_k: Optional[int] = None
     max_tokens: Optional[int] = None
 
 
@@ -116,24 +115,41 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     prev_messages = request.messages[:-1]
     if len(prev_messages) > 0 and prev_messages[0].role == "system":
-        system_message = prev_messages.pop(0).content
+        system_message = prev_messages.pop(0).content.strip()
     else:
         system_message = None
 
     conv = get_conv_template(conv_template)
-    if system_message:
+    if system_message is not None:
+        # if it's "", system prompt is disabled
         conv.config.system = system_message
 
+    # Magic to attack
+    magic_cmd = "[@]"
+    if magic_cmd in query:
+        index = query.index(magic_cmd)
+        adv_prompt = query[index+len(magic_cmd):].strip()
+        query = query[:index].strip()
+    else:
+        adv_prompt = ""
+    
     for msg in prev_messages:
         if msg.role == "user":
-            conv.append_message(conv.config.roles[0], msg.content)
+            content = msg.content
+            index = content.find(magic_cmd)
+            if index != -1:
+                content = content[:index].strip()
+            conv.append_message(conv.config.roles[0], content)
         elif msg.role == "assistant":
             conv.append_message(conv.config.roles[1], msg.content)
         elif msg.role == "system":
             raise HTTPException(status_code=400, detail="Invalid request")
+    
     conv.append_message(conv.config.roles[0], query)
     conv.append_message(conv.config.roles[1], None)
-    prompt = conv.get_prompt()
+    prompt = conv.get_prompt() + adv_prompt
+    print("adv prompt:", adv_prompt)
+    print(prompt)
 
     repetition_penalty = model.repetition_penalty
     if request.frequency_penalty is not None:
@@ -145,10 +161,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
         "repetition_penalty": repetition_penalty,
         "max_len": request.max_tokens or model.max_len,
         "max_new_tokens": model.max_new_tokens,
+        "min_p": model.min_p,
     }
 
     if request.stream:
-        generator = chat_completion_stream_generator(prompt, gen_params, request.model)
+        generator = chat_completion_stream_generator(prompt, gen_params, request.model, adv_prompt)
         return StreamingResponse(generator, media_type="text/event-stream")
 
     input_ids = tokenizer(prompt, return_tensors="np")["input_ids"][0]
@@ -172,7 +189,7 @@ def wrap_sse(chunk):
     return f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
 
-async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
+async def chat_completion_stream_generator(prompt, gen_params, model_id: str, prefill: str):
     id = f"chatcmpl-{shortuuid.random()}"
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
@@ -195,7 +212,7 @@ async def chat_completion_stream_generator(prompt, gen_params, model_id: str):
         end = time.time()
         times.append(end - start)
         start = end
-        output_text = outputs["text"]
+        output_text = prefill + outputs["text"]
         usage = outputs["usage"]
         # More fluent, but more requests, and more likely to be cut off
         # seps = r'([！，。？；：、 ?,.:“”‘’【】《》（）\n])'
@@ -255,14 +272,17 @@ def compile():
     gen_params = {
         "temperature": model.temperature,
         "top_p": model.top_p,
+        "min_p": model.min_p,
         "repetition_penalty": model.repetition_penalty,
         "max_len": model.max_len,
-        "max_new_tokens": model.max_new_tokens,
+        "max_new_tokens": 3,
         "prompt": "hello"
     }
     output = generate_stream(model, gen_params)
+    s = ""
     for x in output:
-        pass
+        s += x["text"]
+    print(f"Prompt: {gen_params['prompt']}, output: {repr(s)}")
     print(f"Compilation finished in {time.time() - start:.2f}s")
 
 
@@ -284,6 +304,7 @@ def chat_api_server(cfg: DictConfig) -> None:
     print("Default conversation setting:")
     print(f"  temperature: {pipeline.temperature}")
     print(f"  top_p: {pipeline.top_p}")
+    print(f"  min_p: {pipeline.min_p}")
     print(f"  top_k: {pipeline.top_k}")
     print(f"  repetition_penalty: {pipeline.repetition_penalty}")
     print(f"  max_len: {pipeline.max_len}")
