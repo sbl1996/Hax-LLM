@@ -1,10 +1,13 @@
 from typing import Optional, Callable
+from functools import partial
 import math
 import numpy as np
 
 import jax
 from jax import lax
 import jax.numpy as jnp
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P, Mesh
 
 import flax.linen as nn
 from flax.linen.attention import (
@@ -553,6 +556,7 @@ def tpu_flash_attention(
     attn_logits_soft_cap: float | None = None,
     is_causal: bool = True, sliding_window_size: int | None = None,
     dtype: Optional[Dtype] = None,
+    mesh: Optional[Mesh] = None,
 ):
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -611,6 +615,13 @@ def tpu_flash_attention(
 
         return jax.vmap(splash_kernel)(query, key, value, segment_ids=decoder_segment_ids)
 
+    if mesh is not None:
+        axis_names = P(None, "Y", None, None)
+        wrap_flash_attention = shard_map(
+            wrap_flash_attention, mesh=mesh,
+            in_specs=(axis_names, axis_names, axis_names, None),
+            out_specs=axis_names, check_rep=False,
+        )
     x = wrap_flash_attention(query, key, value, None)
     x = jnp.transpose(x, axes=(0, 2, 1, 3))
     return x.astype(dtype)

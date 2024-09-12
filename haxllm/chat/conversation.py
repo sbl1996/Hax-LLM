@@ -50,3 +50,29 @@ def get_conv_template(name):
         config=get_chat_setting(name),
         messages=[],
     )
+
+
+def apply_template(messages, conv_template):
+    conv = get_conv_template(conv_template)
+    query = messages[-1]['content']
+    prev_messages = messages[:-1]
+
+    if len(prev_messages) > 0 and prev_messages[0]['role'] == "system":
+        system_message = prev_messages.pop(0)['content']
+    else:
+        system_message = None
+
+    if system_message:
+        conv.config.system = system_message
+
+    for msg in prev_messages:
+        if msg['role'] == "user":
+            conv.append_message(conv.config.roles[0], msg.content)
+        elif msg['role'] == "assistant":
+            conv.append_message(conv.config.roles[1], msg.content)
+        elif msg['role'] == "system":
+            raise ValueError("system message must be the first message")
+    conv.append_message(conv.config.roles[0], query)
+    conv.append_message(conv.config.roles[1], None)
+    prompt = conv.get_prompt()
+    return prompt

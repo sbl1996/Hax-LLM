@@ -2,7 +2,6 @@ from typing import Mapping, Optional, Tuple, Callable, Sequence, Union, Literal
 import functools
 import dataclasses
 
-import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
@@ -17,7 +16,7 @@ from flax.linen.attention import (
 )
 
 from haxllm.model.modules import DenseGeneral
-from haxllm.gconfig import get as get_gconfig, get_attention_impl
+from haxllm.gconfig import get_gconfig, get_attention_impl
 from haxllm.model.attention import decode_for_padding, tpu_flash_attention, make_apply_rope, init_decode_cache, dot_product_attention
 from haxllm.model.quantize import QConfig
 from haxllm.model.mixin import RoPEScalingConfig
@@ -101,6 +100,7 @@ remat = nn_partitioning.remat
 
 
 class ShardModule(nn.Module):
+
     def with_sharding_constraint(self, x, axes):
         try:
             shard = getattr(self, "shard", None)
@@ -312,8 +312,7 @@ class SelfAttention(ShardModule):
         else:
             deterministic = True
 
-        if get_attention_impl() == 'flash':
-            assert not self.decode, "flash attention is not supported for decode mode."
+        if not self.decode and get_attention_impl() == 'flash':
             assert deterministic, "dropout not supported for flash attention."
             x = tpu_flash_attention(
                 query,
@@ -324,6 +323,7 @@ class SelfAttention(ShardModule):
                 scale=self.scale,
                 attn_logits_soft_cap=self.attn_logits_soft_cap,
                 dtype=self.dtype,
+                mesh=get_gconfig("mesh"),
             )
         else:
             x = dot_product_attention(

@@ -9,6 +9,7 @@ from haxllm.model.llama import (
     convert_llama_q_params,
 )
 from haxllm.model.gemma import remap_gemma_state_dict
+from haxllm.model.utils import get_module
 
 REMAP_FN = {
     "llama": remap_llama_state_dict,

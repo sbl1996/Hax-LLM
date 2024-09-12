@@ -102,7 +102,7 @@ def convert_scan_params(params, src_keys, tgt_keys, lengths):
         level_trees = []
         for i in range(lengths[0]):
             level_trees.append(params.pop(src_keys[i]))
-        params[tgt_keys] = jax.tree_map(
+        params[tgt_keys] = jax.tree.map(
             lambda *xs: np.stack(xs, axis=0), *level_trees)
     elif len(lengths) == 2:
         level_trees = []
@@ -110,9 +110,9 @@ def convert_scan_params(params, src_keys, tgt_keys, lengths):
             loop_trees = []
             for j in range(lengths[1]):
                 loop_trees.append(params.pop(src_keys[i * lengths[1] + j]))
-            level_trees.append(jax.tree_map(
+            level_trees.append(jax.tree.map(
                 lambda *xs: np.stack(xs, axis=0), *loop_trees))
-        params[tgt_keys] = jax.tree_map(
+        params[tgt_keys] = jax.tree.map(
             lambda *xs: np.stack(xs, axis=0), *level_trees)
     else:
         for l in range(lengths[0]):
@@ -122,9 +122,9 @@ def convert_scan_params(params, src_keys, tgt_keys, lengths):
                 loop_trees = []
                 for j in range(lengths[2]):
                     loop_trees.append(params.pop(src_keys[ol + i * lengths[2] + j]))
-                level_trees.append(jax.tree_map(
+                level_trees.append(jax.tree.map(
                     lambda *xs: np.stack(xs, axis=0), *loop_trees))
-            params[tgt_keys[l]] = jax.tree_map(
+            params[tgt_keys[l]] = jax.tree.map(
                 lambda *xs: np.stack(xs, axis=0), *level_trees)
     return params
 

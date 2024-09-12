@@ -3,7 +3,6 @@ from omegaconf import OmegaConf
 import optax
 
 from haxllm.optim import warmup_linear_decay_schedule
-from haxllm.config_utils import get_module
 from haxllm.chat.setting import get_chat_setting
 
 
@@ -61,14 +60,8 @@ def load_optimizer(cfg, steps_per_epoch):
     return optimizer
 
 
-def load_tokenizer(cfg):
+def load_tokenizer(cfg, pad_token_id=None):
     from transformers import AutoTokenizer
-    family = cfg.family
-    peft = None
-    if hasattr(cfg, "peft"):
-        peft = cfg.peft.method
-    mod = get_module(family, peft)
-    model_pad_token_id = getattr(getattr(mod, "TransformerConfig"), "pad_token_id", None)
 
     tokenizer_config = cfg.tokenizer
     tokenizer_name = tokenizer_config.name
@@ -79,10 +72,9 @@ def load_tokenizer(cfg):
     tokenizer.truncation_side = getattr(tokenizer_config, "truncation_side", "right")
     tokenizer.decode(tokenizer("init")['input_ids'])
 
-    if model_pad_token_id is not None and tokenizer.pad_token_id != model_pad_token_id:
-        print(f"Changing tokenizer pad token id from {tokenizer.pad_token_id} to {model_pad_token_id}")
-        tokenizer.pad_token_id = model_pad_token_id
-
+    if pad_token_id is not None and tokenizer.pad_token_id != pad_token_id:
+        print(f"Changing tokenizer pad token id from {tokenizer.pad_token_id} to {pad_token_id}")
+        tokenizer.pad_token_id = pad_token_id
     return tokenizer
 
 
@@ -116,11 +108,13 @@ def load_chat(cfg, eos_token_id):
 
 
 def load_peft(cfg):
-    if hasattr(cfg, "peft"):
-        peft_config: dict = OmegaConf.to_container(cfg.peft, resolve=True)
-        name = peft_config.pop("method")
-        kwargs = {**peft_config}
+    cfg = getattr(cfg, "peft", None)
+    if cfg is None:
+        return {}
+    cfg: dict = OmegaConf.to_container(cfg, resolve=True)
+    name = cfg.pop("method")
+    if name == "lora":
+        from haxllm.model.lora import LoraConfig
+        return {"lora_config": LoraConfig(**cfg)}
     else:
-        name = None
-        kwargs = {}
-    return name, kwargs
+        raise ValueError(f"Unknown peft method {name}")

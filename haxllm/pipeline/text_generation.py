@@ -34,6 +34,14 @@ def init_mesh(mesh):
     return mesh
 
 
+def init_fn(init_rng, input_ids, model, cache_only):
+    state = model.init(init_rng, input_ids=input_ids)
+    state = freeze(state)
+    if cache_only:
+        return state['cache']
+    return state['params'], state['cache']
+
+
 class TextGenerationPipeline:
 
     def __init__(self, tokenizer: Tokenizer, model, max_len=512, seed=None, rng=None,
@@ -113,61 +121,11 @@ class TextGenerationPipeline:
             print(*args, **kwargs)
 
     def init_without_params(self, mesh=None):
+        return self.init(mesh=mesh, no_params=True)
+
+    def init(self, transformer_weight=None, mesh=None, no_params=False):
         self._rng, init_rng = random.split(self._rng)
         input_ids = jnp.zeros((1, self.max_len), dtype=jnp.int32)
-
-        def init_fn(init_rng, input_ids, model):
-            state = model.init(init_rng, input_ids=input_ids)
-            state = freeze(state)
-            return state['cache']
-
-        mesh = init_mesh(mesh)
-        parallel = mesh is not None
-        if parallel:
-            self.print("Init model on {}".format(mesh))
-
-            abs_cache = jax.eval_shape(
-                partial(init_fn, model=self.model), init_rng, input_ids)
-            cache_spec = nn.get_partition_spec(abs_cache)
-
-            p_init_fn = jax.jit(
-                partial(init_fn, model=self.model), out_shardings=cache_spec)
-            with mesh:
-                cache = p_init_fn(init_rng, input_ids)
-        else:
-            self.print("Init model on CPU")
-            p_init_fn = jax.jit(partial(init_fn, model=self.model))
-
-            with jax.default_device(jax.devices("cpu")[0]):
-                cache = p_init_fn(init_rng, input_ids)
-
-        if not parallel:
-            cache = jax.device_put(cache, jax.devices()[0])
-
-        def apply_fn(params, cache, input_ids, model):
-            logits, new_vars = model.apply(
-                {"params": params, "cache": cache},
-                input_ids=input_ids,
-                train=False,
-                mutable=["cache"],
-            )
-            return new_vars['cache'], logits
-
-        p_apply_fn = jax.jit(partial(apply_fn, model=self.model))
-
-        self._apply_fn = p_apply_fn
-        self.cache = cache
-    
-    def init(self, transformer_weight=None, mesh=None):
-        self._rng, init_rng = random.split(self._rng)
-        input_ids = jnp.zeros((1, self.max_len), dtype=jnp.int32)
-
-        def init_fn(init_rng, input_ids, model, cache_only):
-            state = model.init(init_rng, input_ids=input_ids)
-            state = freeze(state)
-            if cache_only:
-                return state['cache']
-            return state['params'], state['cache']
 
         mesh = init_mesh(mesh)
         parallel = mesh is not None
@@ -199,7 +157,8 @@ class TextGenerationPipeline:
             params = freeze(unflatten_dict(params, sep="."))
 
         if not parallel:
-            params = jax.device_put(params, jax.devices()[0])
+            if not no_params:
+                params = jax.device_put(params, jax.devices()[0])
             cache = jax.device_put(cache, jax.devices()[0])
 
         def apply_fn(params, cache, input_ids, model):
@@ -214,8 +173,9 @@ class TextGenerationPipeline:
         p_apply_fn = jax.jit(partial(apply_fn, model=self.model))
 
         self._apply_fn = p_apply_fn
-        self.params = params
         self.cache = cache
+        if not no_params:
+            self.params = params
     
     def init_inspection(self):
         if self._apply_fn_i is not None:
@@ -346,7 +306,7 @@ class TextGenerationPipeline:
             assert self._apply_fn_i is not None, "call `init_inspection` before calling `forward` with inspect=True"
         apply_fn = self._apply_fn if not inspect else self._apply_fn_i
         batch_size, max_source_length = input_ids.shape
-        cache = jax.tree_map(lambda x: add_batch_dim(x, batch_size), self.cache)
+        cache = jax.tree.map(lambda x: add_batch_dim(x, batch_size), self.cache)
         input_ids = jnp.asarray(input_ids)
         return apply_fn(self.params, cache, input_ids)
 
@@ -375,7 +335,7 @@ class ChatPipeline(TextGenerationPipeline):
         self.conv_template = None
     
     def reset_chat_state(self):
-        self._ccache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), self.cache)
+        self._ccache = jax.tree.map(lambda x: jnp.tile(x, [1] * x.ndim), self.cache)
     
     def get_cache_index(self):
         cache = self._ccache['transformer']

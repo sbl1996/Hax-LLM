@@ -5,7 +5,7 @@ import numpy as np
 from haxllm.chat.setting import ChatSetting
 
 
-def find_prompt_prefix_suffix(examples, tokenizer, chat_setting):
+def find_prompt_prefix_suffix(examples, tokenizer, chat_setting: ChatSetting):
     examples = [chat_setting.build_prompt(e) for e in examples]
     input_ids = [tokenizer.encode(e, add_special_tokens=True) for e in examples]
     l = 0
@@ -73,13 +73,15 @@ def preprocess_for_lm(
         labels = np.full((n, max_len), ignore_index, dtype=np.int32)
 
         for i in range(n):
-            a_ids = tokenizer.encode(text=query[i], add_special_tokens=True, truncation=True, max_length=max_source_length)
+            a_ids = tokenizer.encode(
+                text=query[i], add_special_tokens=True, truncation=True, max_length=max_source_length)
 
             # Option 1: a_ids + b_ids
-            b_ids = tokenizer.encode(text=answer[i], add_special_tokens=False, truncation=True, max_length=max_target_length)
+            b_ids = tokenizer.encode(
+                text=answer[i], add_special_tokens=False, truncation=True, max_length=max_target_length)
 
             if chat:
-                # ensure that chat prompt is not truncated
+                # ensure that chat generation prompt is not truncated
                 a_ids[-len(prompt_suffix):] = prompt_suffix
             context_length = len(a_ids)
             input_ids = a_ids + b_ids + [tokenizer.eos_token_id]
@@ -109,16 +111,15 @@ def preprocess_for_lm(
 
             l = len(input_ids)
 
-            if padding_side == "right":
-                inputs[i, :l] = input_ids
-                
-                # shift left and pad the end with ignore_index
-                labels[i, context_length-1:l-1] = input_ids[context_length:]
-            else:
-                inputs[i, -l:] = input_ids
-                
-                # shift right and pad the beginning with ignore_index
-                labels[i, -1-l+context_length:-1] = input_ids[context_length:]
+            # default to padding right for train
+            inputs[i, :l] = input_ids
+            # shift left and pad the end with ignore_index
+            labels[i, context_length-1:l-1] = input_ids[context_length:]
+
+            # padding_left
+            # inputs[i, -l:] = input_ids
+            # # shift right and pad the beginning with ignore_index
+            # labels[i, -1-l+context_length:-1] = input_ids[context_length:]
         return {"input_ids": inputs, "labels": labels}
     else:
         max_target_length = max_len - max_source_length
@@ -133,10 +134,11 @@ def preprocess_for_lm(
             encode_label = encode_labels[i]
             if chat:
                 encode_input[-len(prompt_suffix):] = prompt_suffix
-            if padding_side == "right":
-                inputs[i, :len(encode_input)] = encode_input
-                labels[i, :len(encode_label)] = encode_label
-            else:
-                inputs[i, -len(encode_input):] = encode_input
-                labels[i, -len(encode_label):] = encode_label
+            # inputs[i, :len(encode_input)] = encode_input
+
+            # default to padding left for decode
+            inputs[i, -len(encode_input):] = encode_input
+            # labels[i, -len(encode_label):] = encode_label
+
+            labels[i, :len(encode_label)] = encode_label
         return {"input_ids": inputs, "labels": labels}

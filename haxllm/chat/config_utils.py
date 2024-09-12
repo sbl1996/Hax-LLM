@@ -1,6 +1,5 @@
 from typing import Tuple
 import os
-import json
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -10,8 +9,7 @@ import jax.numpy as jnp
 from transformers import AutoTokenizer
 
 from haxllm.pipeline.text_generation import ChatPipeline, TextGenerationPipeline
-from haxllm.config_utils import get_module
-from haxllm.model.utils import load_config as _load_config, load_model_cls
+from haxllm.model.utils import load_config as _load_config, load_model_cls, get_module
 from haxllm.model.quantize import QConfig
 from haxllm.chat.conversation import get_conv_template
 
@@ -78,9 +76,8 @@ def load_config(cfg: DictConfig, chat: bool = True) -> Tuple[TextGenerationPipel
 
     parallel = mesh is not None
 
-    peft = getattr(cfg, "peft", None)
     qconfig = getattr(cfg, "qconfig", None)
-    mod = get_module(template_config.pop("family"), peft)
+    mod = get_module(template_config.pop("family"))
     max_len = getattr(cfg, "max_len", None)
 
     if qconfig:

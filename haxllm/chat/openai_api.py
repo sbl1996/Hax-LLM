@@ -124,7 +124,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         # if it's "", system prompt is disabled
         conv.config.system = system_message
 
-    # Magic to attack
+    # Magic
     magic_cmd = "[@]"
     if magic_cmd in query:
         index = query.index(magic_cmd)
@@ -173,7 +173,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     output_ids = model.random_sample(input_ids, **gen_params)
     output = tokenizer.decode(output_ids[input_echo_len:], skip_special_tokens=True)
-    response = output.strip()
+    response = adv_prompt + output.rstrip()
 
     choice_data = ChatCompletionResponseChoice(
         index=0,

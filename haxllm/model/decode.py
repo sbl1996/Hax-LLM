@@ -37,7 +37,7 @@ def gather_beams(xs, indices):
         if x.ndim <= 2:
             return x
         return x[..., indices, :, :, :]
-    return jax.tree_map(gather_fn, xs)
+    return jax.tree.map(gather_fn, xs)
 
 
 def fix_cache_index(cache, offset):
@@ -229,7 +229,7 @@ def random_sample(inputs, tokenizer, apply_fn, params, cache, max_len,
     context_length = len(tokens)
     assert context_length < max_len, "Context length must be less than max_len"
 
-    cache = jax.tree_map(lambda x: jnp.tile(x, [1] * x.ndim), cache)
+    cache = jax.tree.map(lambda x: jnp.tile(x, [1] * x.ndim), cache)
 
     live_seq = jnp.full((1, max_len), pad_token_id, dtype=jnp.int32)
     live_seq = live_seq.at[:, :context_length].set(tokens)
@@ -300,7 +300,7 @@ def batch_random_sample(
     context_length = jnp.argmax(input_ids == pad_token_id, axis=1)
     context_length = jnp.where(context_length == 0, max_source_length, context_length)
 
-    cache = jax.tree_map(lambda x: add_batch_dim(x, batch_size), cache)
+    cache = jax.tree.map(lambda x: add_batch_dim(x, batch_size), cache)
 
     live_seqs = jnp.full((batch_size, max_len), pad_token_id, dtype=jnp.int32)
     live_seqs = live_seqs.at[:, :max_source_length].set(input_ids)
@@ -362,7 +362,7 @@ def beam_search(inputs, tokenizer, apply_fn, params, cache, max_len,
     context_length = len(tokens)
     assert context_length < max_len, "Context length must be less than max_len"
 
-    cache = jax.tree_map(lambda x: add_batch_dim(x, n_beams), cache)
+    cache = jax.tree.map(lambda x: add_batch_dim(x, n_beams), cache)
 
     if pad_context is None:
         live_seqs = jnp.zeros((n_beams, max_len), dtype=jnp.int32)

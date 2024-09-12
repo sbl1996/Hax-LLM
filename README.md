@@ -36,9 +36,9 @@
 ## Inference Features
 - Model parallel
 - Beam search
-- Temperature, top-k, top-p
+- Temperature, top-k, top-p, min_p, repetition penalty
 - KV cache
-- Quantization
+- Quantization (q4 and q8 converted from autogptq and autoawq)
 
 
 ## Experiments

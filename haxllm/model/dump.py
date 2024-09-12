@@ -1,10 +1,9 @@
 import os
 import json
-from typing import List, Optional
+from typing import Optional
 from dataclasses import dataclass
 import tyro
 
-import importlib
 from pathlib import Path
 
 import numpy as np

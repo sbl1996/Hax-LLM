@@ -1,4 +1,5 @@
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from functools import partial
 
 import math
 
@@ -8,10 +9,12 @@ from jax import lax
 
 from flax.core import meta
 import flax.linen as nn
+from flax import struct
 from flax.linen import initializers
 from flax.linen.dtypes import promote_dtype
 
-from haxllm.model.parallel import ShardMixIn
+from haxllm.model.parallel import ShardMixIn, DenseGeneral
+from haxllm.model.quantize import QConfig, QuantMethod
 
 PRNGKey = Any
 Shape = Tuple[int, ...]
@@ -20,6 +23,25 @@ Array = Any
 
 
 default_kernel_init = initializers.kaiming_uniform()
+
+
+@struct.dataclass
+class LoraConfig:
+    attn_lora_r: Tuple[int, int, int, int] = (8, 8, 0, 0)
+    mlp_lora_r: Tuple[int, int, int] = (0, 0, 0)
+    lora_alpha: int = 1
+
+    def create_dense_cls(self, name: str):
+        if name == "attn":
+            rs = self.attn_lora_r
+        elif name == "mlp":
+            rs = self.mlp_lora_r
+        else:
+            raise ValueError(f"Unknown name: {name}")
+        return [
+            partial(LoraDenseGeneral, r=r, lora_alpha=self.lora_alpha)
+            if r > 0 else DenseGeneral for r in rs
+        ]
 
 
 def _normalize_axes(axes: Tuple[int, ...], ndim: int) -> Tuple[int, ...]:
@@ -43,12 +65,16 @@ class DenseGeneralBase(nn.Module):
     param_dtype: Dtype = jnp.float32
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
     bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
+    qconfig: Optional[QConfig] = None
     lora_param_dtype: Dtype = jnp.float32
     r: int = 0
     lora_alpha: int = 1
 
     @nn.compact
     def __call__(self, inputs: Array) -> Array:
+        # TODO: support quantization
+        if self.qconfig is not None:
+            raise NotImplementedError("LoraDenseGeneral does not support quantization")
         features = _canonicalize_tuple(self.features)
         axis = _canonicalize_tuple(self.axis)
         ndim = inputs.ndim
@@ -62,7 +88,7 @@ class DenseGeneralBase(nn.Module):
                 math.prod(shape[0:n_axis]),
                 math.prod(shape[-n_features:]),
             )
-            flat_shape = jax.tree_map(int, flat_shape)
+            flat_shape = jax.tree.map(int, flat_shape)
             kernel = initializer(rng, flat_shape, dtype)
             if isinstance(kernel, meta.AxisMetadata):
                 return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
@@ -150,5 +176,5 @@ class DenseGeneralBase(nn.Module):
         return out
 
 
-class DenseGeneral(ShardMixIn, DenseGeneralBase):
+class LoraDenseGeneral(ShardMixIn, DenseGeneralBase):
     pass

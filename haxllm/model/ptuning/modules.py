@@ -63,7 +63,7 @@ class PrefixEmbed(nn.Module):
                     math.prod(shape[0:1]),
                     math.prod(shape[-n_features:]),
                 )
-                flat_shape = jax.tree_map(int, flat_shape)
+                flat_shape = jax.tree.map(int, flat_shape)
                 kernel = self.inif_fn(rng, flat_shape, dtype)
                 if isinstance(kernel, meta.AxisMetadata):
                     return meta.replace_boxed(

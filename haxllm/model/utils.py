@@ -1,10 +1,12 @@
 import math
+import importlib
 
 from enum import Enum, auto
 import jax
 import jax.numpy as jnp
 
 from haxllm.model.mixin import RoPEScalingConfig
+
 
 class ModelTask(Enum):
     SequenceClassification = auto()
@@ -157,3 +159,7 @@ def report_params_and_flops(params, max_len, batch_size):
     hidden_size, n_layers = infer_model_config(params)
     per_device_tflops = calculate_training_tflops(num_model_parameters, max_len, per_device_batch_size, hidden_size, n_layers)
     return per_device_tflops * n_devices
+
+
+def get_module(family):
+    return importlib.import_module("haxllm.model." + family)

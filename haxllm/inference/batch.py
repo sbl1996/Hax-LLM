@@ -35,11 +35,12 @@ def batch_inference(
     pipeline: TextGenerationPipeline,
     inputs: List[str],
     batch_size: int,
-    max_new_tokens: int = 1,
+    max_new_tokens: int | None = None,
     progress_bar: bool = False,
 ):
     tokenizer = pipeline.tokenizer
     pad_value = "pad"
+    max_new_tokens = max_new_tokens or pipeline.max_new_tokens
 
     outputs = []
     total_samples = len(inputs)
@@ -53,8 +54,9 @@ def batch_inference(
             pad_len = batch_size - len(batch_input)
             batch_input = batch_input + [pad_value] * pad_len
         input_ids = prepare_input(tokenizer, batch_input, max_len=pipeline.max_len - max_new_tokens)
+        input_len = input_ids.shape[1]
         output_ids = pipeline.random_sample(input_ids, max_new_tokens=max_new_tokens)[:(batch_size-pad_len)]
-        outputs.extend(tokenizer.batch_decode(output_ids[:, -max_new_tokens:], skip_special_tokens=True))
+        outputs.extend(tokenizer.batch_decode(output_ids[:, input_len:], skip_special_tokens=True))
         processed_samples += len(batch_input) - pad_len
         if progress_bar:
             pbar.update(len(batch_input) - pad_len)

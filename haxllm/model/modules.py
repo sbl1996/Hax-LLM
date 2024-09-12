@@ -78,11 +78,10 @@ class DenseGeneral(nn.Module):
                 math.prod(shape[0:n_axis]),
                 math.prod(shape[-n_features:]),
             )
-            flat_shape = jax.tree_map(int, flat_shape)
+            flat_shape = jax.tree.map(int, flat_shape)
             kernel_init = initializers.zeros_init() if qconfig else self.kernel_init
             kernel = kernel_init(rng, flat_shape, dtype)
             if isinstance(kernel, meta.AxisMetadata):
-                # raise NotImplementedError
                 return meta.replace_boxed(kernel, jnp.reshape(kernel.unbox(), shape))
             return jnp.reshape(kernel, shape)
 

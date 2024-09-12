@@ -55,8 +55,8 @@ def train_step(params, opt_state, step, batch, dropout_rng,
         return loss, logits
 
     if cast:
-        params_dtype = jax.tree_map(lambda x: x.dtype, params)
-        params = jax.tree_map(cast_bf16, params)
+        params_dtype = jax.tree.map(lambda x: x.dtype, params)
+        params = jax.tree.map(cast_bf16, params)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (_, logits), grads = grad_fn(params)
@@ -67,7 +67,7 @@ def train_step(params, opt_state, step, batch, dropout_rng,
     params = optax.apply_updates(params, updates)
 
     if cast:
-        params = jax.tree_map(lambda p, d: p.astype(d), params, params_dtype)
+        params = jax.tree.map(lambda p, d: p.astype(d), params, params_dtype)
 
     metrics = compute_metrics(logits, labels, mask)
     metrics["total"] = mask.sum()
