@@ -29,7 +29,7 @@ def find_pad_context_length(seq_len, multiple=64):
 def init_mesh(mesh):
     if mesh is None or isinstance(mesh, Mesh):
         return mesh
-    device_mesh = mesh_utils.create_device_mesh(mesh, contiguous_submeshes=True)
+    device_mesh = mesh_utils.create_device_mesh(mesh)
     mesh = Mesh(devices=device_mesh, axis_names=("X", "Y"))
     return mesh
 

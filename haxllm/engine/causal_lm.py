@@ -257,10 +257,16 @@ class TrainerBase:
         pipeline.init_without_params(getattr(self, "mesh", None))
         self.pipeline = pipeline
 
-
     @classmethod
     def make_example_inputs(cls, dataset):
         return _make_example_inputs(dataset)
+
+    def load_checkpoint(self, params, checkpoint, device):
+        params = unfreeze(flatten_dict(params, sep="."))
+        params = load_transformer_params(
+            params, checkpoint, device=device, lm_head=True)
+        params = freeze(unflatten_dict(params, sep="."))
+        return params
 
 
 class DPTrainer(TrainerBase):
@@ -281,18 +287,13 @@ class DPTrainer(TrainerBase):
         self.replace_freeze_params_optimizer(self._rng, input_ids)
         self._rng, init_rng = jax.random.split(self._rng)
 
-        jit_init_fn = jax.jit(
-            partial(init_fn, model=self.model, tx=self.tx),
-        )
         with jax.default_device(jax.devices("cpu")[0]):
-            params, opt_state, global_step = jit_init_fn(
-                init_rng, input_ids)
-        
+            params, opt_state, global_step = jax.jit(
+                partial(init_fn, model=self.model, tx=self.tx),
+            )(init_rng, input_ids)
+
         if checkpoint is not None:
-            params = unfreeze(flatten_dict(params, sep="."))
-            params = load_transformer_params(
-                params, checkpoint, device="cpu", lm_head=True)
-            params = freeze(unflatten_dict(params, sep="."))
+            params = self.load_checkpoint(params, checkpoint, device="cpu")
 
         params, opt_state, global_step = jax.device_put_replicated(
             (params, opt_state, global_step), jax.local_devices())
@@ -373,18 +374,13 @@ class MPTrainer(TrainerBase):
             self.mesh, partial(init_fn, model=self.model, tx=self.tx), init_rng, input_ids
         )
 
-        jit_init_fn = jax.jit(
+        params, opt_state, global_step = jax.jit(
             partial(init_fn, model=self.model, tx=self.tx),
             out_shardings=out_shardings,
-        )
-        params, opt_state, global_step = jit_init_fn(
-            init_rng, input_ids)
+        )(init_rng, input_ids)
         
         if checkpoint is not None:
-            params = unfreeze(flatten_dict(params, sep="."))
-            params = load_transformer_params(
-                params, checkpoint, device=self.mesh, lm_head=True)
-            params = freeze(unflatten_dict(params, sep="."))
+            params = self.load_checkpoint(params, checkpoint, device=self.mesh)
         
         self._params = params
         self._opt_state = opt_state

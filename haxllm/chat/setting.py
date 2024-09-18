@@ -20,6 +20,29 @@ class ChatSetting:
         ]
         return self.get_prompt(messages)
 
+    def find_prompt_prefix_suffix(self, tokenizer):
+        if not hasattr(self, "_prefix_suffix_cache"):
+            self._prefix_suffix_cache = {}
+        cache = self._prefix_suffix_cache
+        if tokenizer.name in cache:
+            return self._prefix_suffix_cache[tokenizer.name]
+        examples = ["你好", "晚上吃什么", "请问你是谁", "How are you?"]
+        examples = [self.build_prompt(e) for e in examples]
+        input_ids = [tokenizer.encode(e, add_special_tokens=True) for e in examples]
+        l = 0
+        while True:
+            if len(set(input[l] for input in input_ids)) != 1:
+                break
+            l += 1
+        r = 0
+        while True:
+            if len(set(input[-r-1] for input in input_ids)) != 1:
+                break
+            r += 1
+        prefix, suffix = input_ids[0][:l], input_ids[0][-r:]
+        cache[tokenizer.name] = prefix, suffix
+        return prefix, suffix
+
     @classmethod
     def none(cls):
         return NoneChatSetting()

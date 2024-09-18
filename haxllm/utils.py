@@ -3,7 +3,7 @@ import math
 import re
 import struct
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import collections
 import itertools
 from tqdm import tqdm
@@ -51,7 +51,7 @@ def spec_from_dataset(dataset, input_keys):
 
 
 def time_now():
-    now = datetime.utcnow() + timedelta(hours=8)
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
     return now.strftime("%H:%M:%S")
 
 
@@ -291,7 +291,7 @@ def create_input_iter(ds, device, prepare_fn):
 
 
 def create_mesh(mesh_shape, axis_names=("X", "Y")):
-    device_mesh = mesh_utils.create_device_mesh(mesh_shape, contiguous_submeshes=True)
+    device_mesh = mesh_utils.create_device_mesh(mesh_shape)
     mesh = Mesh(devices=device_mesh, axis_names=axis_names)
     return mesh
 

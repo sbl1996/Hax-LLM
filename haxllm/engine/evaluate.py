@@ -1,4 +1,5 @@
 from typing import Iterable, Sequence, Literal
+import random
 
 import jieba 
 from rouge_chinese import Rouge
@@ -9,7 +10,7 @@ from tokenizers import Tokenizer
 import numpy as np
 import jax
 
-from haxllm.utils import pad
+from haxllm.utils import pad, time_now
 
 
 def evaluate_chinese(
@@ -19,14 +20,16 @@ def evaluate_chinese(
     eval_steps: int,
     batch_size: int,
     stop_token_ids: Sequence[int],
-    echo: Literal[False, 'first', 'all'] = False,
+    echo: Literal[False, 'first', 'all', 'random'] = False,
     print_metrics: Literal[False, 'step', 'final'] = False,
 ):
-    assert echo in [False, 'first', 'all']
+    assert echo in [False, 'first', 'all', 'random']
     assert print_metrics in ['step', 'final', False]
     eval_iter = iter(ds_eval)
     score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
 
+    if echo == 'random':
+        echo_step = random.randint(0, eval_steps - 1)
     for i in range(eval_steps):
         eval_batch = next(eval_iter)
         eval_batch = jax.tree_util.tree_map(
@@ -59,7 +62,7 @@ def evaluate_chinese(
             decoded_labels = decoded_labels[:n]
 
         for k, (input, pred, label) in enumerate(zip(decoded_inputs, decoded_preds, decoded_labels)):
-            if (echo == 'first' and k == 0) or echo == 'all':
+            if echo == 'all' or (echo == 'first' and i == 0 and k == 0) or (echo == 'random' and i == echo_step and k == 0):
                 print("=====================================")
                 print("input:")
                 print(input)
@@ -97,5 +100,5 @@ def evaluate_chinese(
             print(f'\r{i+1}/{eval_steps} {", ".join([ f"{k}: {np.mean(v):.4f}" for k, v in score_dict.items() ])}')
     if print_metrics == 'final':
         print(f'{"-"*20} Final {"-"*20}')
-        print(f'\r{i+1}/{eval_steps} {", ".join([ f"{k}: {np.mean(v):.4f}" for k, v in score_dict.items() ])}')
+        print(f'{time_now()} {i+1}/{eval_steps} {", ".join([ f"{k}: {np.mean(v):.4f}" for k, v in score_dict.items() ])}')
     return score_dict

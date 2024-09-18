@@ -1,5 +1,4 @@
 from typing import Callable, Any, Optional
-from functools import partial
 
 import numpy as np
 import jax.numpy as jnp
@@ -11,7 +10,7 @@ from haxllm.model.quantize import QConfig, QuantMethod, QuantSource
 from haxllm.model.modules import RMSNorm, make_block_stack
 from haxllm.model.parallel import GLUMlpBlock, DenseGeneral, Embed, SelfAttention, ShardModule
 from haxllm.model.mixin import RematScanConfigMixin, RoPEScalingConfigMixin
-from haxllm.model.lora import LoraDenseGeneral, LoraConfig
+from haxllm.model.lora import LoraConfig
 
 
 def QwenConfig(**kwargs):
@@ -575,7 +574,6 @@ class TransformerModel(nn.Module):
     @nn.compact
     def __call__(self, inputs, train):
         config = self.config
-        # remat = config.remat or config.remat_scan
         x, padding_mask = inputs
         x = make_block_stack(
             self.block_cls, config.n_layers, config)((x, padding_mask), train)[0]
@@ -615,8 +613,6 @@ class TransformerLMHeadModel(ShardModule):
 
         if config.tie_word_embeddings:
             x = embed_layer.attend(x)
-            if not config.decode:
-                x = self.with_sharding_constraint(x, (None, "Y", "X"))
         else:
             if config.decode:
                 shard_axes = {"kernel": ("Y", "X")}

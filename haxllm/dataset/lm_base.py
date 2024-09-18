@@ -5,22 +5,6 @@ import numpy as np
 from haxllm.chat.setting import ChatSetting
 
 
-def find_prompt_prefix_suffix(examples, tokenizer, chat_setting: ChatSetting):
-    examples = [chat_setting.build_prompt(e) for e in examples]
-    input_ids = [tokenizer.encode(e, add_special_tokens=True) for e in examples]
-    l = 0
-    while True:
-        if len(set(input[l] for input in input_ids)) != 1:
-            break
-        l += 1
-    r = 0
-    while True:
-        if len(set(input[-r-1] for input in input_ids)) != 1:
-            break
-        r += 1
-    return input_ids[0][:l], input_ids[0][-r:]
-
-
 # ChatGLM2 style dataset, modified from https://github.com/THUDM/ChatGLM2-6B/blob/main/ptuning/main.py#L158-L213
 def preprocess_for_lm(
         tokenizer, examples, max_len, max_source_length, prompt_template=None,
@@ -54,7 +38,7 @@ def preprocess_for_lm(
     """
     chat = chat_setting is not None
     if chat:
-        prompt_prefix, prompt_suffix = find_prompt_prefix_suffix(["你好", "晚上吃什么", "请问你是谁", "How are you?"], tokenizer, chat_setting)
+        prompt_prefix, prompt_suffix = chat_setting.find_prompt_prefix_suffix(tokenizer)
     if padding_side is None:
         padding_side = tokenizer.padding_side
     assert padding_side in ["left", "right"]
